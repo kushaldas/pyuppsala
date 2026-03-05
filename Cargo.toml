@@ -1,0 +1,15 @@
+[package]
+name = "pyuppsala"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for the Uppsala XML library"
+license = "BSD-2-Clause"
+repository = "https://github.com/kushaldas/pyuppsala"
+
+[lib]
+name = "pyuppsala"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py310"] }
+uppsala = { path = "../uppsala" }
