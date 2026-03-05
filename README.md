@@ -18,6 +18,8 @@ no C dependencies to compile and no transitive native libraries to audit.
 - **Serialization** with pretty-printing, compact output, and streaming to files
 - **Automatic encoding detection** for UTF-8 and UTF-16 (LE/BE)
 
+Read the [full documentation](https://pyuppsala.rtfd.io)
+
 ## Installation
 
 ```bash
