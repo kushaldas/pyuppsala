@@ -6,7 +6,8 @@ All pyuppsala exceptions inherit from Python's built-in :class:`Exception`.
 .. exception:: XmlParseError
 
    Raised when the XML input is syntactically malformed (e.g. unclosed tags,
-   invalid characters). The error message includes line and column numbers.
+   invalid characters, unexpected end of input). The error message includes
+   line and column numbers.
 
    .. code-block:: python
 
@@ -16,6 +17,11 @@ All pyuppsala exceptions inherit from Python's built-in :class:`Exception`.
           parse("<unclosed")
       except XmlParseError as e:
           print(e)  # "1:10: ..."
+
+      try:
+          parse("")
+      except XmlParseError as e:
+          print(e)  # "Unexpected end of input"
 
 .. exception:: XmlWellFormednessError
 
@@ -29,7 +35,12 @@ All pyuppsala exceptions inherit from Python's built-in :class:`Exception`.
       try:
           parse('<root a="1" a="2"/>')
       except XmlWellFormednessError as e:
-          print(e)
+          print(e)  # duplicate attribute error
+
+      try:
+          parse("<open></close>")
+      except XmlWellFormednessError as e:
+          print(e)  # mismatched end tag
 
 .. exception:: XmlNamespaceError
 
@@ -66,6 +77,21 @@ All pyuppsala exceptions inherit from Python's built-in :class:`Exception`.
 
    Raised when an XSD schema itself is invalid (not when an instance document
    fails validation -- that returns :class:`ValidationError` objects).
+
+   .. code-block:: python
+
+      from pyuppsala import XsdValidator, XsdValidationError
+
+      try:
+          XsdValidator("<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'><xs:invalid/></xs:schema>")
+      except XsdValidationError as e:
+          print(e)
+
+   .. note::
+
+      Individual validation failures from :meth:`XsdValidator.validate` and
+      :meth:`XsdValidator.validate_str` are returned as :class:`ValidationError`
+      objects in a list, **not** raised as exceptions.
 
 Exception hierarchy
 -------------------

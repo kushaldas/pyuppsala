@@ -3,7 +3,7 @@
 project = "pyuppsala"
 copyright = "2026, Kushal Das"
 author = "Kushal Das"
-release = "0.1.0"
+release = "0.3.0"
 
 extensions = [
     "sphinx.ext.autodoc",
@@ -17,5 +17,5 @@ intersphinx_mapping = {
 templates_path = ["_templates"]
 exclude_patterns = ["_build"]
 
-html_theme = "sphinx_rtd_theme"
+html_theme = "furo"
 html_static_path = ["_static"]
