@@ -136,3 +136,5 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "uppsala"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1600dc6ec465bbba4056042fc73041b82081849ab3117f5d2e233eb96e3e1725"

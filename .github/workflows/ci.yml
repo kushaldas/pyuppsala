@@ -1,0 +1,294 @@
+name: ci
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'pyproject.toml'
+  workflow_dispatch:
+env:
+  FORCE_COLOR: "1"
+  UV_LINK_MODE: "copy"
+jobs:
+
+  manylinux_x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Build wheel
+      uses: PyO3/maturin-action@v1
+      with:
+        target: x86_64
+        manylinux: auto
+        args: --release --strip -o dist
+
+    - name: Install UV
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        uv venv
+        source .venv/bin/activate
+        uv pip install pytest
+        uv pip install ./dist/pyuppsala-*.whl
+
+    - name: Run tests
+      run: |
+        source .venv/bin/activate
+        pytest tests/ -vvv
+
+    - name: Store wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: pyuppsala_manylinux_x86_64
+        path: dist/
+        overwrite: true
+        retention-days: 1
+        if-no-files-found: "error"
+        compression-level: 0
+
+  manylinux_aarch64:
+    runs-on: ubuntu-24-arm
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Build wheel
+      uses: PyO3/maturin-action@v1
+      with:
+        target: aarch64
+        manylinux: auto
+        args: --release --strip -o dist
+
+    - name: Install UV
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        uv venv
+        source .venv/bin/activate
+        uv pip install pytest
+        uv pip install ./dist/pyuppsala-*.whl
+
+    - name: Run tests
+      run: |
+        source .venv/bin/activate
+        pytest tests/ -vvv
+
+    - name: Store wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: pyuppsala_manylinux_aarch64
+        path: dist/
+        overwrite: true
+        retention-days: 1
+        if-no-files-found: "error"
+        compression-level: 0
+
+  macos_aarch64:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-python@v6
+      with:
+        allow-prereleases: true
+        python-version: "3.14"
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: "aarch64-apple-darwin"
+
+    - name: Build environment
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        uv venv --python python3.14
+        source .venv/bin/activate
+        uv pip install --upgrade "maturin>=1,<2" pytest
+
+    - name: Build wheel
+      run: |
+        source .venv/bin/activate
+        MACOSX_DEPLOYMENT_TARGET="11.0" \
+        maturin build \
+          --release \
+          --strip \
+          --interpreter python3.14 \
+          --target=aarch64-apple-darwin
+
+    - name: Run tests
+      run: |
+        source .venv/bin/activate
+        uv pip install target/wheels/pyuppsala-*.whl
+        pytest tests/ -vvv
+
+    - name: Store wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: pyuppsala_macos_aarch64
+        path: target/wheels
+        overwrite: true
+        retention-days: 1
+        if-no-files-found: "error"
+        compression-level: 0
+
+  macos_intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-python@v6
+      with:
+        allow-prereleases: true
+        python-version: "3.14"
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: "x86_64-apple-darwin"
+
+    - name: Build environment
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        uv venv --python python3.14
+        source .venv/bin/activate
+        uv pip install --upgrade "maturin>=1,<2" pytest
+
+    - name: Build wheel
+      run: |
+        source .venv/bin/activate
+        MACOSX_DEPLOYMENT_TARGET="10.15" \
+        maturin build \
+          --release \
+          --strip \
+          --interpreter python3.14
+
+    - name: Run tests
+      run: |
+        source .venv/bin/activate
+        uv pip install target/wheels/pyuppsala-*.whl
+        pytest tests/ -vvv
+
+    - name: Store wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: pyuppsala_macos_intel
+        path: target/wheels
+        overwrite: true
+        retention-days: 1
+        if-no-files-found: "error"
+        compression-level: 0
+
+  windows_amd64:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-python@v6
+      with:
+        allow-prereleases: true
+        python-version: "3.14"
+        architecture: "x64"
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: "x86_64-pc-windows-msvc"
+
+    - name: Build environment
+      run: |
+        python.exe -m pip install --upgrade pip "maturin>=1,<2" pytest
+
+    - name: Build wheel
+      run: |
+        maturin.exe build --release --strip --target=x86_64-pc-windows-msvc
+
+    - name: Run tests
+      shell: pwsh
+      run: |
+        python -m venv venv
+        .\venv\Scripts\Activate.ps1
+        pip install pytest
+        pip install pyuppsala --no-index --find-links target\wheels
+        pytest tests/ -vvv
+
+    - name: Store wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: pyuppsala_windows_amd64
+        path: target\wheels
+        overwrite: true
+        retention-days: 1
+        if-no-files-found: "error"
+        compression-level: 0
+
+  windows_aarch64:
+    runs-on: windows-11-arm
+    timeout-minutes: 10
+    env:
+      TARGET: "aarch64-pc-windows-msvc"
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-python@v6
+      with:
+        allow-prereleases: true
+        python-version: "3.14"
+        architecture: "arm64"
+
+    - shell: pwsh
+      run: |
+        Invoke-WebRequest -Uri "https://static.rust-lang.org/rustup/dist/$env:TARGET/rustup-init.exe" -OutFile rustup-init.exe
+        .\rustup-init.exe --default-toolchain "stable-$env:TARGET" --profile minimal --component rust-src -y
+        "$env:USERPROFILE\.cargo\bin" | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+        "CARGO_HOME=$env:USERPROFILE\.cargo" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
+    - name: Build environment
+      run: |
+        python.exe -m pip install --upgrade pip "maturin>=1,<2" pytest
+
+    - name: Build wheel
+      run: |
+        maturin.exe build --release --strip --target="$env:TARGET"
+
+    - name: Run tests
+      shell: pwsh
+      run: |
+        python -m venv venv
+        .\venv\Scripts\Activate.ps1
+        pip install pytest
+        pip install pyuppsala --no-index --find-links target\wheels
+        pytest tests/ -vvv
+
+    - name: Store wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: pyuppsala_windows_aarch64
+        path: target\wheels
+        overwrite: true
+        retention-days: 1
+        if-no-files-found: "error"
+        compression-level: 0
+
+  sdist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Build sdist
+      uses: PyO3/maturin-action@v1
+      with:
+        command: sdist
+        args: -o dist
+
+    - name: Store sdist
+      uses: actions/upload-artifact@v4
+      with:
+        name: pyuppsala_sdist
+        path: dist/
+        overwrite: true
+        retention-days: 1
+        if-no-files-found: "error"
+        compression-level: 0

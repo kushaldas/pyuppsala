@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py310"] }
-uppsala = { path = "../uppsala" }
+uppsala = "0.3.0"
