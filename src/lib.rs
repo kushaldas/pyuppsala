@@ -394,24 +394,46 @@ impl Node {
             .collect())
     }
 
-    /// The line number of this node in the source document.
+    /// The line number of this node in the source document (1-based).
     #[getter]
     fn line(&self) -> PyResult<usize> {
         let guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.node_line(self.id))
+        let byte_pos = match guard.doc.node_range(self.id) {
+            Some(r) => r.start,
+            None => return Ok(1),
+        };
+        if guard.input.is_empty() || byte_pos == 0 {
+            return Ok(1);
+        }
+        Ok(guard.input.as_bytes()[..byte_pos]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1)
     }
 
-    /// The column number of this node in the source document.
+    /// The column number of this node in the source document (1-based).
     #[getter]
     fn column(&self) -> PyResult<usize> {
         let guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.node_column(self.id))
+        let byte_pos = match guard.doc.node_range(self.id) {
+            Some(r) => r.start,
+            None => return Ok(1),
+        };
+        if guard.input.is_empty() || byte_pos == 0 {
+            return Ok(1);
+        }
+        let bytes = &guard.input.as_bytes()[..byte_pos];
+        Ok(match bytes.iter().rposition(|&b| b == b'\n') {
+            Some(nl_pos) => byte_pos - nl_pos,
+            None => byte_pos + 1,
+        })
     }
 
     /// The byte range (start, end) of this node in the original source, or None.

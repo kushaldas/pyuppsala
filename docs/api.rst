@@ -132,10 +132,10 @@ Document
          root = doc.create_element("root")
          doc.append_child(doc.root, root)
 
-         # With namespace
+         # With namespace prefix
          child = doc.create_element("item", namespace_uri="urn:ex", prefix="x")
          doc.append_child(root, child)
-         print(doc.to_xml())  # '<root><x:item xmlns:x="urn:ex"/></root>'
+         print(doc.to_xml())  # '<root><x:item/></root>'
 
    .. method:: create_text(text: str) -> Node
 
@@ -845,7 +845,6 @@ XsdValidator
       from pyuppsala import XsdValidator
 
       schema = """\
-      <?xml version="1.0"?>
       <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
         <xs:element name="age" type="xs:positiveInteger"/>
       </xs:schema>
@@ -874,7 +873,6 @@ XsdValidator
          from pyuppsala import Document, XsdValidator
 
          schema = """\
-         <?xml version="1.0"?>
          <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
            <xs:element name="name" type="xs:string"/>
          </xs:schema>

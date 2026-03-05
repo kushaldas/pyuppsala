@@ -74,7 +74,6 @@ Schema validation with detailed errors
     from pyuppsala import XsdValidator
 
     schema = """\
-    <?xml version="1.0"?>
     <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
       <xs:element name="person">
         <xs:complexType>
@@ -443,7 +442,6 @@ Combining XmlWriter with validation
 
     # Define a schema
     schema = """\
-    <?xml version="1.0"?>
     <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
       <xs:element name="order">
         <xs:complexType>

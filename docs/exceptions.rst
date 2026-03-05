@@ -18,11 +18,6 @@ All pyuppsala exceptions inherit from Python's built-in :class:`Exception`.
       except XmlParseError as e:
           print(e)  # "1:10: ..."
 
-      try:
-          parse("")
-      except XmlParseError as e:
-          print(e)  # "Unexpected end of input"
-
 .. exception:: XmlWellFormednessError
 
    Raised when the XML violates a well-formedness constraint defined by
@@ -83,7 +78,12 @@ All pyuppsala exceptions inherit from Python's built-in :class:`Exception`.
       from pyuppsala import XsdValidator, XsdValidationError
 
       try:
-          XsdValidator("<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'><xs:invalid/></xs:schema>")
+          # Element declaration missing required 'name' attribute
+          XsdValidator("""\
+          <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element type="xs:string"/>
+          </xs:schema>
+          """)
       except XsdValidationError as e:
           print(e)
 

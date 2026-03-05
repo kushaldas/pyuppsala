@@ -177,7 +177,6 @@ Validate with XSD
     from pyuppsala import XsdValidator
 
     schema = """\
-    <?xml version="1.0"?>
     <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
       <xs:element name="greeting" type="xs:string"/>
     </xs:schema>
