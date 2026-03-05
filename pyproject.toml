@@ -21,6 +21,10 @@ classifiers = [
     "Topic :: Text Processing :: Markup :: XML",
 ]
 
+[project.urls]
+Documentation = "https://pyuppsala.readthedocs.org/"
+Repository = "https://github.com/kushaldas/pyuppsala"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
