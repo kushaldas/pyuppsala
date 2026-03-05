@@ -44,40 +44,40 @@ jobs:
         if-no-files-found: "error"
         compression-level: 0
 
-  manylinux_aarch64:
-    runs-on: ubuntu-24-arm
-    timeout-minutes: 10
-    steps:
-    - uses: actions/checkout@v5
+  #manylinux_aarch64:
+    #runs-on: ubuntu-24-arm
+    #timeout-minutes: 10
+    #steps:
+    #- uses: actions/checkout@v5
 
-    - name: Pull the manylinux image
-      run: docker pull quay.io/pypa/manylinux_2_28_aarch64
+    #- name: Pull the manylinux image
+      #run: docker pull quay.io/pypa/manylinux_2_28_aarch64
 
-    - name: Build the wheel inside manylinux container
-      run: |
-        docker run --rm \
-          -v ${{ github.workspace }}:/io \
-          quay.io/pypa/manylinux_2_28_aarch64 \
-          /io/build-wheels.sh
+    #- name: Build the wheel inside manylinux container
+      #run: |
+        #docker run --rm \
+          #-v ${{ github.workspace }}:/io \
+          #quay.io/pypa/manylinux_2_28_aarch64 \
+          #/io/build-wheels.sh
 
-    - name: Install UV and test
-      run: |
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        uv venv
-        source .venv/bin/activate
-        uv pip install pytest
-        uv pip install ./dist/pyuppsala-*.whl
-        pytest tests/ -vvv
+    #- name: Install UV and test
+      #run: |
+        #curl -LsSf https://astral.sh/uv/install.sh | sh
+        #uv venv
+        #source .venv/bin/activate
+        #uv pip install pytest
+        #uv pip install ./dist/pyuppsala-*.whl
+        #pytest tests/ -vvv
 
-    - name: Store wheels
-      uses: actions/upload-artifact@v4
-      with:
-        name: pyuppsala_manylinux_aarch64
-        path: dist/
-        overwrite: true
-        retention-days: 3
-        if-no-files-found: "error"
-        compression-level: 0
+    #- name: Store wheels
+      #uses: actions/upload-artifact@v4
+      #with:
+        #name: pyuppsala_manylinux_aarch64
+        #path: dist/
+        #overwrite: true
+        #retention-days: 3
+        #if-no-files-found: "error"
+        #compression-level: 0
 
   macos_aarch64:
     runs-on: macos-15
@@ -214,7 +214,7 @@ jobs:
 
   publish:
     runs-on: ubuntu-latest
-    needs: [manylinux_x86_64, manylinux_aarch64, macos_aarch64, windows_amd64, windows_aarch64]
+    needs: [manylinux_x86_64, macos_aarch64, windows_amd64, windows_aarch64]
     environment: pypi
     permissions:
       id-token: write
