@@ -1,15 +1,64 @@
 API reference
 =============
 
+Resource limits
+---------------
+
+The parser, XPath engine, and XSD regex engine all enforce safe defaults
+that block denial-of-service inputs (deep nesting, billion-laughs entity
+expansion, deeply-nested XPath/regex expressions, catastrophic regex
+backtracking). The keyword arguments below let you raise (or lower) those
+defaults when you need to.
+
+.. data:: DEFAULT_MAX_DEPTH
+   :type: int
+
+   Default maximum element-nesting depth (currently 128).
+
+.. data:: DEFAULT_MAX_ENTITY_EXPANSION
+   :type: int
+
+   Default maximum total bytes from entity expansion (currently 1 MiB).
+
+.. data:: DEFAULT_MAX_XPATH_DEPTH
+   :type: int
+
+   Default maximum XPath expression-tree depth (currently 32).
+
+.. data:: DEFAULT_MAX_REGEX_GROUP_DEPTH
+   :type: int
+
+   Default maximum XSD regex group-nesting depth (currently 64).
+
+.. data:: DEFAULT_MAX_REGEX_STEPS
+   :type: int
+
+   Default maximum backtracking steps when matching an XSD regex
+   (currently 1,000,000). When the cap is reached the matcher returns
+   ``False`` rather than burning CPU.
+
+.. warning::
+   Do not source the ``max_depth`` / ``max_entity_expansion`` /
+   ``max_steps`` keyword arguments from untrusted input. An attacker who
+   controls a cap can re-enable the DoS class it was designed to block.
+   These arguments are intended for application authors who have a
+   legitimate reason to relax (or tighten) the safe defaults.
+
 Module-level functions
 ----------------------
 
-.. function:: parse(xml: str) -> Document
+.. function:: parse(xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None) -> Document
 
    Parse an XML string and return a :class:`Document`.
 
    :param xml: A well-formed XML string.
-   :raises XmlParseError: If the XML is syntactically malformed.
+   :param max_depth: Maximum element-nesting depth.
+       Defaults to :data:`DEFAULT_MAX_DEPTH`.
+   :param max_entity_expansion: Maximum total bytes produced by entity
+       expansion. Defaults to :data:`DEFAULT_MAX_ENTITY_EXPANSION`.
+   :param namespace_aware: When ``False``, disables XML namespace processing.
+   :raises XmlParseError: If the XML is syntactically malformed or a
+       resource cap is exceeded.
    :raises XmlWellFormednessError: If a well-formedness constraint is violated.
 
    .. code-block:: python
@@ -19,12 +68,18 @@ Module-level functions
       doc = parse("<root>hello</root>")
       print(doc.document_element.text_content)  # "hello"
 
-.. function:: parse_bytes(data: bytes) -> Document
+.. function:: parse_bytes(data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None) -> Document
 
-   Parse XML from bytes with automatic encoding detection (UTF-8, UTF-16 LE/BE).
+   Parse XML from bytes with automatic encoding detection (UTF-8, UTF-16
+   LE/BE, with or without a BOM). Encoding detection is applied in all
+   cases, so the keyword arguments below never change how the bytes are
+   decoded — UTF-16 input keeps working with or without custom limits.
 
    :param data: Raw bytes of an XML document.
-   :raises XmlParseError: If the XML is malformed.
+   :param max_depth: See :func:`parse`.
+   :param max_entity_expansion: See :func:`parse`.
+   :param namespace_aware: See :func:`parse`.
+   :raises XmlParseError: If the XML is malformed or a resource cap is exceeded.
 
    .. code-block:: python
 
@@ -40,11 +95,14 @@ Module-level functions
 Document
 --------
 
-.. class:: Document(xml: str)
+.. class:: Document(xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None)
 
    Parse an XML string into a DOM document.
 
    :param xml: A well-formed XML string.
+   :param max_depth: See :func:`parse`.
+   :param max_entity_expansion: See :func:`parse`.
+   :param namespace_aware: See :func:`parse`.
 
    .. code-block:: python
 
@@ -53,9 +111,11 @@ Document
       doc = Document("<catalog><book>XML Guide</book></catalog>")
       print(doc.document_element.tag.local_name)  # "catalog"
 
-   .. staticmethod:: from_bytes(data: bytes) -> Document
+   .. staticmethod:: from_bytes(data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None) -> Document
 
-      Parse XML from bytes with automatic encoding detection.
+      Parse XML from bytes with automatic encoding detection. See
+      :func:`parse_bytes` for the keyword arguments that override the
+      safe parser defaults.
 
       .. code-block:: python
 
@@ -748,9 +808,12 @@ Attribute
 XPathEvaluator
 --------------
 
-.. class:: XPathEvaluator()
+.. class:: XPathEvaluator(*, max_depth=None)
 
    XPath 1.0 expression evaluator.
+
+   :param max_depth: Maximum XPath expression-tree depth.
+       Defaults to :data:`DEFAULT_MAX_XPATH_DEPTH`.
 
    .. code-block:: python
 
@@ -1109,10 +1172,13 @@ XmlWriter
 XsdRegex
 --------
 
-.. class:: XsdRegex(pattern: str)
+.. class:: XsdRegex(pattern, *, max_depth=None)
 
    XSD regular expression pattern matcher. XSD regexes are implicitly
    anchored -- they must match the **entire** input string.
+
+   :param max_depth: Maximum group-nesting depth applied at compile
+       time. Defaults to :data:`DEFAULT_MAX_REGEX_GROUP_DEPTH`.
 
    Supported features: alternation (``|``), grouping, quantifiers
    (``*``, ``+``, ``?``, ``{n}``, ``{n,m}``), character classes with
@@ -1132,9 +1198,13 @@ XsdRegex
       print(email.is_match("user@example.com"))  # True
       print(email.is_match("not-an-email"))       # False
 
-   .. method:: is_match(input: str) -> bool
+   .. method:: is_match(input, *, max_steps=None) -> bool
 
       Test whether *input* fully matches the pattern.
+
+      :param max_steps: Maximum backtracking steps. Defaults to
+          :data:`DEFAULT_MAX_REGEX_STEPS`. Returns ``False`` when the
+          cap is reached, preventing catastrophic-backtracking ReDoS.
 
       .. code-block:: python
 

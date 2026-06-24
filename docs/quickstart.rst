@@ -15,6 +15,15 @@ Or with `uv <https://docs.astral.sh/uv/>`_::
 Requirements: Python 3.10 or later. No C compiler needed -- the package ships
 pre-built wheels compiled from Rust.
 
+Safe defaults
+-------------
+
+The parser, XPath engine, and XSD regex engine apply resource caps that
+block denial-of-service inputs (deep nesting, billion-laughs entity
+expansion, deeply-nested XPath/regex expressions, catastrophic regex
+backtracking) by default. See :ref:`Resource limits and hardening
+<resource-limits>` for how to inspect or adjust them.
+
 Parse an XML document
 ---------------------
 

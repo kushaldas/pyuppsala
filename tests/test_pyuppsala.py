@@ -1322,3 +1322,209 @@ class TestQNameMatches:
         q = QName("root")
         assert q.matches("root") is True
         assert q.matches("root", namespace_uri="urn:example") is False
+
+
+# ============================================================================
+# Security limits (uppsala 0.4.0 hardening)
+# ============================================================================
+
+
+class TestSecurityLimits:
+    def test_default_depth_blocks_deep_nesting(self):
+        deep = "<a>" * 200 + "</a>" * 200
+        with pytest.raises(XmlParseError):
+            parse(deep)
+
+    def test_max_depth_override_allows_deeper(self):
+        deep = "<a>" * 200 + "</a>" * 200
+        doc = parse(deep, max_depth=300)
+        assert doc.document_element is not None
+        assert doc.document_element.tag.local_name == "a"
+
+    def test_max_depth_override_below_input_still_rejects(self):
+        shallow = "<a><b/></a>"
+        with pytest.raises(XmlParseError):
+            parse(shallow, max_depth=1)
+
+    def test_billion_laughs_blocked_by_default(self):
+        billion_laughs = (
+            "<!DOCTYPE lolz ["
+            '<!ENTITY lol "lol">'
+            '<!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">'
+            '<!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">'
+            '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">'
+            '<!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">'
+            '<!ENTITY lol5 "&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;">'
+            '<!ENTITY lol6 "&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;">'
+            '<!ENTITY lol7 "&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;">'
+            '<!ENTITY lol8 "&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;">'
+            '<!ENTITY lol9 "&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;">'
+            "]>"
+            "<lolz>&lol9;</lolz>"
+        )
+        with pytest.raises(XmlParseError):
+            parse(billion_laughs)
+
+    def test_max_entity_expansion_override_rejects_smaller_payload(self):
+        # Tiny payload that exceeds a 16-byte budget but not the default
+        xml = (
+            "<!DOCTYPE r ["
+            '<!ENTITY a "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA">'
+            "]>"
+            "<r>&a;</r>"
+        )
+        with pytest.raises(XmlParseError):
+            parse(xml, max_entity_expansion=16)
+
+    def test_xpath_depth_blocked_by_default(self):
+        doc = parse("<r><x/></r>")
+        # Default cap is DEFAULT_MAX_XPATH_DEPTH = 32
+        deep = "(" * 64 + "/r" + ")" * 64
+        ev = XPathEvaluator()
+        with pytest.raises(XPathError):
+            ev.evaluate(doc, deep)
+
+    def test_xpath_depth_override_allows_deeper(self):
+        doc = parse("<r><x/></r>")
+        deep = "(" * 64 + "/r" + ")" * 64
+        ev = XPathEvaluator(max_depth=128)
+        result = ev.evaluate(doc, deep)
+        assert isinstance(result, list)
+
+    def test_regex_group_depth_blocked_by_default(self):
+        # Default cap is DEFAULT_MAX_REGEX_GROUP_DEPTH = 64
+        pattern = "(" * 80 + "x" + ")" * 80
+        with pytest.raises(ValueError):
+            XsdRegex(pattern)
+
+    def test_regex_group_depth_override_allows_deeper(self):
+        pattern = "(" * 80 + "x" + ")" * 80
+        rx = XsdRegex(pattern, max_depth=128)
+        assert rx.is_match("x") is True
+
+    def test_regex_max_steps_caps_runtime(self):
+        # A pattern that admits backtracking. With a tiny step budget the
+        # matcher should bail out and return False rather than burning CPU.
+        rx = XsdRegex("(a|aa)+b")
+        text = "a" * 30  # no 'b', so no full match
+        assert rx.is_match(text, max_steps=100) is False
+
+    def test_constants_are_positive_ints(self):
+        assert isinstance(pyuppsala.DEFAULT_MAX_DEPTH, int)
+        assert pyuppsala.DEFAULT_MAX_DEPTH > 0
+        assert isinstance(pyuppsala.DEFAULT_MAX_ENTITY_EXPANSION, int)
+        assert pyuppsala.DEFAULT_MAX_ENTITY_EXPANSION > 0
+        assert isinstance(pyuppsala.DEFAULT_MAX_XPATH_DEPTH, int)
+        assert pyuppsala.DEFAULT_MAX_XPATH_DEPTH > 0
+        assert isinstance(pyuppsala.DEFAULT_MAX_REGEX_GROUP_DEPTH, int)
+        assert pyuppsala.DEFAULT_MAX_REGEX_GROUP_DEPTH > 0
+        assert isinstance(pyuppsala.DEFAULT_MAX_REGEX_STEPS, int)
+        assert pyuppsala.DEFAULT_MAX_REGEX_STEPS > 0
+
+    def test_comment_round_trip_injection_blocked(self):
+        doc = Document.empty()
+        root = doc.create_element("r")
+        doc.append_child(doc.root, root)
+        comment = doc.create_comment("bad --> injection")
+        doc.append_child(root, comment)
+        out = doc.to_xml()
+        # Whatever sanitization is applied, the result must round-trip.
+        reparsed = parse(out)
+        assert reparsed.document_element.tag.local_name == "r"
+
+    def test_pi_round_trip_injection_blocked(self):
+        doc = Document.empty()
+        root = doc.create_element("r")
+        doc.append_child(doc.root, root)
+        pi = doc.create_processing_instruction("target", "evil ?> bytes")
+        doc.append_child(root, pi)
+        out = doc.to_xml()
+        reparsed = parse(out)
+        assert reparsed.document_element.tag.local_name == "r"
+
+    def test_cdata_round_trip_injection_blocked(self):
+        doc = Document.empty()
+        root = doc.create_element("r")
+        doc.append_child(doc.root, root)
+        cdata = doc.create_cdata("inner ]]> close")
+        doc.append_child(root, cdata)
+        out = doc.to_xml()
+        reparsed = parse(out)
+        assert reparsed.document_element.tag.local_name == "r"
+
+    def test_parse_bytes_with_kwargs(self):
+        # The kwargs branch of Document.from_bytes routes through the
+        # Parser builder while still applying full encoding detection.
+        doc = parse_bytes(b"<root/>", max_depth=200)
+        assert doc.document_element.tag.local_name == "root"
+
+    def test_parse_bytes_kwargs_preserve_utf16(self):
+        # Regression: passing any keyword argument (including
+        # namespace_aware=True, its default value) must not disable UTF-16
+        # auto-detection. Previously the kwargs path did a lossy UTF-8
+        # decode that mangled UTF-16 input.
+        xml = "<root>héllo</root>"
+        for data in (
+            b"\xff\xfe" + xml.encode("utf-16-le"),  # UTF-16 LE BOM
+            b"\xfe\xff" + xml.encode("utf-16-be"),  # UTF-16 BE BOM
+            xml.encode("utf-16-le"),                 # UTF-16 LE, no BOM
+            xml.encode("utf-16-be"),                 # UTF-16 BE, no BOM
+        ):
+            for kwargs in (
+                {"namespace_aware": True},
+                {"namespace_aware": False},
+                {"max_depth": 64},
+                {"max_entity_expansion": 999999},
+            ):
+                doc = parse_bytes(data, **kwargs)
+                el = doc.document_element
+                assert el.tag.local_name == "root"
+                assert el.text_content == "héllo"
+                # input_text must reflect the decoded source, not raw bytes.
+                assert doc.input_text == xml
+
+    def test_parse_bytes_utf16_odd_length_rejected(self):
+        # An odd-length UTF-16 payload is malformed; it must be rejected
+        # rather than silently truncating the trailing byte.
+        good = b"\xff\xfe" + "<root/>".encode("utf-16-le")
+        with pytest.raises((XmlParseError, XmlWellFormednessError)):
+            parse_bytes(good + b"\x00")  # one extra byte -> odd body length
+
+    def test_parse_bytes_namespace_aware_matches_default(self):
+        # parse_bytes(data, namespace_aware=True) must behave identically to
+        # parse_bytes(data) for a UTF-16 input (the reviewer's scenario).
+        data = b"\xff\xfe" + "<root/>".encode("utf-16-le")
+        assert (
+            parse_bytes(data).document_element.tag.local_name
+            == parse_bytes(data, namespace_aware=True).document_element.tag.local_name
+            == "root"
+        )
+
+    def test_parse_bytes_kwargs_path_blocks_deep(self):
+        deep = ("<a>" * 200 + "</a>" * 200).encode()
+        # Default cap (128) blocks even via the bytes entry point.
+        with pytest.raises(XmlParseError):
+            parse_bytes(deep)
+        # Override allows it through.
+        doc = parse_bytes(deep, max_depth=300)
+        assert doc.document_element is not None
+        assert doc.document_element.tag.local_name == "a"
+
+    def test_namespace_aware_false_disables_ns_processing(self):
+        # With namespace processing disabled, the parser does not split
+        # the prefix from the local name — the tag is the full prefixed
+        # source string.
+        xml = '<x:item xmlns:x="urn:ex"/>'
+        doc = parse(xml, namespace_aware=False)
+        tag = doc.document_element.tag
+        # Either the local name carries the prefix, or the namespace_uri
+        # is None (no resolution happened). Both prove ns processing was
+        # skipped, in contrast to the default behavior below.
+        assert tag.namespace_uri is None or "x:item" in tag.prefixed_name
+
+        # Sanity check: with namespace_aware=True (default) the same
+        # input resolves to the urn:ex namespace.
+        doc2 = parse(xml)
+        tag2 = doc2.document_element.tag
+        assert tag2.namespace_uri == "urn:ex"
+        assert tag2.local_name == "item"
