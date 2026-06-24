@@ -1454,9 +1454,44 @@ class TestSecurityLimits:
 
     def test_parse_bytes_with_kwargs(self):
         # The kwargs branch of Document.from_bytes routes through the
-        # Parser builder; this exercises the documented UTF-8 lossy path.
+        # Parser builder while still applying full encoding detection.
         doc = parse_bytes(b"<root/>", max_depth=200)
         assert doc.document_element.tag.local_name == "root"
+
+    def test_parse_bytes_kwargs_preserve_utf16(self):
+        # Regression: passing any keyword argument (including
+        # namespace_aware=True, its default value) must not disable UTF-16
+        # auto-detection. Previously the kwargs path did a lossy UTF-8
+        # decode that mangled UTF-16 input.
+        xml = "<root>héllo</root>"
+        for data in (
+            b"\xff\xfe" + xml.encode("utf-16-le"),  # UTF-16 LE BOM
+            b"\xfe\xff" + xml.encode("utf-16-be"),  # UTF-16 BE BOM
+            xml.encode("utf-16-le"),                 # UTF-16 LE, no BOM
+            xml.encode("utf-16-be"),                 # UTF-16 BE, no BOM
+        ):
+            for kwargs in (
+                {"namespace_aware": True},
+                {"namespace_aware": False},
+                {"max_depth": 64},
+                {"max_entity_expansion": 999999},
+            ):
+                doc = parse_bytes(data, **kwargs)
+                el = doc.document_element
+                assert el.tag.local_name == "root"
+                assert el.text_content == "héllo"
+                # input_text must reflect the decoded source, not raw bytes.
+                assert doc.input_text == xml
+
+    def test_parse_bytes_namespace_aware_matches_default(self):
+        # parse_bytes(data, namespace_aware=True) must behave identically to
+        # parse_bytes(data) for a UTF-16 input (the reviewer's scenario).
+        data = b"\xff\xfe" + "<root/>".encode("utf-16-le")
+        assert (
+            parse_bytes(data).document_element.tag.local_name
+            == parse_bytes(data, namespace_aware=True).document_element.tag.local_name
+            == "root"
+        )
 
     def test_parse_bytes_kwargs_path_blocks_deep(self):
         deep = ("<a>" * 200 + "</a>" * 200).encode()

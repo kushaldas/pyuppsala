@@ -70,12 +70,13 @@ Module-level functions
 
 .. function:: parse_bytes(data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None) -> Document
 
-   Parse XML from bytes with automatic encoding detection (UTF-8, UTF-16 LE/BE).
+   Parse XML from bytes with automatic encoding detection (UTF-8, UTF-16
+   LE/BE, with or without a BOM). Encoding detection is applied in all
+   cases, so the keyword arguments below never change how the bytes are
+   decoded — UTF-16 input keeps working with or without custom limits.
 
    :param data: Raw bytes of an XML document.
-   :param max_depth: See :func:`parse`. When set, the input is decoded as
-       UTF-8 (replacing invalid sequences); decode UTF-16 input yourself
-       and call :func:`parse` if you need both UTF-16 and custom limits.
+   :param max_depth: See :func:`parse`.
    :param max_entity_expansion: See :func:`parse`.
    :param namespace_aware: See :func:`parse`.
    :raises XmlParseError: If the XML is malformed or a resource cap is exceeded.

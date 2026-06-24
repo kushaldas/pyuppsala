@@ -213,9 +213,9 @@ class Document:
     ) -> Document:
         """Parse XML from bytes, with automatic encoding detection (UTF-8/UTF-16).
 
-        When any keyword argument is set the input is decoded as UTF-8;
-        callers that need UTF-16 input together with custom limits should
-        decode to ``str`` first and call ``Document(...)``.
+        Encoding detection is applied in all cases; the keyword arguments do
+        not change how the bytes are decoded, so UTF-16 input works with or
+        without custom limits.
         """
         ...
     @staticmethod

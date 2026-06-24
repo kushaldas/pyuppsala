@@ -736,13 +736,13 @@ impl Document {
         })
     }
 
-    /// Parse XML from bytes, with automatic encoding detection (UTF-8/UTF-16).
+    /// Parse XML from bytes, with automatic encoding detection (UTF-8/UTF-16,
+    /// with or without BOM).
     ///
-    /// Optional keyword arguments override uppsala's safe defaults. When
-    /// any keyword argument is set, the input is decoded as UTF-8 (replacing
-    /// invalid sequences) before being fed to the parser; UTF-16 inputs in
-    /// that mode should be decoded by the caller. When no keyword argument
-    /// is set, full encoding auto-detection is used.
+    /// Optional keyword arguments override uppsala's safe defaults. Encoding
+    /// auto-detection is applied in all cases — passing ``max_depth``,
+    /// ``max_entity_expansion``, or ``namespace_aware`` does not change how
+    /// the bytes are decoded, so UTF-16 input keeps working regardless.
     ///
     /// .. warning::
     ///    Do not source the resource-limit kwargs from untrusted input.
@@ -755,25 +755,15 @@ impl Document {
         max_entity_expansion: Option<usize>,
         namespace_aware: Option<bool>,
     ) -> PyResult<Document> {
-        let has_kwargs =
-            max_depth.is_some() || max_entity_expansion.is_some() || namespace_aware.is_some();
-        if has_kwargs {
-            let input = String::from_utf8_lossy(data).into_owned();
-            let parser = build_parser(max_depth, max_entity_expansion, namespace_aware);
-            let doc = parser
-                .parse(&input)
-                .map_err(xml_error_to_pyerr)?
-                .into_static();
-            Ok(Document {
-                inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
-            })
-        } else {
-            let input = String::from_utf8_lossy(data).into_owned();
-            let doc = uppsala::parse_bytes(data).map_err(xml_error_to_pyerr)?;
-            Ok(Document {
-                inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
-            })
-        }
+        let input = decode_xml_bytes(data)?;
+        let parser = build_parser(max_depth, max_entity_expansion, namespace_aware);
+        let doc = parser
+            .parse(&input)
+            .map_err(xml_error_to_pyerr)?
+            .into_static();
+        Ok(Document {
+            inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
+        })
     }
 
     /// Create a new empty document.
@@ -1602,6 +1592,67 @@ fn build_parser(
         parser = parser.with_max_entity_expansion(b);
     }
     parser
+}
+
+/// Decode raw XML bytes to a String, auto-detecting the encoding (UTF-8 and
+/// UTF-16 LE/BE, with or without BOM). This mirrors uppsala's internal
+/// `decode_xml_bytes` so the keyword-argument code path keeps the same
+/// encoding support as the plain `parse_bytes` fast path — the `Parser`
+/// builder only accepts `&str`, so without this the only option would be a
+/// lossy UTF-8 decode that mangles UTF-16 input.
+fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
+    if data.len() < 2 {
+        // Too short for BOM detection — assume UTF-8.
+        return String::from_utf8(data.to_vec())
+            .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-8: {}", e)));
+    }
+
+    // Byte-order mark detection.
+    if data[0] == 0xFF && data[1] == 0xFE {
+        return decode_utf16(&data[2..], false); // UTF-16 LE BOM
+    }
+    if data[0] == 0xFE && data[1] == 0xFF {
+        return decode_utf16(&data[2..], true); // UTF-16 BE BOM
+    }
+    if data.len() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+        // UTF-8 BOM — strip it and decode as UTF-8.
+        return String::from_utf8(data[3..].to_vec())
+            .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-8: {}", e)));
+    }
+
+    // No BOM — check for UTF-16 without BOM (XML spec Appendix F).
+    if data[0] == 0x00 && data[1] == 0x3C {
+        return decode_utf16(data, true); // UTF-16 BE without BOM
+    }
+    if data[0] == 0x3C && data[1] == 0x00 {
+        return decode_utf16(data, false); // UTF-16 LE without BOM
+    }
+
+    // Default: UTF-8.
+    String::from_utf8(data.to_vec())
+        .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-8: {}", e)))
+}
+
+/// Decode UTF-16 bytes (big- or little-endian) to a String.
+fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
+    let code_units: Vec<u16> = bytes
+        .chunks(2)
+        .filter(|chunk| chunk.len() == 2)
+        .map(|chunk| {
+            if big_endian {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect();
+    String::from_utf16(&code_units).map_err(|e| {
+        XmlWellFormednessError::new_err(format!(
+            "1:1: Invalid UTF-16 {}: {}",
+            if big_endian { "BE" } else { "LE" },
+            e
+        ))
+    })
 }
 
 fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlWriteOptions {
