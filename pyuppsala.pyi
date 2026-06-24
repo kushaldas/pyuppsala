@@ -185,12 +185,38 @@ class Document:
     Parse XML with ``Document(xml_string)`` or ``Document.from_bytes(data)``.
     """
 
-    def __init__(self, xml: str) -> None:
-        """Parse an XML string into a Document."""
+    def __init__(
+        self,
+        xml: str,
+        *,
+        max_depth: Optional[int] = None,
+        max_entity_expansion: Optional[int] = None,
+        namespace_aware: Optional[bool] = None,
+    ) -> None:
+        """Parse an XML string into a Document.
+
+        Optional keyword arguments override uppsala's safe defaults
+        (see ``DEFAULT_MAX_DEPTH``, ``DEFAULT_MAX_ENTITY_EXPANSION``).
+
+        Warning:
+            Do not source these values from untrusted input — an attacker
+            who controls the cap can re-enable the corresponding DoS class.
+        """
         ...
     @staticmethod
-    def from_bytes(data: bytes) -> Document:
-        """Parse XML from bytes, with automatic encoding detection (UTF-8/UTF-16)."""
+    def from_bytes(
+        data: bytes,
+        *,
+        max_depth: Optional[int] = None,
+        max_entity_expansion: Optional[int] = None,
+        namespace_aware: Optional[bool] = None,
+    ) -> Document:
+        """Parse XML from bytes, with automatic encoding detection (UTF-8/UTF-16).
+
+        When any keyword argument is set the input is decoded as UTF-8;
+        callers that need UTF-16 input together with custom limits should
+        decode to ``str`` first and call ``Document(...)``.
+        """
         ...
     @staticmethod
     def empty() -> Document:
@@ -292,7 +318,13 @@ class Document:
 class XPathEvaluator:
     """XPath 1.0 expression evaluator."""
 
-    def __init__(self) -> None: ...
+    def __init__(self, *, max_depth: Optional[int] = None) -> None:
+        """Create a new XPath evaluator.
+
+        ``max_depth`` overrides the expression-tree depth cap
+        (see ``DEFAULT_MAX_XPATH_DEPTH``).
+        """
+        ...
     def add_namespace(self, prefix: str, uri: str) -> None:
         """Register a namespace prefix for use in XPath expressions."""
         ...
@@ -415,11 +447,20 @@ class XsdRegex:
     XSD regexes are implicitly anchored (must match the full string).
     """
 
-    def __init__(self, pattern: str) -> None:
-        """Compile an XSD regex pattern."""
+    def __init__(self, pattern: str, *, max_depth: Optional[int] = None) -> None:
+        """Compile an XSD regex pattern.
+
+        ``max_depth`` overrides the group-nesting cap applied at
+        compile time (see ``DEFAULT_MAX_REGEX_GROUP_DEPTH``).
+        """
         ...
-    def is_match(self, input: str) -> bool:
-        """Test whether the input string fully matches the pattern."""
+    def is_match(self, input: str, *, max_steps: Optional[int] = None) -> bool:
+        """Test whether the input string fully matches the pattern.
+
+        ``max_steps`` overrides the backtracking-step cap
+        (see ``DEFAULT_MAX_REGEX_STEPS``). The matcher returns ``False``
+        when the cap is reached, preventing catastrophic-backtracking ReDoS.
+        """
         ...
     @property
     def pattern(self) -> str:
@@ -430,10 +471,47 @@ class XsdRegex:
 
 # Module-level functions
 
-def parse(xml: str) -> Document:
-    """Parse an XML string and return a Document."""
+def parse(
+    xml: str,
+    *,
+    max_depth: Optional[int] = None,
+    max_entity_expansion: Optional[int] = None,
+    namespace_aware: Optional[bool] = None,
+) -> Document:
+    """Parse an XML string and return a Document.
+
+    See ``Document`` for the keyword arguments that override the safe
+    parser defaults.
+    """
     ...
 
-def parse_bytes(data: bytes) -> Document:
-    """Parse XML bytes and return a Document, with automatic encoding detection."""
+def parse_bytes(
+    data: bytes,
+    *,
+    max_depth: Optional[int] = None,
+    max_entity_expansion: Optional[int] = None,
+    namespace_aware: Optional[bool] = None,
+) -> Document:
+    """Parse XML bytes and return a Document, with automatic encoding detection.
+
+    See ``Document.from_bytes`` for the keyword arguments that override
+    the safe parser defaults.
+    """
     ...
+
+# Default resource-limit constants (uppsala 0.4.0 hardening)
+
+DEFAULT_MAX_DEPTH: int
+"""Default maximum element nesting depth (128)."""
+
+DEFAULT_MAX_ENTITY_EXPANSION: int
+"""Default maximum total bytes from entity expansion (1 MiB)."""
+
+DEFAULT_MAX_XPATH_DEPTH: int
+"""Default maximum XPath expression-tree depth (32)."""
+
+DEFAULT_MAX_REGEX_GROUP_DEPTH: int
+"""Default maximum XSD regex group-nesting depth (64)."""
+
+DEFAULT_MAX_REGEX_STEPS: int
+"""Default maximum backtracking steps when matching an XSD regex (1,000,000)."""

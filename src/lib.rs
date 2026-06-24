@@ -4,6 +4,8 @@ use pyo3::prelude::*;
 
 use std::sync::{Arc, Mutex};
 use uppsala::dom::{Attribute as UAttribute, NodeId, NodeKind, QName as UQName, XmlWriteOptions};
+use uppsala::parser::Parser as UParser;
+use uppsala::parser::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_EXPANSION};
 use uppsala::writer::XmlWriter as UXmlWriter;
 use uppsala::xpath::{XPathEvaluator as UXPathEvaluator, XPathValue as UXPathValue};
 use uppsala::xsd::XsdValidator as UXsdValidator;
@@ -706,26 +708,72 @@ struct Document {
 #[pymethods]
 impl Document {
     /// Parse an XML string into a Document.
+    ///
+    /// Optional keyword arguments override uppsala's safe defaults:
+    ///
+    /// * ``max_depth`` — maximum element nesting depth (default 128).
+    /// * ``max_entity_expansion`` — maximum total bytes from entity expansion
+    ///   (default 1 << 20 = 1 MiB).
+    /// * ``namespace_aware`` — when False, disables XML namespace processing.
+    ///
+    /// .. warning::
+    ///    Do not source these values from untrusted input. An attacker who
+    ///    controls the cap can re-enable the corresponding DoS attack class
+    ///    (deep-nesting stack overflow, billion-laughs entity expansion).
     #[new]
-    fn new(xml: &str) -> PyResult<Self> {
+    #[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None))]
+    fn new(
+        xml: &str,
+        max_depth: Option<u32>,
+        max_entity_expansion: Option<usize>,
+        namespace_aware: Option<bool>,
+    ) -> PyResult<Self> {
         let input = xml.to_string();
-        let doc = uppsala::parse(xml)
-            .map_err(xml_error_to_pyerr)?
-            .into_static();
+        let parser = build_parser(max_depth, max_entity_expansion, namespace_aware);
+        let doc = parser.parse(xml).map_err(xml_error_to_pyerr)?.into_static();
         Ok(Document {
             inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
         })
     }
 
     /// Parse XML from bytes, with automatic encoding detection (UTF-8/UTF-16).
+    ///
+    /// Optional keyword arguments override uppsala's safe defaults. When
+    /// any keyword argument is set, the input is decoded as UTF-8 (replacing
+    /// invalid sequences) before being fed to the parser; UTF-16 inputs in
+    /// that mode should be decoded by the caller. When no keyword argument
+    /// is set, full encoding auto-detection is used.
+    ///
+    /// .. warning::
+    ///    Do not source the resource-limit kwargs from untrusted input.
+    ///    See :class:`Document` for details.
     #[staticmethod]
-    fn from_bytes(data: &[u8]) -> PyResult<Document> {
-        // Decode to get the input text for source tracking
-        let input = String::from_utf8_lossy(data).into_owned();
-        let doc = uppsala::parse_bytes(data).map_err(xml_error_to_pyerr)?;
-        Ok(Document {
-            inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
-        })
+    #[pyo3(signature = (data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None))]
+    fn from_bytes(
+        data: &[u8],
+        max_depth: Option<u32>,
+        max_entity_expansion: Option<usize>,
+        namespace_aware: Option<bool>,
+    ) -> PyResult<Document> {
+        let has_kwargs =
+            max_depth.is_some() || max_entity_expansion.is_some() || namespace_aware.is_some();
+        if has_kwargs {
+            let input = String::from_utf8_lossy(data).into_owned();
+            let parser = build_parser(max_depth, max_entity_expansion, namespace_aware);
+            let doc = parser
+                .parse(&input)
+                .map_err(xml_error_to_pyerr)?
+                .into_static();
+            Ok(Document {
+                inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
+            })
+        } else {
+            let input = String::from_utf8_lossy(data).into_owned();
+            let doc = uppsala::parse_bytes(data).map_err(xml_error_to_pyerr)?;
+            Ok(Document {
+                inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
+            })
+        }
     }
 
     /// Create a new empty document.
@@ -1065,11 +1113,22 @@ struct XPathEvaluator {
 
 #[pymethods]
 impl XPathEvaluator {
+    /// Create a new XPath evaluator.
+    ///
+    /// ``max_depth`` overrides the default expression-tree depth cap
+    /// (default 32) used to bound recursive parsing of XPath expressions.
+    ///
+    /// .. warning::
+    ///    Do not source ``max_depth`` from untrusted input — an attacker
+    ///    who controls the cap can re-enable XPath stack-overflow attacks.
     #[new]
-    fn new() -> Self {
-        XPathEvaluator {
-            inner: UXPathEvaluator::new(),
+    #[pyo3(signature = (*, max_depth=None))]
+    fn new(max_depth: Option<u32>) -> Self {
+        let mut inner = UXPathEvaluator::new();
+        if let Some(d) = max_depth {
+            inner = inner.with_max_depth(d);
         }
+        XPathEvaluator { inner }
     }
 
     /// Register a namespace prefix for use in XPath expressions.
@@ -1436,10 +1495,21 @@ struct XsdRegex {
 #[pymethods]
 impl XsdRegex {
     /// Compile an XSD regex pattern.
+    ///
+    /// ``max_depth`` overrides the default group-nesting cap (default 64)
+    /// applied to the pattern at compile time.
+    ///
+    /// .. warning::
+    ///    Do not source ``max_depth`` from untrusted input — an attacker
+    ///    who controls the cap can re-enable regex compiler stack overflows.
     #[new]
-    fn new(pattern: &str) -> PyResult<Self> {
-        let inner = uppsala::xsd_regex::XsdRegex::compile(pattern)
-            .map_err(|e| PyValueError::new_err(format!("Invalid XSD regex: {}", e)))?;
+    #[pyo3(signature = (pattern, *, max_depth=None))]
+    fn new(pattern: &str, max_depth: Option<u32>) -> PyResult<Self> {
+        let inner = match max_depth {
+            Some(d) => uppsala::xsd_regex::XsdRegex::compile_with_max_depth(pattern, d),
+            None => uppsala::xsd_regex::XsdRegex::compile(pattern),
+        }
+        .map_err(|e| PyValueError::new_err(format!("Invalid XSD regex: {}", e)))?;
         Ok(XsdRegex {
             inner,
             pattern: pattern.to_string(),
@@ -1447,8 +1517,20 @@ impl XsdRegex {
     }
 
     /// Test whether the input string fully matches the pattern.
-    fn is_match(&self, input: &str) -> bool {
-        self.inner.is_match(input)
+    ///
+    /// ``max_steps`` overrides the default backtracking-step cap
+    /// (default 1,000,000). The matcher returns ``False`` when the cap
+    /// is reached, which prevents catastrophic-backtracking ReDoS.
+    ///
+    /// .. warning::
+    ///    Do not source ``max_steps`` from untrusted input — an attacker
+    ///    who controls the cap can re-enable polynomial-ReDoS attacks.
+    #[pyo3(signature = (input, *, max_steps=None))]
+    fn is_match(&self, input: &str, max_steps: Option<usize>) -> bool {
+        match max_steps {
+            Some(n) => self.inner.is_match_with_max_steps(input, n),
+            None => self.inner.is_match(input),
+        }
     }
 
     /// The original pattern string.
@@ -1471,20 +1553,56 @@ impl XsdRegex {
 // ---------------------------------------------------------------------------
 
 /// Parse an XML string and return a Document.
+///
+/// See ``Document.__init__`` for the keyword arguments that override the
+/// safe parser defaults.
 #[pyfunction]
-fn parse(xml: &str) -> PyResult<Document> {
-    Document::new(xml)
+#[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None))]
+fn parse(
+    xml: &str,
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+) -> PyResult<Document> {
+    Document::new(xml, max_depth, max_entity_expansion, namespace_aware)
 }
 
 /// Parse XML bytes and return a Document, with automatic encoding detection.
+///
+/// See ``Document.from_bytes`` for the keyword arguments that override
+/// the safe parser defaults.
 #[pyfunction]
-fn parse_bytes(data: &[u8]) -> PyResult<Document> {
-    Document::from_bytes(data)
+#[pyo3(signature = (data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None))]
+fn parse_bytes(
+    data: &[u8],
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+) -> PyResult<Document> {
+    Document::from_bytes(data, max_depth, max_entity_expansion, namespace_aware)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn build_parser(
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+) -> UParser {
+    let mut parser = match namespace_aware {
+        Some(false) => UParser::with_namespace_aware(false),
+        _ => UParser::new(),
+    };
+    if let Some(d) = max_depth {
+        parser = parser.with_max_depth(d);
+    }
+    if let Some(b) = max_entity_expansion {
+        parser = parser.with_max_entity_expansion(b);
+    }
+    parser
+}
 
 fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlWriteOptions {
     let mut opts = match indent {
@@ -1525,6 +1643,22 @@ fn pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Functions
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(parse_bytes, m)?)?;
+
+    // Default resource-limit constants (uppsala 0.4.0 hardening)
+    m.add("DEFAULT_MAX_DEPTH", DEFAULT_MAX_DEPTH)?;
+    m.add("DEFAULT_MAX_ENTITY_EXPANSION", DEFAULT_MAX_ENTITY_EXPANSION)?;
+    m.add(
+        "DEFAULT_MAX_XPATH_DEPTH",
+        uppsala::xpath::DEFAULT_MAX_XPATH_DEPTH,
+    )?;
+    m.add(
+        "DEFAULT_MAX_REGEX_GROUP_DEPTH",
+        uppsala::xsd_regex::DEFAULT_MAX_REGEX_GROUP_DEPTH,
+    )?;
+    m.add(
+        "DEFAULT_MAX_REGEX_STEPS",
+        uppsala::xsd_regex::DEFAULT_MAX_REGEX_STEPS,
+    )?;
 
     // Exceptions
     m.add("XmlParseError", m.py().get_type::<XmlParseError>())?;

@@ -534,3 +534,53 @@ Node iteration patterns
     # String conversion
     print(str(root))   # "<root><a/><b/><c/><d/><e/></root>"
     print(repr(root))  # "Node(<root>)"
+
+.. _resource-limits:
+
+Resource limits and hardening
+-----------------------------
+
+The parser, XPath engine, and XSD regex engine apply safe defaults that
+block denial-of-service inputs out of the box.
+
+.. code-block:: python
+
+    import pyuppsala
+    from pyuppsala import parse, XPathEvaluator, XsdRegex, XmlParseError
+
+    # Inspect the active defaults
+    print(pyuppsala.DEFAULT_MAX_DEPTH)             # 128
+    print(pyuppsala.DEFAULT_MAX_ENTITY_EXPANSION)  # 1048576
+    print(pyuppsala.DEFAULT_MAX_XPATH_DEPTH)       # 32
+    print(pyuppsala.DEFAULT_MAX_REGEX_GROUP_DEPTH) # 64
+    print(pyuppsala.DEFAULT_MAX_REGEX_STEPS)       # 1000000
+
+    # Billion-laughs is rejected by default: each entity expands the next
+    # tenfold, so &g; would expand to ~10 MiB -- well past the 1 MiB cap.
+    billion_laughs = (
+        '<!DOCTYPE l ['
+        '<!ENTITY a "AAAAAAAAAA">'
+        '<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
+        '<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">'
+        '<!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">'
+        '<!ENTITY e "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;">'
+        '<!ENTITY f "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;">'
+        '<!ENTITY g "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;">'
+        ']>'
+        '<l>&g;</l>'
+    )
+    try:
+        parse(billion_laughs)
+    except XmlParseError as e:
+        print("blocked:", e)  # Entity expansion exceeds configured limit
+
+    # Raise the depth cap when a legitimate document needs it
+    deep = "<a>" * 200 + "</a>" * 200
+    doc = parse(deep, max_depth=300)
+
+    # Tighten the regex backtracking budget for an untrusted pattern
+    rx = XsdRegex("(a|aa)+b")
+    print(rx.is_match("a" * 30, max_steps=100))  # False -- bailed early
+
+    # Raise the XPath depth cap for an unusually nested expression
+    ev = XPathEvaluator(max_depth=128)
