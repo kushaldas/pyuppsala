@@ -1603,8 +1603,7 @@ fn build_parser(
 fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
     if data.len() < 2 {
         // Too short for BOM detection — assume UTF-8.
-        return String::from_utf8(data.to_vec())
-            .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-8: {}", e)));
+        return decode_utf8(data);
     }
 
     // Byte-order mark detection.
@@ -1616,8 +1615,7 @@ fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
     }
     if data.len() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
         // UTF-8 BOM — strip it and decode as UTF-8.
-        return String::from_utf8(data[3..].to_vec())
-            .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-8: {}", e)));
+        return decode_utf8(&data[3..]);
     }
 
     // No BOM — check for UTF-16 without BOM (XML spec Appendix F).
@@ -1629,15 +1627,31 @@ fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
     }
 
     // Default: UTF-8.
-    String::from_utf8(data.to_vec())
+    decode_utf8(data)
+}
+
+/// Validate UTF-8 bytes and copy them into a String. Borrows the slice for
+/// validation (`std::str::from_utf8`) so there is no intermediate `Vec<u8>`
+/// allocation on the common UTF-8 path — only the final owned copy.
+fn decode_utf8(bytes: &[u8]) -> PyResult<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
         .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-8: {}", e)))
 }
 
-/// Decode UTF-16 bytes (big- or little-endian) to a String.
+/// Decode UTF-16 bytes (big- or little-endian) to a String. An odd-length
+/// input is rejected as malformed rather than silently dropping the trailing
+/// byte (which could truncate invalid UTF-16 into superficially valid text).
 fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
+    let endian = if big_endian { "BE" } else { "LE" };
+    if !bytes.len().is_multiple_of(2) {
+        return Err(XmlWellFormednessError::new_err(format!(
+            "1:1: Invalid UTF-16 {}: odd number of bytes",
+            endian
+        )));
+    }
     let code_units: Vec<u16> = bytes
-        .chunks(2)
-        .filter(|chunk| chunk.len() == 2)
+        .chunks_exact(2)
         .map(|chunk| {
             if big_endian {
                 u16::from_be_bytes([chunk[0], chunk[1]])
@@ -1646,13 +1660,8 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
             }
         })
         .collect();
-    String::from_utf16(&code_units).map_err(|e| {
-        XmlWellFormednessError::new_err(format!(
-            "1:1: Invalid UTF-16 {}: {}",
-            if big_endian { "BE" } else { "LE" },
-            e
-        ))
-    })
+    String::from_utf16(&code_units)
+        .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-16 {}: {}", endian, e)))
 }
 
 fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlWriteOptions {

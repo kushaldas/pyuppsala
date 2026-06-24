@@ -1483,6 +1483,13 @@ class TestSecurityLimits:
                 # input_text must reflect the decoded source, not raw bytes.
                 assert doc.input_text == xml
 
+    def test_parse_bytes_utf16_odd_length_rejected(self):
+        # An odd-length UTF-16 payload is malformed; it must be rejected
+        # rather than silently truncating the trailing byte.
+        good = b"\xff\xfe" + "<root/>".encode("utf-16-le")
+        with pytest.raises((XmlParseError, XmlWellFormednessError)):
+            parse_bytes(good + b"\x00")  # one extra byte -> odd body length
+
     def test_parse_bytes_namespace_aware_matches_default(self):
         # parse_bytes(data, namespace_aware=True) must behave identically to
         # parse_bytes(data) for a UTF-16 input (the reviewer's scenario).
