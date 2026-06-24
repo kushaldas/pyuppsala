@@ -447,10 +447,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard
-            .doc
-            .node_range(self.id)
-            .map(|r| (r.start, r.end)))
+        Ok(guard.doc.node_range(self.id).map(|r| (r.start, r.end)))
     }
 
     /// The original source text of this node, or None.
@@ -709,11 +706,11 @@ struct Document {
 impl Document {
     /// Parse an XML string into a Document.
     ///
-    /// Optional keyword arguments override uppsala's safe defaults:
+    /// Optional keyword arguments override uppsala's safe defaults (see module constants like ``DEFAULT_MAX_DEPTH``):
     ///
-    /// * ``max_depth`` — maximum element nesting depth (default 128).
+    /// * ``max_depth`` — maximum element nesting depth (default ``DEFAULT_MAX_DEPTH``).
     /// * ``max_entity_expansion`` — maximum total bytes from entity expansion
-    ///   (default 1 << 20 = 1 MiB).
+    ///   (default ``DEFAULT_MAX_ENTITY_EXPANSION``).
     /// * ``namespace_aware`` — when False, disables XML namespace processing.
     ///
     /// .. warning::
@@ -1660,8 +1657,9 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
             }
         })
         .collect();
-    String::from_utf16(&code_units)
-        .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-16 {}: {}", endian, e)))
+    String::from_utf16(&code_units).map_err(|e| {
+        XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-16 {}: {}", endian, e))
+    })
 }
 
 fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlWriteOptions {
