@@ -938,9 +938,10 @@ impl Document {
     ///
     /// Optional keyword arguments override uppsala's safe defaults:
     ///
-    /// * ``max_depth`` - maximum element nesting depth (default 128).
+    /// * ``max_depth`` - maximum element nesting depth (default
+    ///   ``DEFAULT_MAX_DEPTH``, from ``uppsala::parser``).
     /// * ``max_entity_expansion`` - maximum total bytes from entity expansion
-    ///   (default 1 << 20 = 1 MiB).
+    ///   (default ``DEFAULT_MAX_ENTITY_EXPANSION``, from ``uppsala::parser``).
     /// * ``namespace_aware`` - when False, disables XML namespace processing.
     ///
     /// .. warning::

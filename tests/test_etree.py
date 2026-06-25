@@ -515,6 +515,22 @@ class TestStandalone:
         tree = P.parse(data)
         assert tree.getroot().tag == "doc"
 
+    @pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+    def test_parse_utf16_without_bom(self, encoding):
+        # UTF-16 (LE/BE) XML without a BOM must be recognized as content, not a
+        # filename, matching the native parse_bytes decoder.
+        raw = "<doc>hi</doc>".encode(encoding)
+        root = P.parse(raw).getroot()
+        assert root.tag == "doc"
+        assert root.text == "hi"
+
+    def test_tostring_rejects_non_xml_method(self):
+        el = P.fromstring("<a>x</a>")
+        assert P.tostring(el, method="xml", encoding="unicode") == "<a>x</a>"
+        for method in ("html", "text", "c14n"):
+            with pytest.raises(NotImplementedError):
+                P.tostring(el, method=method)
+
     def test_namespaced_attribute_delete_is_exact(self):
         # Two attributes share a local name in different namespaces; deleting one
         # via Clark notation must not remove the other.

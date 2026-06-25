@@ -68,7 +68,10 @@ Supported features
 - **Factories**: :func:`Element`, :func:`SubElement`, :func:`Comment`,
   :func:`ProcessingInstruction` / ``PI``, :class:`QName`, :func:`ElementTree`.
 - **I/O**: :func:`fromstring` / ``XML``, :func:`fromstringlist`, :func:`parse`,
-  :func:`tostring`, :func:`tounicode`, :func:`dump`, :func:`indent`.
+  :func:`tostring` (``method="xml"`` only), :func:`tounicode`, :func:`dump`,
+  :func:`indent`. Byte input is decoded by Uppsala (UTF-8 and UTF-16, with or
+  without a BOM); ``XMLParser(encoding=...)`` overrides the declared encoding
+  for byte input.
 - **Search**: ``find`` / ``findall`` / ``findtext`` / ``iterfind`` (ElementPath),
   ``iter`` / ``itertext``, and full ``.xpath()`` via Uppsala's XPath 1.0 engine,
   plus :class:`XPath` / :class:`ETXPath` / :func:`XPathEvaluator`.
@@ -120,6 +123,9 @@ than being ignored:
 - ``XMLParser(recover=True)`` -- error-recovery parsing
 - DTD processing (``dtd_validation``, ``load_dtd``, ``resolve_entities=False``)
 - custom URI resolvers and parser ``target`` objects
+- ``tostring(method=...)`` other than ``"xml"`` (``"html"``, ``"text"``,
+  ``"c14n"`` raise ``NotImplementedError``)
+- XPath variable binding (passing ``$name`` keyword arguments to ``.xpath()``)
 - ``iterparse``, C14N / ``canonicalize``
 - RelaxNG, Schematron, and DTD schema classes (only :class:`XMLSchema` /
   XSD is provided)

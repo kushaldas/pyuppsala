@@ -566,16 +566,16 @@ def parse_bytes(
 # Default resource-limit constants (uppsala 0.4.0 hardening)
 
 DEFAULT_MAX_DEPTH: int
-"""Default maximum element nesting depth (128)."""
+"""Default maximum element nesting depth (from uppsala's parser::DEFAULT_MAX_DEPTH)."""
 
 DEFAULT_MAX_ENTITY_EXPANSION: int
-"""Default maximum total bytes from entity expansion (1 MiB)."""
+"""Default maximum total bytes from entity expansion (from uppsala's parser::DEFAULT_MAX_ENTITY_EXPANSION)."""
 
 DEFAULT_MAX_XPATH_DEPTH: int
-"""Default maximum XPath expression-tree depth (32)."""
+"""Default maximum XPath expression-tree depth (from uppsala's xpath::DEFAULT_MAX_XPATH_DEPTH)."""
 
 DEFAULT_MAX_REGEX_GROUP_DEPTH: int
-"""Default maximum XSD regex group-nesting depth (64)."""
+"""Default maximum XSD regex group-nesting depth (from uppsala's xsd_regex::DEFAULT_MAX_REGEX_GROUP_DEPTH)."""
 
 DEFAULT_MAX_REGEX_STEPS: int
-"""Default maximum backtracking steps when matching an XSD regex (1,000,000)."""
+"""Default maximum backtracking steps when matching an XSD regex (from uppsala's xsd_regex::DEFAULT_MAX_REGEX_STEPS)."""

@@ -1427,10 +1427,16 @@ def _looks_like_xml(source):
     """Heuristic: True if ``source`` is string/bytes holding XML rather than a path.
 
     A leading byte-order mark (UTF-8 or UTF-16) marks the input as encoded XML
-    content; otherwise the first non-whitespace character must be ``<``.
+    content; a UTF-16 document without a BOM encodes its leading ``<`` as
+    ``b"<\\x00"`` (LE) or ``b"\\x00<"`` (BE), matching uppsala's own BOM-less
+    UTF-16 detection in ``parse_bytes``. Otherwise the first non-whitespace
+    character must be ``<``.
     """
     if isinstance(source, bytes):
         if any(source.startswith(bom) for bom in _BOMS):
+            return True
+        # UTF-16 without a BOM: a leading '<' is two bytes, one of them NUL.
+        if source[:2] in (b"<\x00", b"\x00<"):
             return True
         return source.lstrip()[:1] == b"<"
     if isinstance(source, str):
@@ -1459,7 +1465,15 @@ def tostring(
     Returns ``str`` when ``encoding="unicode"``, otherwise ``bytes`` (default
     encoding is ASCII with no XML declaration, like lxml). ``pretty_print=True``
     indents the output.
+
+    Only ``method="xml"`` is supported; other lxml serialization methods
+    (``"html"``, ``"text"``, ``"c14n"``) change the output semantics and raise
+    ``NotImplementedError`` rather than being silently ignored.
     """
+    if method not in (None, "xml"):
+        raise NotImplementedError(
+            "tostring(method=%r) is not supported; only 'xml' is available" % method
+        )
     if isinstance(element_or_tree, _ElementTree):
         element = element_or_tree.getroot()
     else:
