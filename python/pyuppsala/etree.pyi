@@ -229,7 +229,8 @@ class XMLParser:
         namespace_aware: Optional[bool] = None,
         collect_ids: bool = True,
         compact: bool = True,
-        **kwargs: Any,
+        target: Any = None,
+        resolvers: Any = None,
     ) -> None: ...
 
 def fromstring(

@@ -708,7 +708,7 @@ class _Element:
     def __iter__(self):
         """Iterate over child elements (and comments/PIs) as proxies."""
         proxy = self._holder.proxy
-        return iter([proxy(k) for k in _content_children(self._node)])
+        return (proxy(k) for k in _content_children(self._node))
 
     def __getitem__(self, index):
         """Index or slice into the child elements."""
@@ -796,7 +796,12 @@ class _Element:
         snode = src_el._node
         stail = _following_text_node(snode)
         new_node = _clone_node(dst, snode)
-        new_tail = dst.doc.create_text(stail.text or "") if stail is not None else None
+        if stail is None:
+            new_tail = None
+        elif stail.kind == "cdata":
+            new_tail = dst.doc.create_cdata(stail.text or "")
+        else:
+            new_tail = dst.doc.create_text(stail.text or "")
         _repoint_subtree(sh, dst, snode, new_node)
         if snode.parent is not None:
             if stail is not None:
@@ -1308,9 +1313,14 @@ class XMLParser:
             raise NotImplementedError("DTD processing is not supported")
         if not resolve_entities:
             raise NotImplementedError("resolve_entities=False is not supported")
-        if kwargs.get("target") is not None:
+        target = kwargs.pop("target", None)
+        resolvers = kwargs.pop("resolvers", None)
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise TypeError("unexpected XMLParser keyword argument(s): %s" % names)
+        if target is not None:
             raise NotImplementedError("custom parser targets are not supported")
-        if kwargs.get("resolvers") is not None:
+        if resolvers is not None:
             raise NotImplementedError("custom URI resolvers are not supported")
         self._opts = {
             "huge_tree": huge_tree,

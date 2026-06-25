@@ -478,6 +478,11 @@ class TestStandalone:
         root = P.fromstring("<a><b/></a>", parser)
         assert root.tag == "a"
 
+    def test_parser_rejects_unknown_kwargs(self):
+        P.XMLParser(target=None, resolvers=None)
+        with pytest.raises(TypeError):
+            P.XMLParser(unexpected=True)
+
     def test_remove_comments(self):
         parser = P.XMLParser(remove_comments=True)
         root = P.fromstring("<a><!--x--><b/></a>", parser)
@@ -582,6 +587,18 @@ class TestStandalone:
         # t1 is untouched and t2 still owns y.
         assert [e.tag for e in t1] == ["c"]
         assert y.getparent().tag == "x"
+
+    def test_cross_tree_move_preserves_cdata_tail(self):
+        src = P.fromstring(
+            "<src><item/><![CDATA[tail]]></src>",
+            P.XMLParser(strip_cdata=False),
+        )
+        dst = P.Element("dst")
+        dst.append(src[0])
+        assert (
+            P.tostring(dst, encoding="unicode")
+            == "<dst><item/><![CDATA[tail]]></dst>"
+        )
 
     def test_index_non_element_raises_valueerror(self):
         root = P.fromstring("<r><a/></r>")
