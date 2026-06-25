@@ -253,3 +253,23 @@ QName matching
     print(q.matches("Envelope", namespace_uri="http://schemas.xmlsoap.org/soap/envelope/"))  # True
     print(q.matches("Envelope"))  # False -- namespace doesn't match None
     print(q.matches("Body", namespace_uri="http://schemas.xmlsoap.org/soap/envelope/"))  # False
+
+Using the lxml-compatible etree API
+-----------------------------------
+
+If you are coming from ``lxml.etree``, the :mod:`pyuppsala.etree` submodule lets
+most existing code run by changing only the import.
+
+.. code-block:: python
+
+    from pyuppsala import etree
+
+    root = etree.fromstring("<a x='1'><b>hi</b>tail</a>")
+    print(root.find("b").text)   # hi
+    print(root.find("b").tail)   # tail
+
+    child = etree.SubElement(root, "c")
+    child.text = "y"
+    print(etree.tostring(root, encoding="unicode"))
+
+See :doc:`etree` for the full feature matrix and migration notes.

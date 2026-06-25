@@ -15,15 +15,15 @@ use uppsala::{Document as UDocument, XmlError};
 // Custom Python exceptions
 // ---------------------------------------------------------------------------
 
-create_exception!(pyuppsala, XmlParseError, pyo3::exceptions::PyException);
+create_exception!(_pyuppsala, XmlParseError, pyo3::exceptions::PyException);
 create_exception!(
-    pyuppsala,
+    _pyuppsala,
     XmlWellFormednessError,
     pyo3::exceptions::PyException
 );
-create_exception!(pyuppsala, XmlNamespaceError, pyo3::exceptions::PyException);
-create_exception!(pyuppsala, XPathError, pyo3::exceptions::PyException);
-create_exception!(pyuppsala, XsdValidationError, pyo3::exceptions::PyException);
+create_exception!(_pyuppsala, XmlNamespaceError, pyo3::exceptions::PyException);
+create_exception!(_pyuppsala, XPathError, pyo3::exceptions::PyException);
+create_exception!(_pyuppsala, XsdValidationError, pyo3::exceptions::PyException);
 
 fn xml_error_to_pyerr(e: XmlError) -> PyErr {
     match e {
@@ -50,7 +50,7 @@ fn xml_error_to_pyerr(e: XmlError) -> PyErr {
 }
 
 // ---------------------------------------------------------------------------
-// Shared document handle — allows multiple Python objects to reference one DOM
+// Shared document handle - allows multiple Python objects to reference one DOM
 // ---------------------------------------------------------------------------
 
 /// Wraps a Document alongside the original input text.
@@ -66,7 +66,7 @@ struct DocWithInput {
 type SharedDoc = Arc<Mutex<DocWithInput>>;
 
 // ---------------------------------------------------------------------------
-// QName — Python wrapper
+// QName - Python wrapper
 // ---------------------------------------------------------------------------
 
 /// A qualified XML name with optional namespace URI and prefix.
@@ -166,7 +166,7 @@ impl QName {
 }
 
 // ---------------------------------------------------------------------------
-// Attribute — Python wrapper
+// Attribute - Python wrapper
 // ---------------------------------------------------------------------------
 
 /// An XML attribute with a qualified name and string value.
@@ -210,12 +210,12 @@ impl Attribute {
 }
 
 // ---------------------------------------------------------------------------
-// Node — a lightweight handle into a Document
+// Node - a lightweight handle into a Document
 // ---------------------------------------------------------------------------
 
 /// A node within an XML document.
 ///
-/// Nodes are lightweight handles — the actual data lives inside the Document.
+/// Nodes are lightweight handles - the actual data lives inside the Document.
 /// Do not use a Node after its parent Document has been garbage collected.
 #[pyclass(name = "Node", from_py_object)]
 #[derive(Clone)]
@@ -396,6 +396,213 @@ impl Node {
             .collect())
     }
 
+    /// A stable integer identity for this node within its Document.
+    ///
+    /// Two `Node` handles referring to the same underlying node return the same
+    /// value. Used by the etree layer to maintain an identity-stable proxy cache.
+    #[getter]
+    fn node_id(&self) -> usize {
+        self.id.index()
+    }
+
+    /// The first child node, or None.
+    #[getter]
+    fn first_child(&self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.first_child(self.id).map(|cid| Node {
+            doc: Arc::clone(&self.doc),
+            id: cid,
+        }))
+    }
+
+    /// The last child node, or None.
+    #[getter]
+    fn last_child(&self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.last_child(self.id).map(|cid| Node {
+            doc: Arc::clone(&self.doc),
+            id: cid,
+        }))
+    }
+
+    /// The next sibling node, or None.
+    #[getter]
+    fn next_sibling(&self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.next_sibling(self.id).map(|sid| Node {
+            doc: Arc::clone(&self.doc),
+            id: sid,
+        }))
+    }
+
+    /// The previous sibling node, or None.
+    #[getter]
+    fn previous_sibling(&self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.previous_sibling(self.id).map(|sid| Node {
+            doc: Arc::clone(&self.doc),
+            id: sid,
+        }))
+    }
+
+    /// In-scope namespace declarations on this element as (prefix, uri) pairs.
+    ///
+    /// The prefix is None for the default namespace (`xmlns="..."`). Returns an
+    /// empty list for non-element nodes.
+    #[getter]
+    fn namespace_declarations(&self) -> PyResult<Vec<(Option<String>, String)>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.element(self.id) {
+            Some(el) => Ok(el
+                .namespace_declarations
+                .iter()
+                .map(|(p, u)| {
+                    let prefix = if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.to_string())
+                    };
+                    (prefix, u.to_string())
+                })
+                .collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Set the content of a Text, CDATA, or Comment node in place.
+    ///
+    /// Raises ValueError for other node kinds. Used by the etree layer to assign
+    /// element `.text`/`.tail` and comment text without recreating nodes.
+    fn set_text(&self, content: &str) -> PyResult<()> {
+        let mut guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind_mut(self.id) {
+            Some(NodeKind::Text(t)) => {
+                *t = std::borrow::Cow::Owned(content.to_string());
+                Ok(())
+            }
+            Some(NodeKind::CData(t)) => {
+                *t = std::borrow::Cow::Owned(content.to_string());
+                Ok(())
+            }
+            Some(NodeKind::Comment(t)) => {
+                *t = std::borrow::Cow::Owned(content.to_string());
+                Ok(())
+            }
+            _ => Err(PyValueError::new_err(
+                "Node is not a text, cdata, or comment node",
+            )),
+        }
+    }
+
+    /// The content of a Comment node, or None for other node kinds.
+    #[getter]
+    fn comment_text(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind(self.id) {
+            Some(NodeKind::Comment(t)) => Ok(Some(t.to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    /// The target of a ProcessingInstruction node, or None for other kinds.
+    #[getter]
+    fn pi_target(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind(self.id) {
+            Some(NodeKind::ProcessingInstruction(pi)) => Ok(Some(pi.target.to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    /// The data of a ProcessingInstruction node, or None.
+    #[getter]
+    fn pi_data(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind(self.id) {
+            Some(NodeKind::ProcessingInstruction(pi)) => {
+                Ok(pi.data.as_ref().map(|d| d.to_string()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Set the data of a ProcessingInstruction node. Raises ValueError otherwise.
+    #[pyo3(signature = (data=None))]
+    fn set_pi_data(&self, data: Option<&str>) -> PyResult<()> {
+        let mut guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind_mut(self.id) {
+            Some(NodeKind::ProcessingInstruction(pi)) => {
+                pi.data = data.map(|d| std::borrow::Cow::Owned(d.to_string()));
+                Ok(())
+            }
+            _ => Err(PyValueError::new_err(
+                "Node is not a processing instruction",
+            )),
+        }
+    }
+
+    /// Rename an element node's qualified name in place.
+    ///
+    /// Raises ValueError if the node is not an element. Used by the etree layer
+    /// for `element.tag = ...` assignment.
+    #[pyo3(signature = (local_name, namespace_uri=None, prefix=None))]
+    fn set_qname(
+        &self,
+        local_name: &str,
+        namespace_uri: Option<&str>,
+        prefix: Option<&str>,
+    ) -> PyResult<()> {
+        let mut guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.element_mut(self.id) {
+            Some(el) => {
+                el.name = match (namespace_uri, prefix) {
+                    (Some(ns), Some(p)) => {
+                        UQName::full(p.to_string(), ns.to_string(), local_name.to_string())
+                    }
+                    (Some(ns), None) => {
+                        UQName::with_namespace(ns.to_string(), local_name.to_string())
+                    }
+                    _ => UQName::local(local_name.to_string()),
+                };
+                Ok(())
+            }
+            None => Err(PyValueError::new_err("Node is not an element")),
+        }
+    }
+
     /// The line number of this node in the source document (1-based).
     #[getter]
     fn line(&self) -> PyResult<usize> {
@@ -447,7 +654,10 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.node_range(self.id).map(|r| (r.start, r.end)))
+        Ok(guard
+            .doc
+            .node_range(self.id)
+            .map(|r| (r.start, r.end)))
     }
 
     /// The original source text of this node, or None.
@@ -689,7 +899,7 @@ impl NodeIterator {
 }
 
 // ---------------------------------------------------------------------------
-// Document — Python wrapper
+// Document - Python wrapper
 // ---------------------------------------------------------------------------
 
 /// An XML document.
@@ -706,12 +916,12 @@ struct Document {
 impl Document {
     /// Parse an XML string into a Document.
     ///
-    /// Optional keyword arguments override uppsala's safe defaults (see module constants like ``DEFAULT_MAX_DEPTH``):
+    /// Optional keyword arguments override uppsala's safe defaults:
     ///
-    /// * ``max_depth`` — maximum element nesting depth (default ``DEFAULT_MAX_DEPTH``).
-    /// * ``max_entity_expansion`` — maximum total bytes from entity expansion
-    ///   (default ``DEFAULT_MAX_ENTITY_EXPANSION``).
-    /// * ``namespace_aware`` — when False, disables XML namespace processing.
+    /// * ``max_depth`` - maximum element nesting depth (default 128).
+    /// * ``max_entity_expansion`` - maximum total bytes from entity expansion
+    ///   (default 1 << 20 = 1 MiB).
+    /// * ``namespace_aware`` - when False, disables XML namespace processing.
     ///
     /// .. warning::
     ///    Do not source these values from untrusted input. An attacker who
@@ -737,7 +947,7 @@ impl Document {
     /// with or without BOM).
     ///
     /// Optional keyword arguments override uppsala's safe defaults. Encoding
-    /// auto-detection is applied in all cases — passing ``max_depth``,
+    /// auto-detection is applied in all cases - passing ``max_depth``,
     /// ``max_entity_expansion``, or ``namespace_aware`` does not change how
     /// the bytes are decoded, so UTF-16 input keeps working regardless.
     ///
@@ -940,6 +1150,43 @@ impl Document {
         Ok(())
     }
 
+    /// Add or replace an `xmlns` declaration on an element node.
+    ///
+    /// `prefix=None` sets the default namespace (`xmlns="uri"`); otherwise sets
+    /// `xmlns:prefix="uri"`. Used by the etree layer so namespaced trees built
+    /// in memory serialize with correct namespace declarations. Raises
+    /// ValueError if `node` is not an element.
+    #[pyo3(signature = (node, prefix, uri))]
+    fn set_namespace_declaration(
+        &self,
+        node: &Node,
+        prefix: Option<&str>,
+        uri: &str,
+    ) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.element_mut(node.id) {
+            Some(el) => {
+                let p = prefix.unwrap_or("");
+                match el
+                    .namespace_declarations
+                    .iter_mut()
+                    .find(|(existing, _)| existing.as_ref() == p)
+                {
+                    Some(slot) => slot.1 = std::borrow::Cow::Owned(uri.to_string()),
+                    None => el.namespace_declarations.push((
+                        std::borrow::Cow::Owned(p.to_string()),
+                        std::borrow::Cow::Owned(uri.to_string()),
+                    )),
+                }
+                Ok(())
+            }
+            None => Err(PyValueError::new_err("Node is not an element")),
+        }
+    }
+
     /// Insert a child node before a reference node.
     fn insert_before(&self, parent: &Node, new_child: &Node, reference: &Node) -> PyResult<()> {
         let mut guard = self
@@ -1106,7 +1353,7 @@ impl XPathEvaluator {
     /// (default 32) used to bound recursive parsing of XPath expressions.
     ///
     /// .. warning::
-    ///    Do not source ``max_depth`` from untrusted input — an attacker
+    ///    Do not source ``max_depth`` from untrusted input - an attacker
     ///    who controls the cap can re-enable XPath stack-overflow attacks.
     #[new]
     #[pyo3(signature = (*, max_depth=None))]
@@ -1339,7 +1586,7 @@ impl XsdValidator {
 }
 
 // ---------------------------------------------------------------------------
-// XmlWriter — imperative XML builder
+// XmlWriter - imperative XML builder
 // ---------------------------------------------------------------------------
 
 /// An imperative XML builder for constructing XML fragments.
@@ -1487,7 +1734,7 @@ impl XsdRegex {
     /// applied to the pattern at compile time.
     ///
     /// .. warning::
-    ///    Do not source ``max_depth`` from untrusted input — an attacker
+    ///    Do not source ``max_depth`` from untrusted input - an attacker
     ///    who controls the cap can re-enable regex compiler stack overflows.
     #[new]
     #[pyo3(signature = (pattern, *, max_depth=None))]
@@ -1510,7 +1757,7 @@ impl XsdRegex {
     /// is reached, which prevents catastrophic-backtracking ReDoS.
     ///
     /// .. warning::
-    ///    Do not source ``max_steps`` from untrusted input — an attacker
+    ///    Do not source ``max_steps`` from untrusted input - an attacker
     ///    who controls the cap can re-enable polynomial-ReDoS attacks.
     #[pyo3(signature = (input, *, max_steps=None))]
     fn is_match(&self, input: &str, max_steps: Option<usize>) -> bool {
@@ -1594,12 +1841,12 @@ fn build_parser(
 /// Decode raw XML bytes to a String, auto-detecting the encoding (UTF-8 and
 /// UTF-16 LE/BE, with or without BOM). This mirrors uppsala's internal
 /// `decode_xml_bytes` so the keyword-argument code path keeps the same
-/// encoding support as the plain `parse_bytes` fast path — the `Parser`
+/// encoding support as the plain `parse_bytes` fast path - the `Parser`
 /// builder only accepts `&str`, so without this the only option would be a
 /// lossy UTF-8 decode that mangles UTF-16 input.
 fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
     if data.len() < 2 {
-        // Too short for BOM detection — assume UTF-8.
+        // Too short for BOM detection - assume UTF-8.
         return decode_utf8(data);
     }
 
@@ -1611,11 +1858,11 @@ fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
         return decode_utf16(&data[2..], true); // UTF-16 BE BOM
     }
     if data.len() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
-        // UTF-8 BOM — strip it and decode as UTF-8.
+        // UTF-8 BOM - strip it and decode as UTF-8.
         return decode_utf8(&data[3..]);
     }
 
-    // No BOM — check for UTF-16 without BOM (XML spec Appendix F).
+    // No BOM - check for UTF-16 without BOM (XML spec Appendix F).
     if data[0] == 0x00 && data[1] == 0x3C {
         return decode_utf16(data, true); // UTF-16 BE without BOM
     }
@@ -1629,7 +1876,7 @@ fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
 
 /// Validate UTF-8 bytes and copy them into a String. Borrows the slice for
 /// validation (`std::str::from_utf8`) so there is no intermediate `Vec<u8>`
-/// allocation on the common UTF-8 path — only the final owned copy.
+/// allocation on the common UTF-8 path - only the final owned copy.
 fn decode_utf8(bytes: &[u8]) -> PyResult<String> {
     std::str::from_utf8(bytes)
         .map(str::to_owned)
@@ -1657,9 +1904,8 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
             }
         })
         .collect();
-    String::from_utf16(&code_units).map_err(|e| {
-        XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-16 {}: {}", endian, e))
-    })
+    String::from_utf16(&code_units)
+        .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-16 {}: {}", endian, e)))
 }
 
 fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlWriteOptions {
@@ -1677,7 +1923,7 @@ fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlW
 // Module definition
 // ---------------------------------------------------------------------------
 
-/// pyuppsala — Python bindings for the Uppsala XML library.
+/// pyuppsala - Python bindings for the Uppsala XML library.
 ///
 /// A zero-dependency XML library providing:
 /// - XML 1.0 parsing and well-formedness checking
@@ -1686,7 +1932,7 @@ fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlW
 /// - XSD validation
 /// - XSD regex pattern matching
 #[pymodule]
-fn pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Classes
     m.add_class::<Document>()?;
     m.add_class::<Node>()?;

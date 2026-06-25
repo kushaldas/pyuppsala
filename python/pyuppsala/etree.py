@@ -1,0 +1,1575 @@
+"""An ``lxml.etree``-compatible API layered on the Uppsala XML engine.
+
+This module lets code written for ``lxml.etree`` run on pyuppsala's secure,
+pure-Rust parser with minimal changes::
+
+    from pyuppsala import etree
+    root = etree.fromstring("<a><b>hi</b></a>")
+    print(root.find("b").text)
+
+Elements are live views over a backing native ``Document`` (mirroring lxml,
+where ``_Element`` objects are views over a libxml2 tree). Each standalone tree
+owns one native document; cross-tree moves deep-copy the subtree into the target
+document and preserve Python object identity via a per-document proxy cache.
+
+See ``docs/etree.rst`` for the supported/unsupported feature matrix.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+from weakref import WeakValueDictionary
+
+from . import _pyuppsala as _u
+from . import _elementpath as ElementPath
+
+__all__ = [
+    # Factories & node types
+    "Element",
+    "SubElement",
+    "Comment",
+    "ProcessingInstruction",
+    "PI",
+    "QName",
+    "ElementTree",
+    # I/O
+    "fromstring",
+    "fromstringlist",
+    "XML",
+    "parse",
+    "tostring",
+    "tounicode",
+    "dump",
+    "indent",
+    "iselement",
+    # Search
+    "XPath",
+    "ETXPath",
+    "XPathEvaluator",
+    # Parser & validation
+    "XMLParser",
+    "register_namespace",
+    "XMLSchema",
+    # Exceptions
+    "LxmlError",
+    "Error",
+    "XMLSyntaxError",
+    "ParseError",
+    "XPathError",
+    "XPathEvalError",
+    "XPathSyntaxError",
+    "DocumentInvalid",
+    "XMLSchemaParseError",
+]
+
+
+# ---------------------------------------------------------------------------
+# Exceptions (lxml-named hierarchy, mapping pyuppsala exceptions underneath)
+# ---------------------------------------------------------------------------
+
+
+class LxmlError(Exception):
+    """Base class for all exceptions raised by pyuppsala.etree."""
+
+
+Error = LxmlError
+
+
+class XMLSyntaxError(LxmlError, SyntaxError):
+    """Raised for XML parsing / well-formedness errors."""
+
+
+# ElementTree code commonly catches ``ParseError``.
+ParseError = XMLSyntaxError
+
+
+class XPathError(LxmlError):
+    """Base class for XPath errors."""
+
+
+class XPathEvalError(XPathError):
+    """Raised when an XPath expression fails to evaluate."""
+
+
+class XPathSyntaxError(XPathError, SyntaxError):
+    """Raised when an XPath expression is malformed."""
+
+
+class DocumentInvalid(LxmlError):
+    """Raised by ``XMLSchema.assertValid`` when a document fails validation."""
+
+
+class XMLSchemaParseError(LxmlError):
+    """Raised when an XSD schema cannot be built."""
+
+
+# ---------------------------------------------------------------------------
+# Namespace registry and Clark-notation helpers
+# ---------------------------------------------------------------------------
+
+_namespace_map = {
+    "http://www.w3.org/XML/1998/namespace": "xml",
+    "http://www.w3.org/1999/xhtml": "html",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#": "rdf",
+    "http://schemas.xmlsoap.org/wsdl/": "wsdl",
+    "http://www.w3.org/2001/XMLSchema": "xs",
+    "http://www.w3.org/2001/XMLSchema-instance": "xsi",
+}
+
+
+def register_namespace(prefix, uri):
+    """Register a prefix -> URI mapping used when serializing built trees."""
+    if not isinstance(prefix, str) or not isinstance(uri, str):
+        raise TypeError("prefix and uri must be strings")
+    import re as _re
+
+    if _re.match(r"ns\d+$", prefix):
+        raise ValueError("Prefixes of the form ns<N> are reserved.")
+    # Drop any existing mapping for this uri or prefix, then register.
+    for u, p in list(_namespace_map.items()):
+        if u == uri or p == prefix:
+            del _namespace_map[u]
+    _namespace_map[uri] = prefix
+
+
+def _tag_split(tag):
+    """Split a tag string into ``(namespace_uri_or_None, local_name)``."""
+    if tag and tag[0] == "{":
+        uri, brace, local = tag[1:].partition("}")
+        if not brace:
+            raise ValueError("Invalid tag name %r" % tag)
+        return (uri or None), local
+    return None, tag
+
+
+def _make_clark(namespace_uri, local):
+    if namespace_uri:
+        return "{%s}%s" % (namespace_uri, local)
+    return local
+
+
+def _clark_of(tag):
+    if isinstance(tag, QName):
+        return tag.text
+    return tag
+
+
+def _split_key(key):
+    """Split a tag/attribute key (str or QName) into ``(ns_or_None, local)``."""
+    if isinstance(key, QName):
+        return key.namespace, key.localname
+    return _tag_split(key)
+
+
+def _prefix_for_ns(ns, nsmap):
+    """Pick a serialization prefix for ``ns`` from ``nsmap``/registry, or None."""
+    if nsmap:
+        has_default = False
+        for pfx, uri in nsmap.items():
+            if uri == ns:
+                if pfx is None:
+                    has_default = True
+                else:
+                    return pfx
+        if has_default:
+            return None
+    return _namespace_map.get(ns)
+
+
+# ---------------------------------------------------------------------------
+# QName
+# ---------------------------------------------------------------------------
+
+
+class QName:
+    """A qualified XML name, compatible with ``lxml.etree.QName``."""
+
+    def __init__(self, text_or_uri_or_element, tag=None):
+        """Build from ``QName("{uri}local")``, ``QName(uri, local)``, or an element.
+
+        With both arguments, the first is the namespace URI and the second the
+        local name; with one argument it may be Clark notation, a bare local
+        name, an existing QName, or an element (whose tag is used).
+        """
+        if tag is not None:
+            uri = text_or_uri_or_element
+            if isinstance(uri, QName):
+                uri = uri.namespace
+            self.text = _make_clark(uri, tag) if uri else tag
+        else:
+            value = text_or_uri_or_element
+            if isinstance(value, _Element):
+                value = value.tag
+            if isinstance(value, QName):
+                value = value.text
+            self.text = value
+        ns, local = _tag_split(self.text)
+        self.namespace = ns
+        self.localname = local
+
+    def __str__(self):
+        return self.text
+
+    def __repr__(self):
+        return "QName(%r)" % self.text
+
+    def __hash__(self):
+        return hash(self.text)
+
+    def __eq__(self, other):
+        if isinstance(other, QName):
+            return self.text == other.text
+        if isinstance(other, str):
+            return self.text == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+
+# ---------------------------------------------------------------------------
+# Document holder + proxy cache
+# ---------------------------------------------------------------------------
+
+_CONTENT_KINDS = ("element", "comment", "processing_instruction")
+_TEXT_KINDS = ("text", "cdata")
+
+
+class _DocHolder:
+    """Owns one native Document and an identity-stable proxy cache."""
+
+    __slots__ = ("doc", "_proxies", "_ns_counter", "__weakref__")
+
+    def __init__(self, doc):
+        self.doc = doc
+        self._proxies = WeakValueDictionary()
+        self._ns_counter = 0
+
+    def proxy(self, node):
+        """Return the identity-stable ``_Element`` wrapper for ``node``.
+
+        Looks the node up by its stable ``node_id`` in the per-document cache so
+        that repeated lookups of the same underlying node return the *same*
+        Python object (``root[0] is root[0]``), matching lxml. ``node_id`` values
+        are never reused by uppsala's arena, so cached entries stay valid for the
+        life of the document; the ``WeakValueDictionary`` drops entries once no
+        Python code holds the wrapper.
+        """
+        if node is None:
+            return None
+        nid = node.node_id
+        el = self._proxies.get(nid)
+        if el is None:
+            # Build the wrapper directly (bypassing __init__, which _Element
+            # does not define) and register it in the cache.
+            el = _Element.__new__(_Element)
+            el._holder = self
+            el._node = node
+            el._id = nid
+            self._proxies[nid] = el
+        else:
+            # Refresh the live native handle: the cached wrapper's stored Node
+            # may be stale after tree mutations, but its node_id is unchanged.
+            el._node = node
+        return el
+
+    def new_prefix(self):
+        """Generate a fresh, unused ``ns<N>`` namespace prefix for serialization."""
+        pfx = "ns%d" % self._ns_counter
+        self._ns_counter += 1
+        return pfx
+
+
+def _following_text_node(node):
+    """Return the text node immediately after ``node`` (its lxml ``.tail``), or None.
+
+    In uppsala's DOM, the text following an element's end tag is stored as the
+    element's next sibling text node; that node is what lxml exposes as ``.tail``.
+    """
+    ns = node.next_sibling
+    if ns is not None and ns.kind in _TEXT_KINDS:
+        return ns
+    return None
+
+
+def _content_children(node):
+    """Return the children lxml treats as element content: elements, comments, PIs.
+
+    Text and CDATA nodes are excluded because lxml exposes them via ``.text`` and
+    ``.tail`` rather than as indexable children.
+    """
+    return [c for c in node.children if c.kind in _CONTENT_KINDS]
+
+
+# ---------------------------------------------------------------------------
+# Subtree cloning / moving across documents
+# ---------------------------------------------------------------------------
+
+
+def _clone_node(dst, snode):
+    """Deep-copy ``snode`` (from any document) into ``dst`` (a ``_DocHolder``).
+
+    Recreates the node and its whole subtree in the destination document and
+    returns the new root node. Used to move elements between trees, since
+    uppsala ``NodeId``s are scoped to a single document and cannot be reparented
+    across documents directly.
+    """
+    ddoc = dst.doc
+    kind = snode.kind
+    if kind == "element":
+        # Recreate the element with its qualified name, namespace declarations,
+        # and attributes, then recurse into its children below.
+        q = snode.tag
+        dn = ddoc.create_element(q.local_name, q.namespace_uri, q.prefix)
+        for pfx, uri in snode.namespace_declarations:
+            ddoc.set_namespace_declaration(dn, pfx, uri)
+        for a in snode.attributes:
+            an = a.name
+            dn.set_attribute(an.local_name, a.value, an.namespace_uri, an.prefix)
+    elif kind == "text":
+        dn = ddoc.create_text(snode.text or "")
+    elif kind == "cdata":
+        dn = ddoc.create_cdata(snode.text or "")
+    elif kind == "comment":
+        dn = ddoc.create_comment(snode.comment_text or "")
+    elif kind == "processing_instruction":
+        dn = ddoc.create_processing_instruction(snode.pi_target, snode.pi_data)
+    else:
+        raise TypeError("Cannot clone node of kind %r" % kind)
+    for child in snode.children:
+        ddoc.append_child(dn, _clone_node(dst, child))
+    return dn
+
+
+def _repoint_subtree(src_holder, dst, snode, dnode):
+    """Move any live proxies from the source subtree onto the cloned subtree.
+
+    Walks the source (``snode``) and cloned (``dnode``) trees in lock-step. When
+    a source node has a live wrapper, that wrapper is re-pointed at the cloned
+    node and re-registered in the destination cache, so existing Python
+    references to a moved element (and its descendants) remain valid afterward -
+    mirroring lxml's in-place move semantics.
+    """
+    proxy = src_holder._proxies.get(snode.node_id)
+    if proxy is not None:
+        src_holder._proxies.pop(snode.node_id, None)
+        proxy._holder = dst
+        proxy._node = dnode
+        proxy._id = dnode.node_id
+        dst._proxies[dnode.node_id] = proxy
+    # Children are cloned in the same order, so a positional zip pairs them up.
+    for sc, dc in zip(snode.children, dnode.children):
+        _repoint_subtree(src_holder, dst, sc, dc)
+
+
+def _extract(holder, node):
+    """Detach ``node`` and its tail text node from their parent.
+
+    Returns the detached tail text node (or None). The tail travels with the
+    element so that moving or removing the element also moves/removes its
+    trailing text, matching lxml/ElementTree semantics.
+    """
+    tail = _following_text_node(node)
+    if node.parent is not None:
+        # Detach the tail first while it is still a sibling, then the node.
+        if tail is not None:
+            holder.doc.detach(tail)
+        holder.doc.detach(node)
+    return tail
+
+
+def _attach(holder, parent_node, node, tail, ref=None):
+    """Insert ``node`` under ``parent_node`` (before ``ref``, or appended), then
+    reattach its ``tail`` text node immediately after it."""
+    if ref is None:
+        holder.doc.append_child(parent_node, node)
+    else:
+        holder.doc.insert_before(parent_node, node, ref)
+    if tail is not None:
+        holder.doc.insert_after(parent_node, tail, node)
+
+
+# ---------------------------------------------------------------------------
+# Element construction
+# ---------------------------------------------------------------------------
+
+
+def _build_element(holder, tag, nsmap):
+    ns, local = _split_key(tag)
+    prefix = _prefix_for_ns(ns, nsmap) if ns else None
+    node = holder.doc.create_element(local, ns, prefix)
+    if nsmap:
+        for pfx, uri in nsmap.items():
+            holder.doc.set_namespace_declaration(node, pfx, uri)
+    return node
+
+
+def _finalize_element_ns(holder, node):
+    """Ensure an attached element's namespace is serializable, reusing an
+    in-scope prefix/default declaration when one exists rather than emitting a
+    redundant ``xmlns`` declaration."""
+    q = node.tag
+    ns = q.namespace_uri
+    if not ns:
+        return
+    # Walk self + ancestors looking for an in-scope declaration of ``ns``.
+    n = node
+    while n is not None and n.kind == "element":
+        for pfx, uri in n.namespace_declarations:
+            if uri == ns:
+                if pfx is None:
+                    if q.prefix is None:
+                        return  # inherits the default namespace
+                else:
+                    if q.prefix != pfx:
+                        node.set_qname(q.local_name, ns, pfx)
+                    return
+        n = n.parent
+    # Not in scope anywhere: declare it on this element.
+    prefix = q.prefix or _namespace_map.get(ns)
+    if prefix is None:
+        prefix = holder.new_prefix()
+    if q.prefix != prefix:
+        node.set_qname(q.local_name, ns, prefix)
+    holder.doc.set_namespace_declaration(node, prefix, ns)
+
+
+def _apply_attribs(el, attrib, extra):
+    """Apply an ``attrib`` dict and ``**extra`` keyword attributes to ``el``."""
+    if attrib:
+        for k, v in attrib.items():
+            el.set(k, v)
+    for k, v in extra.items():
+        # Keyword attributes are passed through as attribute names verbatim,
+        # matching lxml's Element(tag, key="value") shorthand.
+        el.set(k, v)
+
+
+def Element(_tag, attrib=None, nsmap=None, **extra):
+    """Create a new standalone element (the root of its own tree)."""
+    holder = _DocHolder(_u.Document.empty())
+    node = _build_element(holder, _tag, nsmap)
+    holder.doc.append_child(holder.doc.root, node)
+    _finalize_element_ns(holder, node)
+    el = holder.proxy(node)
+    _apply_attribs(el, attrib, extra)
+    return el
+
+
+def SubElement(_parent, _tag, attrib=None, nsmap=None, **extra):
+    """Create a child element of ``_parent`` in the same document."""
+    holder = _parent._holder
+    node = _build_element(holder, _tag, nsmap)
+    holder.doc.append_child(_parent._node, node)
+    _finalize_element_ns(holder, node)
+    el = holder.proxy(node)
+    _apply_attribs(el, attrib, extra)
+    return el
+
+
+def Comment(text=None):
+    """Create a standalone comment node (its ``.tag`` is the ``Comment`` factory)."""
+    holder = _DocHolder(_u.Document.empty())
+    node = holder.doc.create_comment("" if text is None else text)
+    holder.doc.append_child(holder.doc.root, node)
+    return holder.proxy(node)
+
+
+def ProcessingInstruction(target, text=None):
+    """Create a standalone processing-instruction node."""
+    holder = _DocHolder(_u.Document.empty())
+    node = holder.doc.create_processing_instruction(target, text)
+    holder.doc.append_child(holder.doc.root, node)
+    return holder.proxy(node)
+
+
+PI = ProcessingInstruction
+
+
+# ---------------------------------------------------------------------------
+# _Element
+# ---------------------------------------------------------------------------
+
+
+class _Element:
+    """A live view over a node in a native Document. Compatible with lxml's
+    ``_Element``."""
+
+    __slots__ = ("_holder", "_node", "_id", "__weakref__")
+
+    # -- identity / repr --------------------------------------------------
+
+    def __repr__(self):
+        """An lxml-style repr, distinguishing elements, comments and PIs."""
+        kind = self._node.kind
+        if kind == "comment":
+            return "<!--%s-->" % (self._node.comment_text or "")
+        if kind == "processing_instruction":
+            return "<?%s?>" % self._node.pi_target
+        return "<Element %s at 0x%x>" % (self.tag, id(self))
+
+    # -- tag --------------------------------------------------------------
+
+    @property
+    def tag(self):
+        """The element's tag in Clark ``{uri}local`` notation.
+
+        For comment and processing-instruction nodes this returns the
+        :func:`Comment` / :func:`ProcessingInstruction` factory, matching lxml
+        (so ``elem.tag is Comment`` identifies a comment).
+        """
+        kind = self._node.kind
+        if kind == "comment":
+            return Comment
+        if kind == "processing_instruction":
+            return ProcessingInstruction
+        q = self._node.tag
+        if q is None:
+            return None
+        return _make_clark(q.namespace_uri, q.local_name)
+
+    @tag.setter
+    def tag(self, value):
+        """Rename the element, ensuring its namespace stays declared/in scope."""
+        ns, local = _split_key(value)
+        prefix = _prefix_for_ns(ns, self.nsmap) if ns else None
+        self._node.set_qname(local, ns, prefix)
+        if ns:
+            # Make sure the (possibly new) namespace has a usable, declared prefix.
+            if prefix is None:
+                prefix = self._ensure_ns_prefix(ns)
+                self._node.set_qname(local, ns, prefix)
+            else:
+                self._holder.doc.set_namespace_declaration(self._node, prefix, ns)
+
+    # -- text / tail ------------------------------------------------------
+    # ElementTree's .text/.tail are virtual views over real sibling text nodes
+    # in uppsala's DOM: .text is the element's leading text-node child, and
+    # .tail is the text node immediately following the element. Storing them as
+    # real nodes means serialization needs no special handling.
+
+    @property
+    def text(self):
+        """The text directly inside this element, before its first child, or None.
+
+        For comments/PIs this returns the comment/PI body instead.
+        """
+        kind = self._node.kind
+        if kind == "comment":
+            return self._node.comment_text
+        if kind == "processing_instruction":
+            return self._node.pi_data
+        fc = self._node.first_child
+        if fc is not None and fc.kind in _TEXT_KINDS:
+            return fc.text
+        return None
+
+    @text.setter
+    def text(self, value):
+        """Set the leading text, maintaining the single-leading-text-node invariant."""
+        kind = self._node.kind
+        if kind == "comment":
+            self._node.set_text("" if value is None else value)
+            return
+        if kind == "processing_instruction":
+            self._node.set_pi_data(value)
+            return
+        doc = self._holder.doc
+        node = self._node
+        fc = node.first_child
+        has_text = fc is not None and fc.kind in _TEXT_KINDS
+        if value is None:
+            # Drop the leading text node entirely.
+            if has_text:
+                doc.remove_child(node, fc)
+            return
+        if has_text:
+            fc.set_text(value)
+        else:
+            # No leading text node yet: create one and make it the first child.
+            tn = doc.create_text(value)
+            if fc is None:
+                doc.append_child(node, tn)
+            else:
+                doc.insert_before(node, tn, fc)
+
+    @property
+    def tail(self):
+        """The text following this element's end tag, before the next sibling, or None."""
+        ns = self._node.next_sibling
+        if ns is not None and ns.kind in _TEXT_KINDS:
+            return ns.text
+        return None
+
+    @tail.setter
+    def tail(self, value):
+        """Set the trailing text by mutating/creating the following text node."""
+        doc = self._holder.doc
+        node = self._node
+        parent = node.parent
+        ns = _following_text_node(node)
+        if value is None:
+            if ns is not None and parent is not None:
+                doc.remove_child(parent, ns)
+            return
+        if ns is not None:
+            ns.set_text(value)
+        elif parent is not None:
+            # A tail can only exist where there is a parent to host the text node.
+            tn = doc.create_text(value)
+            doc.insert_after(parent, tn, node)
+
+    # -- attributes -------------------------------------------------------
+
+    @property
+    def attrib(self):
+        """A live ``dict``-like view of this element's attributes."""
+        return _Attrib(self)
+
+    def _ensure_ns_prefix(self, ns):
+        """Return a serialization prefix for ``ns`` that is in scope on this
+        element, declaring one here if none is inherited.
+
+        Walks self and ancestors for an existing non-default declaration of
+        ``ns``; otherwise falls back to a registered prefix or a generated
+        ``ns<N>`` and declares it on this element.
+        """
+        n = self._node
+        while n is not None and n.kind == "element":
+            for pfx, uri in n.namespace_declarations:
+                if uri == ns and pfx is not None:
+                    return pfx
+            n = n.parent
+        pfx = _namespace_map.get(ns)
+        if pfx is None:
+            pfx = self._holder.new_prefix()
+        self._holder.doc.set_namespace_declaration(self._node, pfx, ns)
+        return pfx
+
+    def _attr_clark(self, a):
+        """Return an attribute's name in Clark ``{uri}local`` notation."""
+        n = a.name
+        return _make_clark(n.namespace_uri, n.local_name)
+
+    def get(self, key, default=None):
+        """Return the attribute value for ``key`` (str or QName), or ``default``."""
+        ns, local = _split_key(key)
+        v = self._node.get_attribute(local, ns)
+        return v if v is not None else default
+
+    def set(self, key, value):
+        """Set attribute ``key`` (str or QName) to ``value``.
+
+        For namespaced attributes, ensures a usable prefix is in scope (declaring
+        one if needed) so the attribute serializes correctly.
+        """
+        ns, local = _split_key(key)
+        prefix = None
+        if ns:
+            prefix = self._ensure_ns_prefix(ns)
+        self._node.set_attribute(local, value, ns, prefix)
+
+    def keys(self):
+        """Return the attribute names (Clark notation) in document order."""
+        return [self._attr_clark(a) for a in self._node.attributes]
+
+    def values(self):
+        """Return the attribute values in document order."""
+        return [a.value for a in self._node.attributes]
+
+    def items(self):
+        """Return ``(name, value)`` attribute pairs in document order."""
+        return [(self._attr_clark(a), a.value) for a in self._node.attributes]
+
+    # -- children / sequence protocol ------------------------------------
+    # Only element/comment/PI children participate; text/CDATA are surfaced via
+    # .text/.tail instead (see _content_children).
+
+    def __len__(self):
+        """The number of child elements (and comments/PIs)."""
+        return len(_content_children(self._node))
+
+    def __iter__(self):
+        """Iterate over child elements (and comments/PIs) as proxies."""
+        proxy = self._holder.proxy
+        return iter([proxy(k) for k in _content_children(self._node)])
+
+    def __getitem__(self, index):
+        """Index or slice into the child elements."""
+        kids = _content_children(self._node)
+        proxy = self._holder.proxy
+        if isinstance(index, slice):
+            return [proxy(k) for k in kids[index]]
+        return proxy(kids[index])
+
+    def __setitem__(self, index, element):
+        """Replace the child at ``index`` with ``element``."""
+        if isinstance(index, slice):
+            raise NotImplementedError("slice assignment is not supported in v1")
+        kids = _content_children(self._node)
+        old = kids[index]
+        # Insert the new child in place, then remove the old one (with its tail).
+        node, tail = self._adopt(element)
+        self._holder.doc.insert_before(self._node, node, old)
+        _extract(self._holder, old)
+        if tail is not None:
+            self._holder.doc.insert_after(self._node, tail, node)
+
+    def __delitem__(self, index):
+        """Remove the child at ``index`` (or the children in a slice)."""
+        kids = _content_children(self._node)
+        targets = kids[index] if isinstance(index, slice) else [kids[index]]
+        for k in targets:
+            _extract(self._holder, k)
+
+    def __contains__(self, element):
+        """True if ``element`` is a direct child of this element."""
+        if not isinstance(element, _Element):
+            return False
+        p = element._node.parent
+        return p is not None and p.node_id == self._id
+
+    def index(self, child, start=None, stop=None):
+        """Return the position of ``child`` among this element's children."""
+        kids = _content_children(self._node)
+        ids = [k.node_id for k in kids]
+        try:
+            pos = ids.index(child._id)
+        except ValueError:
+            raise ValueError("element is not a child of this node") from None
+        if start is not None and pos < start:
+            raise ValueError("element is not in the requested range")
+        if stop is not None and pos >= stop:
+            raise ValueError("element is not in the requested range")
+        return pos
+
+    # -- mutation ---------------------------------------------------------
+
+    def _adopt(self, element):
+        """Return ``(native_node, tail)`` in this holder for ``element``,
+        cloning across documents when necessary."""
+        if element._holder is self._holder:
+            tail = _extract(self._holder, element._node)
+            return element._node, tail
+        return self._clone_into_self(element)
+
+    def _clone_into_self(self, src_el):
+        """Deep-copy ``src_el`` (from another document) into this holder.
+
+        Returns ``(new_node, new_tail)``. The source subtree is cloned, its live
+        proxies are re-pointed onto the clones, and the original is detached from
+        its tree, so the net effect is a move with preserved object identity.
+        """
+        sh = src_el._holder
+        dst = self._holder
+        snode = src_el._node
+        stail = _following_text_node(snode)
+        new_node = _clone_node(dst, snode)
+        new_tail = dst.doc.create_text(stail.text or "") if stail is not None else None
+        _repoint_subtree(sh, dst, snode, new_node)
+        if snode.parent is not None:
+            if stail is not None:
+                sh.doc.detach(stail)
+            sh.doc.detach(snode)
+        return new_node, new_tail
+
+    def append(self, element):
+        """Append ``element`` as the last child (moving it if it has a parent)."""
+        node, tail = self._adopt(element)
+        _attach(self._holder, self._node, node, tail)
+
+    def extend(self, elements):
+        """Append each element in ``elements`` in order."""
+        for el in elements:
+            self.append(el)
+
+    def insert(self, index, element):
+        """Insert ``element`` at ``index`` among the child elements."""
+        node, tail = self._adopt(element)
+        kids = _content_children(self._node)
+        n = len(kids)
+        # Clamp the index like list.insert: negative counts from the end, and an
+        # out-of-range index appends.
+        if index < 0:
+            index += n
+        if index < 0:
+            index = 0
+        ref = kids[index] if index < n else None
+        _attach(self._holder, self._node, node, tail, ref)
+
+    def remove(self, element):
+        """Remove direct child ``element`` (and its tail). Raises if not a child."""
+        p = element._node.parent
+        if p is None or p.node_id != self._id:
+            raise ValueError("Element is not a child of this node.")
+        _extract(self._holder, element._node)
+
+    def replace(self, old_element, new_element):
+        """Replace child ``old_element`` with ``new_element`` in place."""
+        node, tail = self._adopt(new_element)
+        self._holder.doc.insert_before(self._node, node, old_element._node)
+        _extract(self._holder, old_element._node)
+        if tail is not None:
+            self._holder.doc.insert_after(self._node, tail, node)
+
+    def addnext(self, element):
+        """Insert ``element`` as this element's next sibling."""
+        parent = self._node.parent
+        if parent is None:
+            raise TypeError("cannot add sibling to a root element")
+        node, tail = self._adopt(element)
+        self._holder.doc.insert_after(parent, node, self._node)
+        if tail is not None:
+            self._holder.doc.insert_after(parent, tail, node)
+
+    def addprevious(self, element):
+        """Insert ``element`` as this element's previous sibling."""
+        parent = self._node.parent
+        if parent is None:
+            raise TypeError("cannot add sibling to a root element")
+        node, tail = self._adopt(element)
+        self._holder.doc.insert_before(parent, node, self._node)
+        if tail is not None:
+            self._holder.doc.insert_after(parent, tail, node)
+
+    def makeelement(self, _tag, attrib=None, nsmap=None, **extra):
+        """Create a new (detached) element in the same document as this one."""
+        node = _build_element(self._holder, _tag, nsmap)
+        _finalize_element_ns(self._holder, node)
+        el = self._holder.proxy(node)
+        _apply_attribs(el, attrib, extra)
+        return el
+
+    # -- navigation -------------------------------------------------------
+
+    def getparent(self):
+        """Return the parent element, or None at the tree root."""
+        p = self._node.parent
+        if p is None or p.kind == "document":
+            return None
+        return self._holder.proxy(p)
+
+    def getnext(self):
+        """Return the next sibling element (skipping text nodes), or None."""
+        n = self._node.next_sibling
+        while n is not None and n.kind in _TEXT_KINDS:
+            n = n.next_sibling
+        return self._holder.proxy(n) if n is not None else None
+
+    def getprevious(self):
+        """Return the previous sibling element (skipping text nodes), or None."""
+        n = self._node.previous_sibling
+        while n is not None and n.kind in _TEXT_KINDS:
+            n = n.previous_sibling
+        return self._holder.proxy(n) if n is not None else None
+
+    def itersiblings(self, tag=None, preceding=False):
+        """Yield following (or, with ``preceding=True``, preceding) sibling
+        elements, optionally filtered by ``tag``."""
+        sib = self.getprevious if preceding else self.getnext
+        cur = sib()
+        while cur is not None:
+            if tag is None or _tag_matches(cur._node, tag):
+                yield cur
+            cur = cur.getprevious() if preceding else cur.getnext()
+
+    def iterancestors(self, tag=None):
+        """Yield ancestor elements from parent upward, optionally filtered by ``tag``."""
+        cur = self.getparent()
+        while cur is not None:
+            if tag is None or _tag_matches(cur._node, tag):
+                yield cur
+            cur = cur.getparent()
+
+    def iterdescendants(self, tag=None):
+        """Yield all descendant elements (excluding self) in document order."""
+        for e in self.iter(tag):
+            if e is not self:
+                yield e
+
+    def getroottree(self):
+        """Return an :class:`_ElementTree` wrapping this element's document."""
+        return _ElementTree(self._holder)
+
+    # -- traversal --------------------------------------------------------
+
+    def iter(self, tag=None):
+        """Iterate this element and all descendants in document (pre-order) order.
+
+        With ``tag`` set (or ``"*"`` for any), only matching elements are
+        yielded. Comments/PIs are visited but only match when ``tag`` is None.
+        """
+        if tag == "*":
+            tag = None
+        proxy = self._holder.proxy
+
+        def walk(node):
+            # Pre-order: emit the node itself (if it qualifies), then recurse.
+            if node.kind in _CONTENT_KINDS:
+                if tag is None or _tag_matches(node, tag):
+                    yield proxy(node)
+            for c in node.children:
+                yield from walk(c)
+
+        return walk(self._node)
+
+    def itertext(self):
+        """Yield all text and tail content in this subtree, in document order."""
+        # Ported from xml.etree.ElementTree.itertext: comments/PIs (non-str tags)
+        # contribute no text.
+        tag = self.tag
+        if not isinstance(tag, str) and tag is not None:
+            return
+        t = self.text
+        if t:
+            yield t
+        for e in self:
+            yield from e.itertext()
+            if e.tail:
+                yield e.tail
+
+    # -- search -----------------------------------------------------------
+
+    def find(self, path, namespaces=None):
+        """Return the first subelement matching the ElementPath ``path``, or None."""
+        return ElementPath.find(self, path, namespaces)
+
+    def findall(self, path, namespaces=None):
+        """Return all subelements matching the ElementPath ``path`` as a list."""
+        return ElementPath.findall(self, path, namespaces)
+
+    def findtext(self, path, default=None, namespaces=None):
+        """Return the text of the first match of ``path``, or ``default``."""
+        return ElementPath.findtext(self, path, default, namespaces)
+
+    def iterfind(self, path, namespaces=None):
+        """Iterate over all subelements matching the ElementPath ``path``."""
+        return ElementPath.iterfind(self, path, namespaces)
+
+    def xpath(self, _path, namespaces=None, **variables):
+        """Evaluate a full XPath 1.0 expression against this element as context.
+
+        Delegates to the native :class:`pyuppsala.XPathEvaluator`. Node-set
+        results are returned as ``_Element`` proxies; string/number/boolean
+        results are returned as the corresponding Python types.
+        """
+        ev = _u.XPathEvaluator()
+        if namespaces:
+            for pfx, uri in namespaces.items():
+                if pfx:
+                    ev.add_namespace(pfx, uri)
+        try:
+            result = ev.evaluate(self._holder.doc, _path, self._node)
+        except _u.XPathError as e:
+            raise XPathEvalError(str(e)) from e
+        return _wrap_xpath_result(self._holder, result)
+
+    # -- misc properties --------------------------------------------------
+
+    @property
+    def nsmap(self):
+        """Mapping of in-scope prefixes to URIs (None key = default namespace)."""
+        result = {}
+        # Collect declarations from the root down so that inner declarations
+        # override outer ones for the same prefix.
+        chain = []
+        n = self._node
+        while n is not None and n.kind == "element":
+            chain.append(n)
+            n = n.parent
+        for node in reversed(chain):
+            for pfx, uri in node.namespace_declarations:
+                result[pfx] = uri
+        return result
+
+    @property
+    def prefix(self):
+        """The namespace prefix of this element's tag, or None."""
+        q = self._node.tag
+        return q.prefix if q is not None else None
+
+    @property
+    def sourceline(self):
+        """The 1-based source line of this element, or None for built nodes."""
+        try:
+            line = self._node.line
+        except Exception:
+            return None
+        return line or None
+
+    @property
+    def base(self):
+        """The xml:base URI of this element. Not tracked in v1 (always None)."""
+        return None
+
+
+def _tag_matches(node, tag):
+    """True if ``node`` is an element whose Clark-notation tag equals ``tag``."""
+    if node.kind != "element":
+        return False
+    q = node.tag
+    return _make_clark(q.namespace_uri, q.local_name) == tag
+
+
+def _wrap_xpath_result(holder, result):
+    """Wrap native XPath node-set results as ``_Element`` proxies; pass scalars
+    (bool/float/str) through unchanged."""
+    if isinstance(result, list):
+        return [holder.proxy(n) if isinstance(n, _u.Node) else n for n in result]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Attribute mapping view
+# ---------------------------------------------------------------------------
+
+
+class _Attrib:
+    """A live ``dict``-like view over an element's attributes (lxml's ``.attrib``).
+
+    Keys are attribute names in Clark ``{uri}local`` notation (or plain names);
+    all reads and writes go straight to the backing element.
+    """
+
+    __slots__ = ("_el",)
+
+    def __init__(self, el):
+        self._el = el
+
+    def __getitem__(self, key):
+        v = self._el.get(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __setitem__(self, key, value):
+        self._el.set(key, value)
+
+    def __delitem__(self, key):
+        ns, local = _split_key(key)
+        old = self._el._node.remove_attribute(local)
+        if old is None:
+            raise KeyError(key)
+
+    def __contains__(self, key):
+        return self._el.get(key) is not None
+
+    def __len__(self):
+        return len(self._el._node.attributes)
+
+    def __iter__(self):
+        return iter(self._el.keys())
+
+    def get(self, key, default=None):
+        """Return the value for ``key``, or ``default`` if absent."""
+        return self._el.get(key, default)
+
+    def keys(self):
+        """Attribute names in document order."""
+        return self._el.keys()
+
+    def values(self):
+        """Attribute values in document order."""
+        return self._el.values()
+
+    def items(self):
+        """``(name, value)`` pairs in document order."""
+        return self._el.items()
+
+    def update(self, other):
+        """Set multiple attributes from a mapping or iterable of pairs."""
+        pairs = other.items() if hasattr(other, "items") else other
+        for k, v in pairs:
+            self._el.set(k, v)
+
+    def __repr__(self):
+        return repr(dict(self._el.items()))
+
+
+def iselement(element):
+    """Return True if ``element`` is a pyuppsala.etree element."""
+    return isinstance(element, _Element)
+
+
+# ---------------------------------------------------------------------------
+# ElementTree
+# ---------------------------------------------------------------------------
+
+
+class _ElementTree:
+    """A document wrapper (lxml's ``_ElementTree``) holding a root element."""
+
+    def __init__(self, holder):
+        self._holder = holder
+
+    def getroot(self):
+        """Return the root element, or None for an empty document."""
+        root = self._holder.doc.document_element
+        return self._holder.proxy(root) if root is not None else None
+
+    def parse(self, source, parser=None):
+        """Parse ``source`` into this tree, replacing its contents. Returns the root."""
+        data = _read_source(source)
+        el = fromstring(data, parser)
+        self._holder = el._holder
+        return el
+
+    def write(
+        self,
+        file,
+        encoding=None,
+        xml_declaration=None,
+        pretty_print=False,
+        **kwargs,
+    ):
+        """Serialize the tree to ``file`` (a path or writable file object)."""
+        data = tostring(
+            self.getroot(),
+            encoding=encoding,
+            xml_declaration=xml_declaration,
+            pretty_print=pretty_print,
+        )
+        if isinstance(file, (str, bytes, os.PathLike)):
+            mode = "w" if isinstance(data, str) else "wb"
+            with open(file, mode) as fh:
+                fh.write(data)
+        else:
+            file.write(data)
+
+    def find(self, path, namespaces=None):
+        """Find the first matching subelement from the root."""
+        return self.getroot().find(path, namespaces)
+
+    def findall(self, path, namespaces=None):
+        """Find all matching subelements from the root."""
+        return self.getroot().findall(path, namespaces)
+
+    def findtext(self, path, default=None, namespaces=None):
+        """Find the text of the first matching subelement from the root."""
+        return self.getroot().findtext(path, default, namespaces)
+
+    def iterfind(self, path, namespaces=None):
+        """Iterate matching subelements from the root."""
+        return self.getroot().iterfind(path, namespaces)
+
+    def iter(self, tag=None):
+        """Iterate the root element and all its descendants."""
+        return self.getroot().iter(tag)
+
+    def xpath(self, path, namespaces=None, **variables):
+        """Evaluate an XPath expression with the root as context."""
+        return self.getroot().xpath(path, namespaces=namespaces, **variables)
+
+    def getpath(self, element):
+        """Return an absolute XPath locating ``element`` within this tree.
+
+        Positional predicates (``tag[n]``) are added only where a tag is
+        ambiguous among its siblings, matching lxml's ``getpath``.
+        """
+        parts = []
+        cur = element
+        while cur is not None:
+            parent = cur.getparent()
+            if parent is None:
+                parts.append("/" + _path_tag(cur))
+                break
+            # Only number this step if its tag is not unique among siblings.
+            same = [c for c in parent if c.tag == cur.tag]
+            tag = _path_tag(cur)
+            if len(same) > 1:
+                pos = same.index(cur) + 1
+                parts.append("/%s[%d]" % (tag, pos))
+            else:
+                parts.append("/" + tag)
+            cur = parent
+        return "".join(reversed(parts))
+
+
+def _path_tag(element):
+    """Return an element's tag for use in an XPath step (``prefix:local``)."""
+    q = element._node.tag
+    if q is None:
+        return "*"
+    if q.prefix:
+        return "%s:%s" % (q.prefix, q.local_name)
+    return q.local_name
+
+
+def ElementTree(element=None, *, file=None, parser=None):
+    """Create an :class:`_ElementTree`, lxml's document wrapper.
+
+    Wraps ``element``'s document, parses ``file``, or (with neither) creates an
+    empty tree. Exposed as a factory function rather than a class.
+    """
+    if element is not None:
+        return _ElementTree(element._holder)
+    if file is not None:
+        return parse(file, parser)
+    holder = _DocHolder(_u.Document.empty())
+    return _ElementTree(holder)
+
+
+# ---------------------------------------------------------------------------
+# Parsing & serialization
+# ---------------------------------------------------------------------------
+
+
+_HUGE_DEPTH = 1 << 30
+_HUGE_ENTITY = 1 << 40
+
+
+class XMLParser:
+    """A configurable parser, mapping lxml options onto uppsala's knobs."""
+
+    def __init__(
+        self,
+        *,
+        huge_tree=False,
+        remove_comments=False,
+        remove_pis=False,
+        strip_cdata=True,
+        resolve_entities=True,
+        no_network=True,
+        recover=False,
+        dtd_validation=False,
+        load_dtd=False,
+        ns_clean=False,
+        encoding=None,
+        max_depth=None,
+        max_entity_expansion=None,
+        namespace_aware=None,
+        collect_ids=True,
+        compact=True,
+        **kwargs,
+    ):
+        """Validate and store parser options.
+
+        Options that map onto uppsala's parser (``huge_tree``, ``max_depth``,
+        ``max_entity_expansion``, ``namespace_aware``) and post-parse transforms
+        (``remove_comments``, ``remove_pis``, ``strip_cdata``) are honored.
+        Options whose absence would silently change correctness raise
+        ``NotImplementedError``; purely cosmetic options are accepted and ignored.
+        """
+        if recover:
+            raise NotImplementedError("recover-mode parsing is not supported")
+        if dtd_validation or load_dtd:
+            raise NotImplementedError("DTD processing is not supported")
+        if not resolve_entities:
+            raise NotImplementedError("resolve_entities=False is not supported")
+        if kwargs.get("target") is not None:
+            raise NotImplementedError("custom parser targets are not supported")
+        if kwargs.get("resolvers") is not None:
+            raise NotImplementedError("custom URI resolvers are not supported")
+        self._opts = {
+            "huge_tree": huge_tree,
+            "remove_comments": remove_comments,
+            "remove_pis": remove_pis,
+            "strip_cdata": strip_cdata,
+            "max_depth": max_depth,
+            "max_entity_expansion": max_entity_expansion,
+            "namespace_aware": namespace_aware,
+        }
+
+
+def _parse_kwargs(opts):
+    """Translate stored XMLParser options into keyword args for the native parser."""
+    kw = {}
+    # huge_tree lifts the safe defaults; explicit limits then take precedence.
+    if opts.get("huge_tree"):
+        kw["max_depth"] = _HUGE_DEPTH
+        kw["max_entity_expansion"] = _HUGE_ENTITY
+    if opts.get("max_depth") is not None:
+        kw["max_depth"] = opts["max_depth"]
+    if opts.get("max_entity_expansion") is not None:
+        kw["max_entity_expansion"] = opts["max_entity_expansion"]
+    if opts.get("namespace_aware") is not None:
+        kw["namespace_aware"] = opts["namespace_aware"]
+    return kw
+
+
+def _postprocess(holder, opts):
+    """Apply post-parse tree transforms requested by XMLParser options."""
+    root = holder.doc.document_element
+    if root is None:
+        return
+    if opts.get("remove_comments") or opts.get("remove_pis"):
+        _strip_kinds(
+            holder,
+            root,
+            remove_comments=opts.get("remove_comments"),
+            remove_pis=opts.get("remove_pis"),
+        )
+    if opts.get("strip_cdata", True):
+        _convert_cdata(holder, root)
+
+
+def _strip_kinds(holder, node, remove_comments, remove_pis):
+    """Recursively remove comment and/or PI children from the subtree."""
+    for child in list(node.children):
+        kind = child.kind
+        if (kind == "comment" and remove_comments) or (
+            kind == "processing_instruction" and remove_pis
+        ):
+            holder.doc.remove_child(node, child)
+        elif kind == "element":
+            _strip_kinds(holder, child, remove_comments, remove_pis)
+
+
+def _convert_cdata(holder, node):
+    """Recursively replace CDATA nodes with plain text nodes (lxml's default)."""
+    for child in list(node.children):
+        if child.kind == "cdata":
+            tn = holder.doc.create_text(child.text or "")
+            holder.doc.replace_child(node, tn, child)
+        elif child.kind == "element":
+            _convert_cdata(holder, child)
+
+
+def fromstring(text, parser=None):
+    """Parse an XML string (or bytes) and return its root element."""
+    opts = parser._opts if parser is not None else {}
+    kw = _parse_kwargs(opts)
+    try:
+        if isinstance(text, (bytes, bytearray)):
+            doc = _u.parse_bytes(bytes(text), **kw)
+        else:
+            doc = _u.parse(text, **kw)
+    except (
+        _u.XmlParseError,
+        _u.XmlWellFormednessError,
+        _u.XmlNamespaceError,
+    ) as e:
+        # Re-raise native parse failures under the lxml-compatible name.
+        raise XMLSyntaxError(str(e)) from e
+    holder = _DocHolder(doc)
+    if opts:
+        _postprocess(holder, opts)
+    root = doc.document_element
+    if root is None:
+        raise XMLSyntaxError("Document has no root element")
+    return holder.proxy(root)
+
+
+XML = fromstring
+
+
+def fromstringlist(strings, parser=None):
+    """Parse XML supplied as a sequence of string or bytes fragments."""
+    if not strings:
+        raise XMLSyntaxError("empty input")
+    if isinstance(strings[0], (bytes, bytearray)):
+        return fromstring(b"".join(bytes(s) for s in strings), parser)
+    return fromstring("".join(strings), parser)
+
+
+def _read_source(source):
+    """Read parse input from a filename, path, file object, or raw XML string/bytes."""
+    # A str/bytes that does not start with '<' is treated as a filename/path.
+    if isinstance(source, (str, bytes, os.PathLike)) and not _looks_like_xml(source):
+        with open(source, "rb") as fh:
+            return fh.read()
+    if hasattr(source, "read"):
+        return source.read()
+    return source
+
+
+def _looks_like_xml(source):
+    """Heuristic: True if ``source`` is a string/bytes that begins with ``<``."""
+    if isinstance(source, bytes):
+        return source.lstrip()[:1] == b"<"
+    if isinstance(source, str):
+        return source.lstrip()[:1] == "<"
+    return False
+
+
+def parse(source, parser=None):
+    """Parse ``source`` (filename, file object, or XML text) into an ElementTree."""
+    data = _read_source(source)
+    el = fromstring(data, parser)
+    return _ElementTree(el._holder)
+
+
+def tostring(
+    element_or_tree,
+    encoding=None,
+    method="xml",
+    xml_declaration=None,
+    pretty_print=False,
+    **kwargs,
+):
+    """Serialize an element or tree to XML.
+
+    Returns ``str`` when ``encoding="unicode"``, otherwise ``bytes`` (default
+    encoding is ASCII with no XML declaration, like lxml). ``pretty_print=True``
+    indents the output.
+    """
+    if isinstance(element_or_tree, _ElementTree):
+        element = element_or_tree.getroot()
+    else:
+        element = element_or_tree
+    node = element._node
+    if pretty_print:
+        text = node.to_xml_with_options("  ", False)
+        if not text.endswith("\n"):
+            text += "\n"
+    else:
+        text = node.to_xml()
+
+    if encoding is not None and str(encoding).lower() == "unicode":
+        if xml_declaration:
+            text = '<?xml version="1.0"?>\n' + text
+        return text
+
+    # Byte output. Default (encoding=None) is ASCII with no declaration, like lxml.
+    enc = "ASCII" if encoding is None else str(encoding)
+    if xml_declaration is None:
+        xml_declaration = encoding is not None and enc.lower() not in (
+            "utf-8",
+            "us-ascii",
+            "ascii",
+        )
+    if xml_declaration:
+        decl = '<?xml version="1.0" encoding="%s"?>\n' % enc
+        text = decl + text
+    return text.encode(enc, "xmlcharrefreplace")
+
+
+def tounicode(element_or_tree, **kwargs):
+    """Serialize to a ``str`` (shorthand for ``tostring(..., encoding="unicode")``)."""
+    kwargs["encoding"] = "unicode"
+    return tostring(element_or_tree, **kwargs)
+
+
+def dump(elem, *, pretty_print=True, **kwargs):
+    """Write a debug serialization of ``elem`` to stdout."""
+    if isinstance(elem, _ElementTree):
+        elem = elem.getroot()
+    print(tostring(elem, encoding="unicode", pretty_print=pretty_print), end="")
+
+
+def indent(tree, space="  ", level=0):
+    """Add whitespace to a tree's text/tail for pretty-printing in place.
+
+    Ported from ``xml.etree.ElementTree.indent``.
+    """
+    if isinstance(tree, _ElementTree):
+        tree = tree.getroot()
+    if tree is None:
+        return
+    indentations = ["\n" + level * space]
+
+    def _indent(elem, level):
+        child_level = level + 1
+        try:
+            child_indent = indentations[child_level]
+        except IndexError:
+            child_indent = indentations[level] + space
+            indentations.append(child_indent)
+
+        children = list(elem)
+        if not children:
+            return
+        if not elem.text or not elem.text.strip():
+            elem.text = child_indent
+        for child in children:
+            if len(child):
+                _indent(child, child_level)
+            if not child.tail or not child.tail.strip():
+                child.tail = child_indent
+        # dedent the last child's tail
+        if not children[-1].tail or not children[-1].tail.strip():
+            children[-1].tail = indentations[level]
+
+    _indent(tree, level)
+
+
+# ---------------------------------------------------------------------------
+# XPath helpers (precompiled)
+# ---------------------------------------------------------------------------
+
+
+class XPath:
+    """A reusable, precompiled XPath expression callable on elements/trees."""
+
+    def __init__(self, path, namespaces=None, **kwargs):
+        self.path = path
+        self._namespaces = namespaces
+
+    def __call__(self, element_or_tree, **variables):
+        """Evaluate the expression against ``element_or_tree``."""
+        if isinstance(element_or_tree, _ElementTree):
+            element_or_tree = element_or_tree.getroot()
+        return element_or_tree.xpath(self.path, namespaces=self._namespaces)
+
+
+class ETXPath(XPath):
+    """XPath with ElementTree ``{namespace}tag`` notation (treated as XPath)."""
+
+
+def XPathEvaluator(element_or_tree, namespaces=None, **kwargs):
+    """Return a callable that evaluates XPath expressions against a fixed context."""
+    root = (
+        element_or_tree.getroot()
+        if isinstance(element_or_tree, _ElementTree)
+        else element_or_tree
+    )
+
+    def evaluate(path, **variables):
+        return root.xpath(path, namespaces=namespaces)
+
+    return evaluate
+
+
+# ---------------------------------------------------------------------------
+# XSD validation
+# ---------------------------------------------------------------------------
+
+
+class XMLSchema:
+    """An XSD schema validator wrapping :class:`pyuppsala.XsdValidator`.
+
+    Build from a parsed schema element (``XMLSchema(schema_root)``) or a schema
+    file (``XMLSchema(file=...)``). As with the native validator, the schema must
+    not include an ``<?xml ...?>`` declaration.
+    """
+
+    def __init__(self, etree=None, *, file=None):
+        if etree is not None:
+            schema_xml = tostring(etree, encoding="unicode")
+        elif file is not None:
+            if hasattr(file, "read"):
+                schema_xml = file.read()
+                if isinstance(schema_xml, bytes):
+                    schema_xml = schema_xml.decode("utf-8")
+            else:
+                with open(file, "r", encoding="utf-8") as fh:
+                    schema_xml = fh.read()
+        else:
+            raise XMLSchemaParseError("XMLSchema requires an etree or file argument")
+        try:
+            self._validator = _u.XsdValidator(schema_xml)
+        except _u.XsdValidationError as e:
+            raise XMLSchemaParseError(str(e)) from e
+        # Populated by validate(); mirrors lxml's ``.error_log`` (best effort).
+        self.error_log = []
+
+    def validate(self, tree):
+        """Return True if ``tree`` is valid; record failures in ``error_log``."""
+        root = tree.getroot() if isinstance(tree, _ElementTree) else tree
+        xml = root._node.to_xml()
+        self.error_log = self._validator.validate_str(xml)
+        return len(self.error_log) == 0
+
+    def assertValid(self, tree):
+        """Raise :class:`DocumentInvalid` if ``tree`` does not validate."""
+        if not self.validate(tree):
+            messages = "; ".join(e.message for e in self.error_log)
+            raise DocumentInvalid(messages or "Document does not validate")
+
+    def __call__(self, tree):
+        """Return True if ``tree`` validates (alias for :meth:`validate`)."""
+        return self.validate(tree)

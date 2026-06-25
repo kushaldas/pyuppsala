@@ -17,6 +17,8 @@ no C dependencies to compile and no transitive native libraries to audit.
 - **Imperative XML builder** (`XmlWriter`) for constructing output without a DOM
 - **Serialization** with pretty-printing, compact output, and streaming to files
 - **Automatic encoding detection** for UTF-8 and UTF-16 (LE/BE)
+- **lxml.etree-compatible API** via `pyuppsala.etree`, a near drop-in for much of
+  `lxml.etree` backed by Uppsala's secure parser
 
 Read the [full documentation](https://pyuppsala.rtfd.io)
 
@@ -104,6 +106,29 @@ print(regex.is_match("12345"))  # True
 print(regex.is_match("abcde"))  # False
 ```
 
+### lxml-compatible etree API
+
+Code written for `lxml.etree` runs after swapping the import. Elements are live
+views over the underlying document, with stable identity and the familiar
+`.text`/`.tail`/`.attrib` model.
+
+```python
+from pyuppsala import etree  # instead of: from lxml import etree
+
+root = etree.fromstring("<catalog><book id='1'>Dune</book></catalog>")
+print(root.find("book").text)        # Dune
+print(root[0].get("id"))             # 1
+
+cat = etree.Element("catalog")
+book = etree.SubElement(cat, "book", {"id": "2"})
+book.text = "Neuromancer"
+print(etree.tostring(cat, encoding="unicode"))
+# <catalog><book id="2">Neuromancer</book></catalog>
+```
+
+See the [etree documentation](https://pyuppsala.rtfd.io/en/latest/etree.html)
+for the supported and unsupported feature matrix.
+
 ## API overview
 
 | Class / function | Purpose |
@@ -120,6 +145,7 @@ print(regex.is_match("abcde"))  # False
 | `XsdRegex(pattern)` | XSD regular expression pattern matcher |
 | `parse(xml)` | Module-level shorthand for `Document(xml)` |
 | `parse_bytes(data)` | Module-level shorthand for `Document.from_bytes(data)` |
+| `pyuppsala.etree` | lxml.etree-compatible API (`Element`, `SubElement`, `fromstring`, `tostring`, `find`/`findall`, `XPath`, `XMLSchema`, ...) |
 
 ### Exceptions
 
@@ -135,8 +161,9 @@ All exceptions inherit from `Exception`.
 
 ## Type stubs
 
-A `pyuppsala.pyi` file is included for full IDE auto-completion and
-type-checking with mypy/pyright.
+Type stubs (`pyuppsala/__init__.pyi` and `pyuppsala/etree.pyi`, marked with
+`py.typed`) ship with the package for full IDE auto-completion and type-checking
+with mypy/pyright.
 
 ## Development
 

@@ -73,7 +73,7 @@ Module-level functions
    Parse XML from bytes with automatic encoding detection (UTF-8, UTF-16
    LE/BE, with or without a BOM). Encoding detection is applied in all
    cases, so the keyword arguments below never change how the bytes are
-   decoded — UTF-16 input keeps working with or without custom limits.
+   decoded -- UTF-16 input keeps working with or without custom limits.
 
    :param data: Raw bytes of an XML document.
    :param max_depth: See :func:`parse`.
