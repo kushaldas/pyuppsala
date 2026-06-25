@@ -1401,7 +1401,8 @@ def _postprocess(holder, opts):
     root = holder.doc.document_element
     if root is None:
         return
-    if opts.get("remove_comments") or opts.get("remove_pis"):
+    stripping = opts.get("remove_comments") or opts.get("remove_pis")
+    if stripping:
         _strip_kinds(
             holder,
             root,
@@ -1410,6 +1411,13 @@ def _postprocess(holder, opts):
         )
     if opts.get("strip_cdata", True):
         _convert_cdata(holder, root)
+    if stripping:
+        # Removing a comment/PI can leave the text that surrounded it split
+        # across two adjacent text nodes. Merge them so .text/.tail expose a
+        # single contiguous run, matching lxml where the removed node (and the
+        # split it caused) never existed. Run after CDATA conversion so any
+        # converted nodes participate in the merge too.
+        _coalesce_text(holder, root)
 
 
 def _strip_kinds(holder, node, remove_comments, remove_pis):
@@ -1422,6 +1430,29 @@ def _strip_kinds(holder, node, remove_comments, remove_pis):
             holder.doc.remove_child(node, child)
         elif kind == "element":
             _strip_kinds(holder, child, remove_comments, remove_pis)
+
+
+def _coalesce_text(holder, node):
+    """Merge adjacent plain-text sibling nodes into one, recursing into elements.
+
+    Only plain ``text`` nodes are merged; CDATA sections are left as distinct
+    nodes so that ``strip_cdata=False`` preserves them verbatim. The text of
+    each run after the first is appended to the first node and the extra nodes
+    are removed.
+    """
+    run_head = None
+    for child in list(node.children):
+        kind = child.kind
+        if kind == "text":
+            if run_head is None:
+                run_head = child
+            else:
+                run_head.set_text((run_head.text or "") + (child.text or ""))
+                holder.doc.remove_child(node, child)
+        else:
+            run_head = None
+            if kind == "element":
+                _coalesce_text(holder, child)
 
 
 def _convert_cdata(holder, node):

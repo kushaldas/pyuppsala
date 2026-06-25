@@ -698,3 +698,13 @@ class TestStandalone:
         assert P._HUGE_ENTITY <= sys.maxsize
         root = P.fromstring("<r><a/></r>", P.XMLParser(huge_tree=True))
         assert root.tag == "r"
+
+    def test_remove_comment_merges_surrounding_text(self):
+        # Removing a comment/PI must merge the text it split, so .text/.tail
+        # expose a single contiguous run as in lxml.
+        root = P.fromstring("<a>t<!--c-->u<b/></a>", P.XMLParser(remove_comments=True))
+        assert root.text == "tu"
+        assert P.tostring(root, encoding="unicode") == "<a>tu<b/></a>"
+        # Same for a removed PI splitting a tail run.
+        root = P.fromstring("<a><b/>x<?pi y?>z</a>", P.XMLParser(remove_pis=True))
+        assert root[0].tail == "xz"

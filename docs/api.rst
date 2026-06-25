@@ -572,9 +572,16 @@ Node
 
          print(doc.to_xml())  # '<item id="2" status="active"/>'
 
-   .. method:: remove_attribute(name: str) -> str | None
+   .. method:: remove_attribute(name: str, namespace_uri: str | None = None) -> str | None
 
-      Remove an attribute by local name. Returns the old value, or ``None``.
+      Remove an attribute and return its old value, or ``None`` if absent.
+
+      The attribute is matched by both local name and namespace. With
+      ``namespace_uri=None`` (the default) only the attribute that has *no*
+      namespace is removed; passing a URI removes the attribute in exactly that
+      namespace. In both cases an attribute that merely shares the local name in
+      a different namespace is left untouched (mirroring ``get_attribute`` and
+      ``set_attribute``).
 
       .. code-block:: python
 
@@ -583,6 +590,13 @@ Node
          old = item.remove_attribute("status")
          print(old)  # "draft"
          print(doc.to_xml())  # '<item id="1"/>'
+
+         # Namespaced attributes require the matching URI; a plain name does
+         # not remove a namespaced attribute that shares the local name.
+         doc = Document('<item xmlns:x="urn:x" x:status="ok"/>')
+         item = doc.document_element
+         print(item.remove_attribute("status"))            # None (no-namespace)
+         print(item.remove_attribute("status", "urn:x"))   # "ok"
 
    .. method:: to_xml() -> str
 

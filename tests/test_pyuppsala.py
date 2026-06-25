@@ -333,6 +333,34 @@ class TestNode:
         doc = parse("<root/>")
         assert doc.document_element.remove_attribute("missing") is None
 
+    def test_remove_attribute_namespace_exact(self):
+        # remove_attribute matches both local name and namespace: a plain name
+        # only targets the no-namespace attribute, and a URI targets exactly
+        # that namespace. An attribute sharing the local name in a different
+        # namespace must be left untouched.
+        doc = parse(
+            '<root xmlns:a="urn:a" xmlns:b="urn:b" '
+            'k="plain" a:k="va" b:k="vb"/>'
+        )
+        el = doc.document_element
+
+        def attr_map():
+            # Map of (namespace_uri, local_name) -> value for every attribute.
+            return {
+                (a.name.namespace_uri, a.name.local_name): a.value
+                for a in el.attributes
+            }
+
+        # A plain name removes only the no-namespace attribute.
+        assert el.remove_attribute("k") == "plain"
+        assert attr_map() == {("urn:a", "k"): "va", ("urn:b", "k"): "vb"}
+        # A namespace URI removes exactly the attribute in that namespace.
+        assert el.remove_attribute("k", namespace_uri="urn:a") == "va"
+        assert attr_map() == {("urn:b", "k"): "vb"}
+        # A non-matching namespace removes nothing.
+        assert el.remove_attribute("k", namespace_uri="urn:missing") is None
+        assert attr_map() == {("urn:b", "k"): "vb"}
+
     def test_parent(self):
         doc = parse("<root><child/></root>")
         child = doc.document_element.children[0]
