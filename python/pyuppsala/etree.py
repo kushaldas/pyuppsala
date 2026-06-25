@@ -18,6 +18,7 @@ See ``docs/etree.rst`` for the supported/unsupported feature matrix.
 from __future__ import annotations
 
 import os
+import sys
 from weakref import WeakValueDictionary
 
 from . import _pyuppsala as _u
@@ -1077,10 +1078,25 @@ def _tag_matches(node, tag):
 
 
 def _wrap_xpath_result(holder, result):
-    """Wrap native XPath node-set results as ``_Element`` proxies; pass scalars
-    (bool/float/str) through unchanged."""
+    """Convert a native XPath result to lxml-compatible Python values.
+
+    For node-set results, element/comment/PI nodes become ``_Element``
+    proxies while text and CDATA nodes (e.g. from a ``text()`` selection)
+    become plain ``str`` values, matching lxml which returns string results
+    for text-node selections rather than node objects. Scalar results
+    (bool/float/str) pass through unchanged.
+    """
     if isinstance(result, list):
-        return [holder.proxy(n) if isinstance(n, _u.Node) else n for n in result]
+        wrapped = []
+        for n in result:
+            if isinstance(n, _u.Node):
+                if n.kind in _TEXT_KINDS:
+                    wrapped.append(n.text or "")
+                else:
+                    wrapped.append(holder.proxy(n))
+            else:
+                wrapped.append(n)
+        return wrapped
     return result
 
 
@@ -1297,7 +1313,10 @@ def ElementTree(element=None, *, file=None, parser=None):
 
 
 _HUGE_DEPTH = 1 << 30
-_HUGE_ENTITY = 1 << 40
+# The native parser takes max_entity_expansion as a platform-sized ``usize``.
+# Clamp to ``sys.maxsize`` so ``huge_tree`` does not overflow on 32-bit builds
+# (where ``1 << 40`` exceeds ``usize``); this is still effectively unbounded.
+_HUGE_ENTITY = min(1 << 40, sys.maxsize)
 
 
 class XMLParser:

@@ -7,6 +7,8 @@ covers pyuppsala-specific behavior (security limits, unsupported parser
 options, exception identity) that should not depend on lxml.
 """
 
+import sys
+
 import pytest
 
 from pyuppsala import etree as P
@@ -679,3 +681,20 @@ class TestStandalone:
         assert [
             "#" if not isinstance(e.tag, str) else e.tag for e in root.iter()
         ] == ["r", "a", "#", "b"]
+
+    def test_xpath_text_selection_returns_strings(self):
+        # A text()/CDATA node-set yields plain strings (like lxml smart-strings),
+        # not _Element node proxies.
+        root = P.fromstring("<r>a<b>x</b>c</r>")
+        res = root.xpath("//text()")
+        assert res == ["a", "x", "c"]
+        assert all(isinstance(s, str) for s in res)
+        # Element selections still come back as elements.
+        assert [e.tag for e in root.xpath("//b")] == ["b"]
+
+    def test_huge_tree_entity_limit_fits_usize(self):
+        # huge_tree must not overflow the native usize max_entity_expansion;
+        # this is a regression guard for 32-bit builds where 1<<40 > usize.
+        assert P._HUGE_ENTITY <= sys.maxsize
+        root = P.fromstring("<r><a/></r>", P.XMLParser(huge_tree=True))
+        assert root.tag == "r"
