@@ -900,18 +900,26 @@ class _Element:
     def iter(self, tag=None):
         """Iterate this element and all descendants in document (pre-order) order.
 
-        With ``tag`` set (or ``"*"`` for any), only matching elements are
-        yielded. Comments/PIs are visited but only match when ``tag`` is None.
+        Matching follows lxml/ElementTree:
+
+        * ``tag=None`` yields everything (elements, comments and PIs);
+        * ``tag="*"`` is an element-only wildcard (comments/PIs excluded);
+        * a specific tag yields only matching elements.
         """
-        if tag == "*":
-            tag = None
         proxy = self._holder.proxy
+        wildcard = tag == "*"
+
+        def matches(node):
+            if tag is None:
+                return True  # elements, comments and PIs
+            if wildcard:
+                return node.kind == "element"  # element-only wildcard
+            return _tag_matches(node, tag)
 
         def walk(node):
             # Pre-order: emit the node itself (if it qualifies), then recurse.
-            if node.kind in _CONTENT_KINDS:
-                if tag is None or _tag_matches(node, tag):
-                    yield proxy(node)
+            if node.kind in _CONTENT_KINDS and matches(node):
+                yield proxy(node)
             for c in node.children:
                 yield from walk(c)
 
@@ -1284,6 +1292,9 @@ class XMLParser:
             "max_depth": max_depth,
             "max_entity_expansion": max_entity_expansion,
             "namespace_aware": namespace_aware,
+            # Honored for byte input: overrides the document's declared encoding
+            # by decoding in Python before parsing (see fromstring).
+            "encoding": encoding,
         }
 
 
@@ -1342,14 +1353,31 @@ def _convert_cdata(holder, node):
 
 
 def fromstring(text, parser=None):
-    """Parse an XML string (or bytes) and return its root element."""
+    """Parse an XML string (or bytes) and return its root element.
+
+    A parser ``encoding`` (if set) overrides the document's declared encoding
+    for byte input: the bytes are decoded with it before parsing. It has no
+    effect on ``str`` input, which is already decoded.
+    """
     opts = parser._opts if parser is not None else {}
     kw = _parse_kwargs(opts)
+    encoding = opts.get("encoding")
     try:
         if isinstance(text, (bytes, bytearray)):
-            doc = _u.parse_bytes(bytes(text), **kw)
+            if encoding:
+                # Honor the parser's encoding override by decoding here; uppsala
+                # parses the resulting str regardless of any declared encoding.
+                decoded = bytes(text).decode(encoding)
+                if decoded[:1] == "\ufeff":
+                    decoded = decoded[1:]  # drop a leading BOM
+                doc = _u.parse(decoded, **kw)
+            else:
+                doc = _u.parse_bytes(bytes(text), **kw)
         else:
             doc = _u.parse(text, **kw)
+    except (LookupError, UnicodeDecodeError) as e:
+        # Unknown codec name or bytes that do not decode under it.
+        raise XMLSyntaxError(str(e)) from e
     except (
         _u.XmlParseError,
         _u.XmlWellFormednessError,

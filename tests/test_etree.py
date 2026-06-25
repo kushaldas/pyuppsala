@@ -161,6 +161,17 @@ class TestSearchDifferential:
         pr, lr = P.fromstring(SAMPLE), L.fromstring(SAMPLE)
         assert [e.tag for e in pr.iter("child")] == [e.tag for e in lr.iter("child")]
 
+    def test_iter_wildcard_vs_none(self):
+        # iter("*") is an element-only wildcard; iter() yields comments/PIs too.
+        doc = "<r><a/><!--c--><?pi x?><b/></r>"
+        pr, lr = P.fromstring(doc), L.fromstring(doc)
+
+        def names(it):
+            return ["#" if not isinstance(e.tag, str) else e.tag for e in it]
+
+        assert names(pr.iter("*")) == names(lr.iter("*"))
+        assert names(pr.iter()) == names(lr.iter())
+
     def test_itertext(self):
         pr, lr = P.fromstring(SAMPLE), L.fromstring(SAMPLE)
         assert list(pr.itertext()) == list(lr.itertext())
@@ -522,3 +533,19 @@ class TestStandalone:
             P.XPath("//b")(root, x=1)
         with pytest.raises(NotImplementedError):
             P.XPathEvaluator(root)("//b", x=1)
+
+    def test_parser_encoding_override(self):
+        # encoding= overrides the declared encoding for byte input.
+        raw = '<?xml version="1.0"?><x>caf\u00e9</x>'.encode("latin-1")
+        root = P.fromstring(raw, P.XMLParser(encoding="latin-1"))
+        assert root.text == "caf\u00e9"
+        # An unknown codec surfaces as XMLSyntaxError, not a silent miss.
+        with pytest.raises(P.XMLSyntaxError):
+            P.fromstring(b"<x/>", P.XMLParser(encoding="not-a-real-codec"))
+
+    def test_iter_star_excludes_comments(self):
+        root = P.fromstring("<r><a/><!--c--><b/></r>")
+        assert [e.tag for e in root.iter("*")] == ["r", "a", "b"]
+        assert [
+            "#" if not isinstance(e.tag, str) else e.tag for e in root.iter()
+        ] == ["r", "a", "#", "b"]
