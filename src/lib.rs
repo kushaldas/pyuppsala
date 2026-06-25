@@ -359,10 +359,10 @@ impl Node {
 
     /// Remove an attribute. Returns the old value if any.
     ///
-    /// With `namespace_uri=None` the attribute is matched by local name only
-    /// (uppsala's default). When a namespace URI is given, only the attribute
-    /// matching both that namespace and local name is removed, so namespaced
-    /// attributes sharing a local name are distinguished.
+    /// `namespace_uri=None` removes the attribute that has *no* namespace and
+    /// the given local name; a namespace URI removes the attribute in exactly
+    /// that namespace. In both cases an attribute in a different namespace that
+    /// merely shares the local name is left untouched.
     #[pyo3(signature = (name, namespace_uri=None))]
     fn remove_attribute(
         &self,
@@ -374,16 +374,13 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(self.id) {
-            Some(el) => match namespace_uri {
-                None => Ok(el.remove_attribute(name).map(|s| s.to_string())),
-                Some(ns) => {
-                    let pos = el.attributes.iter().position(|a| {
-                        a.name.local_name.as_ref() == name
-                            && a.name.namespace_uri.as_deref() == Some(ns)
-                    });
-                    Ok(pos.map(|i| el.attributes.remove(i).value.into_owned()))
-                }
-            },
+            Some(el) => {
+                let pos = el.attributes.iter().position(|a| {
+                    a.name.local_name.as_ref() == name
+                        && a.name.namespace_uri.as_deref() == namespace_uri
+                });
+                Ok(pos.map(|i| el.attributes.remove(i).value.into_owned()))
+            }
             None => Err(PyValueError::new_err("Node is not an element")),
         }
     }

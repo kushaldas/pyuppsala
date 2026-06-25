@@ -186,8 +186,10 @@ class Node:
     ) -> Optional[str]:
         """Remove an attribute. Returns the old value if any.
 
-        With ``namespace_uri=None`` the attribute is matched by local name only;
-        otherwise only the attribute in that namespace is removed.
+        ``namespace_uri=None`` removes the attribute with no namespace and the
+        given local name; a namespace URI removes the attribute in exactly that
+        namespace. An attribute in a different namespace that shares the local
+        name is left untouched.
         """
         ...
     def to_xml(self) -> str:

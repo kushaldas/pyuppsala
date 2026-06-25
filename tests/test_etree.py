@@ -541,6 +541,42 @@ class TestStandalone:
         assert el.get("{http://a}k") is None
         assert el.get("{http://b}k") == "2"
 
+    def test_plain_attribute_ops_are_no_namespace(self):
+        # A plain key refers to the no-namespace attribute, never a namespaced
+        # attribute that merely shares the local name.
+        el = P.Element("e", nsmap={"a": "http://a"})
+        el.set("k", "plain")
+        el.set("{http://a}k", "ns")
+        assert el.get("k") == "plain"
+        assert el.get("{http://a}k") == "ns"
+        del el.attrib["k"]  # removes only the no-namespace one
+        assert el.get("k") is None
+        assert el.keys() == ["{http://a}k"]
+
+    def test_cross_tree_membership_is_rejected(self):
+        # node_id is per-document; a node from another tree whose id collides
+        # must not be treated as a child by `in`, index(), remove(), replace().
+        t1 = P.Element("r")
+        P.SubElement(t1, "c")
+        t2 = P.Element("x")
+        y = P.SubElement(t2, "y")  # y.parent.node_id == r.node_id (both roots)
+
+        assert y not in t1
+        with pytest.raises(ValueError):
+            t1.index(y)
+        with pytest.raises(ValueError):
+            t1.remove(y)
+        with pytest.raises(ValueError):
+            t1.replace(y, P.Element("z"))
+        # t1 is untouched and t2 still owns y.
+        assert [e.tag for e in t1] == ["c"]
+        assert y.getparent().tag == "x"
+
+    def test_index_non_element_raises_valueerror(self):
+        root = P.fromstring("<r><a/></r>")
+        with pytest.raises(ValueError):
+            root.index("not-an-element")
+
     def test_xpath_variables_raise(self):
         root = P.fromstring("<a><b/></a>")
         with pytest.raises(NotImplementedError):

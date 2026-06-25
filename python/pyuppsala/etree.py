@@ -656,8 +656,21 @@ class _Element:
         return _make_clark(n.namespace_uri, n.local_name)
 
     def get(self, key, default=None):
-        """Return the attribute value for ``key`` (str or QName), or ``default``."""
+        """Return the attribute value for ``key`` (str or QName), or ``default``.
+
+        A plain key matches the attribute with *no* namespace; a Clark
+        ``{uri}local`` key (or QName) matches that exact namespace. An attribute
+        in a different namespace that shares the local name is not returned.
+        """
         ns, local = _split_key(key)
+        if ns is None:
+            # Plain key: match the no-namespace attribute exactly, rather than
+            # the first attribute with this local name in any namespace.
+            for a in self._node.attributes:
+                an = a.name
+                if an.local_name == local and an.namespace_uri is None:
+                    return a.value
+            return default
         v = self._node.get_attribute(local, ns)
         return v if v is not None else default
 
@@ -726,19 +739,34 @@ class _Element:
         for k in targets:
             _extract(self._holder, k)
 
-    def __contains__(self, element):
-        """True if ``element`` is a direct child of this element."""
-        if not isinstance(element, _Element):
+    def _is_child(self, element):
+        """True if ``element`` is a direct child of this element.
+
+        Requires the same backing document: ``node_id`` values are scoped per
+        document, so a node from another tree can share an id with one of ours
+        and must not be mistaken for a child.
+        """
+        if not isinstance(element, _Element) or element._holder is not self._holder:
             return False
         p = element._node.parent
         return p is not None and p.node_id == self._id
 
+    def __contains__(self, element):
+        """True if ``element`` is a direct child of this element."""
+        return self._is_child(element)
+
     def index(self, child, start=None, stop=None):
-        """Return the position of ``child`` among this element's children."""
+        """Return the position of ``child`` among this element's children.
+
+        Raises ValueError if ``child`` is not a child of this element (including
+        a non-element or an element from a different document).
+        """
+        if not isinstance(child, _Element) or child._holder is not self._holder:
+            raise ValueError("element is not a child of this node")
         kids = _content_children(self._node)
         ids = [k.node_id for k in kids]
         try:
-            pos = ids.index(child._id)
+            pos = ids.index(child._node.node_id)
         except ValueError:
             raise ValueError("element is not a child of this node") from None
         if start is not None and pos < start:
@@ -803,13 +831,14 @@ class _Element:
 
     def remove(self, element):
         """Remove direct child ``element`` (and its tail). Raises if not a child."""
-        p = element._node.parent
-        if p is None or p.node_id != self._id:
+        if not self._is_child(element):
             raise ValueError("Element is not a child of this node.")
         _extract(self._holder, element._node)
 
     def replace(self, old_element, new_element):
         """Replace child ``old_element`` with ``new_element`` in place."""
+        if not self._is_child(old_element):
+            raise ValueError("Element is not a child of this node.")
         node, tail = self._adopt(new_element)
         self._holder.doc.insert_before(self._node, node, old_element._node)
         _extract(self._holder, old_element._node)
