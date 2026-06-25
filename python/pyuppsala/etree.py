@@ -757,8 +757,11 @@ class _Element:
     def index(self, child, start=None, stop=None):
         """Return the position of ``child`` among this element's children.
 
+        ``start``/``stop`` bound the search range and follow list/lxml
+        semantics: a negative value counts from the end of the child list.
         Raises ValueError if ``child`` is not a child of this element (including
-        a non-element or an element from a different document).
+        a non-element or an element from a different document) or falls outside
+        the requested range.
         """
         if not isinstance(child, _Element) or child._holder is not self._holder:
             raise ValueError("element is not a child of this node")
@@ -768,10 +771,18 @@ class _Element:
             pos = ids.index(child._node.node_id)
         except ValueError:
             raise ValueError("element is not a child of this node") from None
-        if start is not None and pos < start:
-            raise ValueError("element is not in the requested range")
-        if stop is not None and pos >= stop:
-            raise ValueError("element is not in the requested range")
+        # Normalize negative bounds to offsets from the end, like list.index.
+        n = len(kids)
+        if start is not None:
+            if start < 0:
+                start = max(n + start, 0)
+            if pos < start:
+                raise ValueError("element is not in the requested range")
+        if stop is not None:
+            if stop < 0:
+                stop += n
+            if pos >= stop:
+                raise ValueError("element is not in the requested range")
         return pos
 
     # -- mutation ---------------------------------------------------------
@@ -1503,7 +1514,13 @@ def tostring(
     Only ``method="xml"`` is supported; other lxml serialization methods
     (``"html"``, ``"text"``, ``"c14n"``) change the output semantics and raise
     ``NotImplementedError`` rather than being silently ignored.
+
+    Any other keyword argument (an unsupported lxml option or a typo) is
+    rejected with ``TypeError`` rather than being silently dropped.
     """
+    if kwargs:
+        names = ", ".join(sorted(kwargs))
+        raise TypeError("unexpected tostring keyword argument(s): %s" % names)
     if method not in (None, "xml"):
         raise NotImplementedError(
             "tostring(method=%r) is not supported; only 'xml' is available" % method

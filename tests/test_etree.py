@@ -579,6 +579,24 @@ class TestStandalone:
             with pytest.raises(NotImplementedError):
                 P.tostring(el, method=method)
 
+    def test_tostring_rejects_unexpected_kwargs(self):
+        # Unsupported lxml options (or typos) must not be silently dropped.
+        el = P.fromstring("<a>x</a>")
+        with pytest.raises(TypeError, match="with_tail"):
+            P.tostring(el, encoding="unicode", with_tail=False)
+
+    def test_index_normalizes_negative_bounds(self):
+        # Negative start/stop count from the end, like list.index / lxml.
+        root = P.fromstring("<r><a/><b/><c/></r>")
+        b = root[1]
+        assert root.index(b) == 1
+        assert root.index(b, -2) == 1  # search starts at index 1
+        assert root.index(b, 0, -1) == 1  # b is before the last child
+        with pytest.raises(ValueError):
+            root.index(b, -1)  # search starts at the last child, b is earlier
+        with pytest.raises(ValueError):
+            root.index(b, 0, -2)  # range excludes index 1
+
     def test_namespaced_attribute_delete_is_exact(self):
         # Two attributes share a local name in different namespaces; deleting one
         # via Clark notation must not remove the other.
