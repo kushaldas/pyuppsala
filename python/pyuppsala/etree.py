@@ -17,7 +17,6 @@ See ``docs/etree.rst`` for the supported/unsupported feature matrix.
 
 from __future__ import annotations
 
-import io
 import os
 from weakref import WeakValueDictionary
 
@@ -1438,44 +1437,26 @@ def fromstringlist(strings, parser=None):
 
 
 def _read_source(source):
-    """Read parse input from a filename, path, file object, or raw XML string/bytes."""
-    # A str/bytes that does not look like XML content is treated as a filename/path.
-    if isinstance(source, (str, bytes, os.PathLike)) and not _looks_like_xml(source):
-        with open(source, "rb") as fh:
-            return fh.read()
+    """Read parse input from a filename/path or a file-like object.
+
+    Matching lxml/ElementTree, a ``str``, ``bytes`` or ``os.PathLike`` is always
+    treated as a filesystem path; an object with a ``read`` method is read as a
+    file. In-memory XML strings/bytes go through :func:`fromstring`, not here.
+    """
     if hasattr(source, "read"):
         return source.read()
-    return source
-
-
-# Byte-order marks that mark a byte string as encoded XML content, not a path.
-_BOMS = (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")
-
-
-def _looks_like_xml(source):
-    """Heuristic: True if ``source`` is string/bytes holding XML rather than a path.
-
-    A leading byte-order mark (UTF-8 or UTF-16) marks the input as encoded XML
-    content; a UTF-16 document without a BOM encodes its leading ``<`` as
-    ``b"<\\x00"`` (LE) or ``b"\\x00<"`` (BE), matching uppsala's own BOM-less
-    UTF-16 detection in ``parse_bytes``. Otherwise the first non-whitespace
-    character must be ``<``.
-    """
-    if isinstance(source, bytes):
-        if any(source.startswith(bom) for bom in _BOMS):
-            return True
-        # UTF-16 without a BOM: a leading '<' is two bytes, one of them NUL.
-        if source[:2] in (b"<\x00", b"\x00<"):
-            return True
-        return source.lstrip()[:1] == b"<"
-    if isinstance(source, str):
-        # Drop a leading Unicode BOM (U+FEFF) before inspecting.
-        return source.lstrip("\ufeff").lstrip()[:1] == "<"
-    return False
+    with open(source, "rb") as fh:
+        return fh.read()
 
 
 def parse(source, parser=None):
-    """Parse ``source`` (filename, file object, or XML text) into an ElementTree."""
+    """Parse from a filename/path or file-like ``source`` into an ElementTree.
+
+    As in ``lxml.etree``, ``source`` is interpreted as a filesystem path (when a
+    ``str``/``bytes``/``os.PathLike``) or as a file-like object; it is **not**
+    treated as inline XML. To parse an in-memory string or bytes use
+    :func:`fromstring`, or wrap it in ``io.BytesIO``/``io.StringIO``.
+    """
     data = _read_source(source)
     el = fromstring(data, parser)
     return _ElementTree(el._holder)

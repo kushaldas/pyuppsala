@@ -69,9 +69,11 @@ Supported features
   :func:`ProcessingInstruction` / ``PI``, :class:`QName`, :func:`ElementTree`.
 - **I/O**: :func:`fromstring` / ``XML``, :func:`fromstringlist`, :func:`parse`,
   :func:`tostring` (``method="xml"`` only), :func:`tounicode`, :func:`dump`,
-  :func:`indent`. Byte input is decoded by Uppsala (UTF-8 and UTF-16, with or
-  without a BOM); ``XMLParser(encoding=...)`` overrides the declared encoding
-  for byte input.
+  :func:`indent`. As in lxml, :func:`fromstring` takes in-memory XML while
+  :func:`parse` takes a filename/path or a file-like object (wrap in-memory
+  data in ``io.BytesIO`` to use it). Byte input is decoded by Uppsala (UTF-8
+  and UTF-16, with or without a BOM); ``XMLParser(encoding=...)`` overrides the
+  declared encoding for byte input.
 - **Search**: ``find`` / ``findall`` / ``findtext`` / ``iterfind`` (ElementPath),
   ``iter`` / ``itertext``, and full ``.xpath()`` via Uppsala's XPath 1.0 engine,
   plus :class:`XPath` / :class:`ETXPath` / :func:`XPathEvaluator`.

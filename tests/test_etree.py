@@ -509,20 +509,31 @@ class TestStandalone:
         assert root.tag == "a"
         assert root.text == "x"
 
-    def test_parse_bom_prefixed_bytes(self):
-        # UTF-8 BOM-prefixed bytes are XML content, not a filename.
-        data = b"\xef\xbb\xbf<doc>hi</doc>"
-        tree = P.parse(data)
-        assert tree.getroot().tag == "doc"
-
-    @pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
-    def test_parse_utf16_without_bom(self, encoding):
-        # UTF-16 (LE/BE) XML without a BOM must be recognized as content, not a
-        # filename, matching the native parse_bytes decoder.
-        raw = "<doc>hi</doc>".encode(encoding)
-        root = P.parse(raw).getroot()
+    def test_fromstring_bom_prefixed_bytes(self):
+        # In-memory parsing goes through fromstring; a UTF-8 BOM is handled.
+        root = P.fromstring(b"\xef\xbb\xbf<doc>hi</doc>")
         assert root.tag == "doc"
         assert root.text == "hi"
+
+    @pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+    def test_fromstring_utf16_without_bom(self, encoding):
+        # UTF-16 (LE/BE) bytes without a BOM are decoded by the native parser.
+        root = P.fromstring("<doc>hi</doc>".encode(encoding))
+        assert root.tag == "doc"
+        assert root.text == "hi"
+
+    def test_parse_treats_str_and_bytes_as_path(self):
+        # Like lxml, parse() interprets str/bytes as a filename, not inline XML.
+        with pytest.raises(OSError):
+            P.parse("<a/>")
+        with pytest.raises(OSError):
+            P.parse(b"<a/>")
+
+    def test_parse_accepts_file_like(self):
+        import io
+
+        root = P.parse(io.BytesIO(b"<doc>hi</doc>")).getroot()
+        assert root.tag == "doc"
 
     def test_tostring_rejects_non_xml_method(self):
         el = P.fromstring("<a>x</a>")
