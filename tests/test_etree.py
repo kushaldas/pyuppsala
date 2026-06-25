@@ -540,6 +540,38 @@ class TestStandalone:
         root = P.parse(io.BytesIO(b"<doc>hi</doc>")).getroot()
         assert root.tag == "doc"
 
+    def test_empty_elementtree_convenience_methods(self):
+        tree = P.ElementTree()
+
+        for method in (
+            lambda: tree.find("x"),
+            lambda: tree.findall("x"),
+            lambda: tree.findtext("x", default="D"),
+            lambda: list(tree.iterfind("x")),
+            lambda: tree.xpath("//x"),
+        ):
+            with pytest.raises(AssertionError, match="missing root"):
+                method()
+
+        assert list(tree.iter()) == []
+
+    def test_empty_elementtree_write_raises_clear_error(self, tmp_path):
+        import io
+
+        tree = P.ElementTree()
+        with pytest.raises(AssertionError, match="missing root"):
+            tree.write(io.BytesIO())
+        with pytest.raises(AssertionError, match="missing root"):
+            tree.write(tmp_path / "empty.xml", encoding="unicode")
+
+    def test_elementtree_write_unicode_path_uses_utf8(self, tmp_path):
+        path = tmp_path / "unicode.xml"
+        P.ElementTree(P.fromstring("<doc>caf&#233;</doc>")).write(
+            path,
+            encoding="unicode",
+        )
+        assert path.read_bytes() == "<doc>caf\u00e9</doc>".encode("utf-8")
+
     def test_tostring_rejects_non_xml_method(self):
         el = P.fromstring("<a>x</a>")
         assert P.tostring(el, method="xml", encoding="unicode") == "<a>x</a>"

@@ -1164,6 +1164,12 @@ class _ElementTree:
         root = self._holder.doc.document_element
         return self._holder.proxy(root) if root is not None else None
 
+    def _require_root(self):
+        root = self.getroot()
+        if root is None:
+            raise AssertionError("ElementTree not initialized, missing root")
+        return root
+
     def parse(self, source, parser=None):
         """Parse ``source`` into this tree, replacing its contents. Returns the root."""
         data = _read_source(source)
@@ -1181,41 +1187,49 @@ class _ElementTree:
     ):
         """Serialize the tree to ``file`` (a path or writable file object)."""
         data = tostring(
-            self.getroot(),
+            self._require_root(),
             encoding=encoding,
             xml_declaration=xml_declaration,
             pretty_print=pretty_print,
+            **kwargs,
         )
         if isinstance(file, (str, bytes, os.PathLike)):
             mode = "w" if isinstance(data, str) else "wb"
-            with open(file, mode) as fh:
-                fh.write(data)
+            if isinstance(data, str):
+                with open(file, mode, encoding="utf-8") as fh:
+                    fh.write(data)
+            else:
+                with open(file, mode) as fh:
+                    fh.write(data)
         else:
             file.write(data)
 
     def find(self, path, namespaces=None):
         """Find the first matching subelement from the root."""
-        return self.getroot().find(path, namespaces)
+        return self._require_root().find(path, namespaces)
 
     def findall(self, path, namespaces=None):
         """Find all matching subelements from the root."""
-        return self.getroot().findall(path, namespaces)
+        return self._require_root().findall(path, namespaces)
 
     def findtext(self, path, default=None, namespaces=None):
         """Find the text of the first matching subelement from the root."""
-        return self.getroot().findtext(path, default, namespaces)
+        return self._require_root().findtext(path, default, namespaces)
 
     def iterfind(self, path, namespaces=None):
         """Iterate matching subelements from the root."""
-        return self.getroot().iterfind(path, namespaces)
+        return self._require_root().iterfind(path, namespaces)
 
     def iter(self, tag=None):
         """Iterate the root element and all its descendants."""
-        return self.getroot().iter(tag)
+        root = self.getroot()
+        if root is None:
+            return iter(())
+        return root.iter(tag)
 
     def xpath(self, path, namespaces=None, **variables):
         """Evaluate an XPath expression with the root as context."""
-        return self.getroot().xpath(path, namespaces=namespaces, **variables)
+        return self._require_root().xpath(path, namespaces=namespaces, **variables)
 
     def getpath(self, element):
         """Return an absolute XPath locating ``element`` within this tree.
