@@ -11,8 +11,17 @@ import pytest
 
 from pyuppsala import etree as P
 
-lxml_etree = pytest.importorskip("lxml.etree")
-L = lxml_etree
+# lxml is only needed by the differential tests. Import it optionally so the
+# standalone tests (TestStandalone) still run in environments without lxml.
+try:
+    import lxml.etree as L
+
+    HAS_LXML = True
+except ImportError:  # pragma: no cover - depends on the environment
+    L = None
+    HAS_LXML = False
+
+requires_lxml = pytest.mark.skipif(not HAS_LXML, reason="lxml is not installed")
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +76,7 @@ def walk_compare(pe, le):
 # ---------------------------------------------------------------------------
 
 
+@requires_lxml
 class TestParseDifferential:
     def test_full_tree_walk(self):
         walk_compare(P.fromstring(SAMPLE), L.fromstring(SAMPLE))
@@ -99,6 +109,7 @@ class TestParseDifferential:
 # ---------------------------------------------------------------------------
 
 
+@requires_lxml
 class TestSearchDifferential:
     @pytest.mark.parametrize(
         "path",
@@ -167,6 +178,7 @@ class TestSearchDifferential:
 # ---------------------------------------------------------------------------
 
 
+@requires_lxml
 class TestAttribDifferential:
     def test_get_keys_items(self):
         pr, lr = P.fromstring(SAMPLE), L.fromstring(SAMPLE)
@@ -204,6 +216,7 @@ def build_tree(etree_mod):
     return root
 
 
+@requires_lxml
 class TestBuildDifferential:
     def test_build_roundtrip(self):
         pr = build_tree(P)
@@ -234,6 +247,7 @@ class TestBuildDifferential:
 # ---------------------------------------------------------------------------
 
 
+@requires_lxml
 class TestMutationDifferential:
     def test_append_insert_remove(self):
         def run(m):
@@ -294,6 +308,7 @@ class TestMutationDifferential:
 # ---------------------------------------------------------------------------
 
 
+@requires_lxml
 class TestNamespaceDifferential:
     def test_nsmap(self):
         pr, lr = P.fromstring(NS_DOC), L.fromstring(NS_DOC)
@@ -313,6 +328,7 @@ class TestNamespaceDifferential:
 # ---------------------------------------------------------------------------
 
 
+@requires_lxml
 class TestElementTreeDifferential:
     def test_parse_file(self, tmp_path):
         f = tmp_path / "d.xml"
@@ -338,6 +354,7 @@ SCHEMA = (
 )
 
 
+@requires_lxml
 class TestSchemaDifferential:
     def test_valid(self):
         schema_p = P.XMLSchema(P.fromstring(SCHEMA))
@@ -354,6 +371,7 @@ class TestSchemaDifferential:
             schema_p.assertValid(bad)
 
 
+@requires_lxml
 class TestExtendedDifferential:
     def test_slicing(self):
         xml = "<r><a/><b/><c/><d/></r>"
@@ -472,3 +490,35 @@ class TestStandalone:
         root = P.fromstring("<a/>")
         assert P.iselement(root)
         assert not P.iselement("a")
+
+    def test_fromstringlist_accepts_generator(self):
+        # A generator (not a sequence) must work, not just lists.
+        gen = (part for part in ("<a>", "x", "</a>"))
+        root = P.fromstringlist(gen)
+        assert root.tag == "a"
+        assert root.text == "x"
+
+    def test_parse_bom_prefixed_bytes(self):
+        # UTF-8 BOM-prefixed bytes are XML content, not a filename.
+        data = b"\xef\xbb\xbf<doc>hi</doc>"
+        tree = P.parse(data)
+        assert tree.getroot().tag == "doc"
+
+    def test_namespaced_attribute_delete_is_exact(self):
+        # Two attributes share a local name in different namespaces; deleting one
+        # via Clark notation must not remove the other.
+        el = P.Element("e", nsmap={"a": "http://a", "b": "http://b"})
+        el.set("{http://a}k", "1")
+        el.set("{http://b}k", "2")
+        del el.attrib["{http://a}k"]
+        assert el.get("{http://a}k") is None
+        assert el.get("{http://b}k") == "2"
+
+    def test_xpath_variables_raise(self):
+        root = P.fromstring("<a><b/></a>")
+        with pytest.raises(NotImplementedError):
+            root.xpath("//b", x=1)
+        with pytest.raises(NotImplementedError):
+            P.XPath("//b")(root, x=1)
+        with pytest.raises(NotImplementedError):
+            P.XPathEvaluator(root)("//b", x=1)

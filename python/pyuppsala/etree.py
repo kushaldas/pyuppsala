@@ -956,7 +956,16 @@ class _Element:
         Delegates to the native :class:`pyuppsala.XPathEvaluator`. Node-set
         results are returned as ``_Element`` proxies; string/number/boolean
         results are returned as the corresponding Python types.
+
+        XPath variable binding (lxml's ``$name`` keyword arguments) is not
+        supported by the underlying engine; passing any raises
+        ``NotImplementedError`` rather than silently ignoring it.
         """
+        if variables:
+            raise NotImplementedError(
+                "XPath variable binding is not supported (got %r)"
+                % sorted(variables)
+            )
         ev = _u.XPathEvaluator()
         if namespaces:
             for pfx, uri in namespaces.items():
@@ -1051,7 +1060,10 @@ class _Attrib:
 
     def __delitem__(self, key):
         ns, local = _split_key(key)
-        old = self._el._node.remove_attribute(local)
+        # Pass the namespace so a namespaced attribute is matched exactly, not
+        # by local name alone (which could delete a same-named attribute in a
+        # different namespace).
+        old = self._el._node.remove_attribute(local, ns)
         if old is None:
             raise KeyError(key)
 
@@ -1358,17 +1370,19 @@ XML = fromstring
 
 
 def fromstringlist(strings, parser=None):
-    """Parse XML supplied as a sequence of string or bytes fragments."""
-    if not strings:
+    """Parse XML supplied as an iterable of string or bytes fragments."""
+    # Materialize first so generators/iterators (not just sequences) work.
+    fragments = list(strings)
+    if not fragments:
         raise XMLSyntaxError("empty input")
-    if isinstance(strings[0], (bytes, bytearray)):
-        return fromstring(b"".join(bytes(s) for s in strings), parser)
-    return fromstring("".join(strings), parser)
+    if isinstance(fragments[0], (bytes, bytearray)):
+        return fromstring(b"".join(bytes(s) for s in fragments), parser)
+    return fromstring("".join(fragments), parser)
 
 
 def _read_source(source):
     """Read parse input from a filename, path, file object, or raw XML string/bytes."""
-    # A str/bytes that does not start with '<' is treated as a filename/path.
+    # A str/bytes that does not look like XML content is treated as a filename/path.
     if isinstance(source, (str, bytes, os.PathLike)) and not _looks_like_xml(source):
         with open(source, "rb") as fh:
             return fh.read()
@@ -1377,12 +1391,23 @@ def _read_source(source):
     return source
 
 
+# Byte-order marks that mark a byte string as encoded XML content, not a path.
+_BOMS = (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")
+
+
 def _looks_like_xml(source):
-    """Heuristic: True if ``source`` is a string/bytes that begins with ``<``."""
+    """Heuristic: True if ``source`` is string/bytes holding XML rather than a path.
+
+    A leading byte-order mark (UTF-8 or UTF-16) marks the input as encoded XML
+    content; otherwise the first non-whitespace character must be ``<``.
+    """
     if isinstance(source, bytes):
+        if any(source.startswith(bom) for bom in _BOMS):
+            return True
         return source.lstrip()[:1] == b"<"
     if isinstance(source, str):
-        return source.lstrip()[:1] == "<"
+        # Drop a leading Unicode BOM (U+FEFF) before inspecting.
+        return source.lstrip("\ufeff").lstrip()[:1] == "<"
     return False
 
 
@@ -1503,7 +1528,11 @@ class XPath:
         """Evaluate the expression against ``element_or_tree``."""
         if isinstance(element_or_tree, _ElementTree):
             element_or_tree = element_or_tree.getroot()
-        return element_or_tree.xpath(self.path, namespaces=self._namespaces)
+        # Forward variables so unsupported variable binding raises rather than
+        # being silently dropped.
+        return element_or_tree.xpath(
+            self.path, namespaces=self._namespaces, **variables
+        )
 
 
 class ETXPath(XPath):
@@ -1519,7 +1548,9 @@ def XPathEvaluator(element_or_tree, namespaces=None, **kwargs):
     )
 
     def evaluate(path, **variables):
-        return root.xpath(path, namespaces=namespaces)
+        # Forward variables so unsupported variable binding raises rather than
+        # being silently dropped.
+        return root.xpath(path, namespaces=namespaces, **variables)
 
     return evaluate
 

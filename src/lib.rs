@@ -23,7 +23,11 @@ create_exception!(
 );
 create_exception!(_pyuppsala, XmlNamespaceError, pyo3::exceptions::PyException);
 create_exception!(_pyuppsala, XPathError, pyo3::exceptions::PyException);
-create_exception!(_pyuppsala, XsdValidationError, pyo3::exceptions::PyException);
+create_exception!(
+    _pyuppsala,
+    XsdValidationError,
+    pyo3::exceptions::PyException
+);
 
 fn xml_error_to_pyerr(e: XmlError) -> PyErr {
     match e {
@@ -353,14 +357,33 @@ impl Node {
         }
     }
 
-    /// Remove an attribute by local name. Returns the old value if any.
-    fn remove_attribute(&self, name: &str) -> PyResult<Option<String>> {
+    /// Remove an attribute. Returns the old value if any.
+    ///
+    /// With `namespace_uri=None` the attribute is matched by local name only
+    /// (uppsala's default). When a namespace URI is given, only the attribute
+    /// matching both that namespace and local name is removed, so namespaced
+    /// attributes sharing a local name are distinguished.
+    #[pyo3(signature = (name, namespace_uri=None))]
+    fn remove_attribute(
+        &self,
+        name: &str,
+        namespace_uri: Option<&str>,
+    ) -> PyResult<Option<String>> {
         let mut guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(self.id) {
-            Some(el) => Ok(el.remove_attribute(name).map(|s| s.to_string())),
+            Some(el) => match namespace_uri {
+                None => Ok(el.remove_attribute(name).map(|s| s.to_string())),
+                Some(ns) => {
+                    let pos = el.attributes.iter().position(|a| {
+                        a.name.local_name.as_ref() == name
+                            && a.name.namespace_uri.as_deref() == Some(ns)
+                    });
+                    Ok(pos.map(|i| el.attributes.remove(i).value.into_owned()))
+                }
+            },
             None => Err(PyValueError::new_err("Node is not an element")),
         }
     }
@@ -654,10 +677,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard
-            .doc
-            .node_range(self.id)
-            .map(|r| (r.start, r.end)))
+        Ok(guard.doc.node_range(self.id).map(|r| (r.start, r.end)))
     }
 
     /// The original source text of this node, or None.
@@ -1904,8 +1924,9 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
             }
         })
         .collect();
-    String::from_utf16(&code_units)
-        .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-16 {}: {}", endian, e)))
+    String::from_utf16(&code_units).map_err(|e| {
+        XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-16 {}: {}", endian, e))
+    })
 }
 
 fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlWriteOptions {

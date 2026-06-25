@@ -181,8 +181,14 @@ class Node:
     ) -> Optional[str]:
         """Set an attribute value. Returns the previous value if any."""
         ...
-    def remove_attribute(self, name: str) -> Optional[str]:
-        """Remove an attribute by local name. Returns the old value if any."""
+    def remove_attribute(
+        self, name: str, namespace_uri: Optional[str] = None
+    ) -> Optional[str]:
+        """Remove an attribute. Returns the old value if any.
+
+        With ``namespace_uri=None`` the attribute is matched by local name only;
+        otherwise only the attribute in that namespace is removed.
+        """
         ...
     def to_xml(self) -> str:
         """Serialize this node and its subtree to XML."""
