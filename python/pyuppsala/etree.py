@@ -123,7 +123,10 @@ _namespace_map = {
 # cannot smuggle tag delimiters, quotes, or whitespace into element/attribute
 # positions.  The etree layer uses NCName because namespace URI and prefix are
 # tracked separately.
-_NCNAME_START = r"A-Z_a-z\xC0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD"
+_NCNAME_START = (
+    r"A-Z_a-z\xC0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD"
+    r"\U00010000-\U000EFFFF"
+)
 _NCNAME_CHAR = _NCNAME_START + r"\-.0-9\xB7\u0300-\u036F\u203F-\u2040"
 _NCNAME_RE = re.compile(r"^[%s][%s]*$" % (_NCNAME_START, _NCNAME_CHAR))
 

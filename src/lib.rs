@@ -63,6 +63,7 @@ fn is_xml_name_start(c: char) -> bool {
         || (0x00C0..=0xD7FF).contains(&u)
         || (0xF900..=0xFDCF).contains(&u)
         || (0xFDF0..=0xFFFD).contains(&u)
+        || (0x10000..=0xEFFFF).contains(&u)
 }
 
 fn is_xml_name_char(c: char) -> bool {

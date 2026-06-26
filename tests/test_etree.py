@@ -725,10 +725,20 @@ class TestStandalone:
         child.set("{urn:y}attr", "v")
         # The validation guard should not reject legitimate local names,
         # prefixes, default namespace handling, or namespaced attributes.
-        roundtrip = P.fromstring(P.tostring(root))
+        roundtrip = P.fromstring(P.tostring(root, encoding="unicode"))
         assert roundtrip.tag == "{urn:x}root"
         assert roundtrip[0].tag == "{urn:x}child"
         assert roundtrip[0].get("{urn:y}attr") == "v"
+
+    def test_supplementary_plane_xml_names_are_valid(self):
+        local = "\U00010000name"
+        prefix = "\U00010000p"
+        root = P.Element("{urn:x}%s" % local, nsmap={prefix: "urn:x"})
+        root.set(local, "value")
+
+        roundtrip = P.fromstring(P.tostring(root, encoding="unicode"))
+        assert roundtrip.tag == "{urn:x}%s" % local
+        assert roundtrip.get(local) == "value"
 
     def test_cross_tree_membership_is_rejected(self):
         # node_id is per-document; a node from another tree whose id collides

@@ -131,6 +131,18 @@ class TestDocument:
         with pytest.raises(ValueError):
             doc.create_element("item", namespace_uri="urn:test", prefix="bad prefix")
 
+    def test_create_element_accepts_supplementary_plane_names(self):
+        doc = Document.empty()
+        local = "\U00010000name"
+        prefix = "\U00010000p"
+        el = doc.create_element(local, namespace_uri="urn:test", prefix=prefix)
+        doc.set_namespace_declaration(el, prefix, "urn:test")
+        doc.append_child(doc.root, el)
+
+        assert doc.document_element.tag.local_name == local
+        assert doc.document_element.tag.prefix == prefix
+        assert "<%s:%s" % (prefix, local) in doc.to_xml()
+
     def test_create_text(self):
         doc = parse("<root/>")
         text = doc.create_text("hello")
