@@ -231,6 +231,23 @@ class TestDocument:
         el.set_attribute("lang", "en", namespace_uri=self.XML_NS, prefix="xml")
         assert el.get_attribute("lang", namespace_uri=self.XML_NS) == "en"
 
+    def test_qname_rejects_reserved_namespace_bindings(self):
+        # create_element/set_attribute/set_qname must also enforce the XML
+        # Namespaces reserved bindings, so a QName cannot use the xmlns prefix,
+        # rebind the xml prefix or XML namespace, or sit in the xmlns namespace.
+        doc = Document.empty()
+        el = doc.create_element("e")
+        with pytest.raises(ValueError):  # element in the xmlns namespace
+            doc.create_element("x", namespace_uri=self.XMLNS_NS, prefix="p")
+        with pytest.raises(ValueError):  # xmlns prefix on an attribute
+            el.set_attribute("a", "v", namespace_uri="urn:y", prefix="xmlns")
+        with pytest.raises(ValueError):  # xmlns prefix on an element name
+            el.set_qname("n", namespace_uri="urn:y", prefix="xmlns")
+        with pytest.raises(ValueError):  # xml prefix bound to a non-XML namespace
+            el.set_attribute("a", "v", namespace_uri="urn:wrong", prefix="xml")
+        with pytest.raises(ValueError):  # XML namespace under a different prefix
+            el.set_attribute("a", "v", namespace_uri=self.XML_NS, prefix="other")
+
     def test_append_child(self):
         doc = parse("<root/>")
         child = doc.create_element("child")

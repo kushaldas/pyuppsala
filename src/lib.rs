@@ -130,16 +130,45 @@ const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 ///
 /// Returns the normalized prefix (empty string mapped to `None`). A prefix is
 /// only meaningful alongside a namespace URI, so a prefix supplied without a
-/// namespace is rejected rather than being silently dropped.
+/// namespace is rejected rather than being silently dropped. The XML
+/// Namespaces reserved bindings are enforced too, so a QName cannot use the
+/// `xmlns` prefix, rebind the `xml` prefix or XML namespace, or sit in the
+/// `xmlns` namespace - all of which would serialize to invalid XML.
 fn validate_qname_parts<'a>(
     namespace_uri: Option<&str>,
     prefix: Option<&'a str>,
 ) -> PyResult<Option<&'a str>> {
     let prefix = validate_prefix(prefix)?;
-    if namespace_uri.is_none() && prefix.is_some() {
-        return Err(PyValueError::new_err(
-            "a namespace prefix requires a namespace URI",
-        ));
+    match namespace_uri {
+        None => {
+            if prefix.is_some() {
+                return Err(PyValueError::new_err(
+                    "a namespace prefix requires a namespace URI",
+                ));
+            }
+        }
+        Some(ns) => {
+            if prefix == Some("xmlns") {
+                return Err(PyValueError::new_err(
+                    "the \"xmlns\" prefix is reserved and cannot be used as a name prefix",
+                ));
+            }
+            if ns == XMLNS_NAMESPACE {
+                return Err(PyValueError::new_err(
+                    "the xmlns namespace cannot be used for element or attribute names",
+                ));
+            }
+            if prefix == Some("xml") && ns != XML_NAMESPACE {
+                return Err(PyValueError::new_err(
+                    "the \"xml\" prefix can only be bound to the XML namespace",
+                ));
+            }
+            if ns == XML_NAMESPACE && prefix != Some("xml") {
+                return Err(PyValueError::new_err(
+                    "the XML namespace can only be used with the \"xml\" prefix",
+                ));
+            }
+        }
     }
     Ok(prefix)
 }

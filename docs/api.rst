@@ -1038,6 +1038,18 @@ XmlWriter
       print(w.to_string())
       # <?xml version="1.0" encoding="UTF-8"?><root>hello</root>
 
+   .. note::
+
+      Element names, attribute names, and processing-instruction targets are
+      written verbatim into the output, so they are validated as well-formed XML
+      names. ``start_element``, ``end_element``, ``empty_element``,
+      ``empty_element_expanded`` (including their *attrs* names), and
+      ``processing_instruction`` raise :class:`ValueError` on an invalid name or
+      target (for example one containing whitespace, quotes, or markup
+      delimiters). ``processing_instruction`` also rejects the reserved ``xml``
+      target. This prevents malformed or injected markup in the serialized
+      output.
+
    .. method:: write_declaration() -> None
 
       Write ``<?xml version="1.0" encoding="UTF-8"?>``.
@@ -1055,6 +1067,8 @@ XmlWriter
    .. method:: start_element(name, attrs=None) -> None
 
       Start an element. *attrs* is an optional list of ``(name, value)`` tuples.
+      Raises :class:`ValueError` if *name* or any attribute name is not a valid
+      XML name.
 
       .. code-block:: python
 
@@ -1067,11 +1081,13 @@ XmlWriter
 
    .. method:: end_element(name: str) -> None
 
-      Close the element.
+      Close the element. Raises :class:`ValueError` if *name* is not a valid XML
+      name.
 
    .. method:: empty_element(name, attrs=None) -> None
 
-      Write a self-closing element: ``<name/>``.
+      Write a self-closing element: ``<name/>``. Raises :class:`ValueError` if
+      *name* or any attribute name is not a valid XML name.
 
       .. code-block:: python
 
@@ -1083,7 +1099,9 @@ XmlWriter
 
    .. method:: empty_element_expanded(name, attrs=None) -> None
 
-      Write an expanded empty element: ``<name></name>``.
+      Write an expanded empty element: ``<name></name>``. Raises
+      :class:`ValueError` if *name* or any attribute name is not a valid XML
+      name.
 
       .. code-block:: python
 
@@ -1130,7 +1148,8 @@ XmlWriter
 
    .. method:: processing_instruction(target, data=None) -> None
 
-      Write a processing instruction.
+      Write a processing instruction. Raises :class:`ValueError` if *target* is
+      not a valid XML name or is the reserved ``xml`` target.
 
       .. code-block:: python
 
