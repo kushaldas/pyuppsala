@@ -21,8 +21,8 @@ import os
 import sys
 from weakref import WeakValueDictionary
 
-from . import _pyuppsala as _u
 from . import _elementpath as ElementPath
+from . import _pyuppsala as _u
 
 __all__ = [
     # Factories & node types
@@ -1579,6 +1579,8 @@ def tostring(
         element = element_or_tree.getroot()
     else:
         element = element_or_tree
+    if element is None:
+        raise AssertionError("ElementTree not initialized, missing root")
     node = element._node
     if pretty_print:
         text = node.to_xml_with_options("  ", False)
