@@ -29,11 +29,7 @@ create_exception!(
 );
 create_exception!(pyuppsala, XmlNamespaceError, pyo3::exceptions::PyException);
 create_exception!(pyuppsala, XPathError, pyo3::exceptions::PyException);
-create_exception!(
-    pyuppsala,
-    XsdValidationError,
-    pyo3::exceptions::PyException
-);
+create_exception!(pyuppsala, XsdValidationError, pyo3::exceptions::PyException);
 
 fn xml_error_to_pyerr(e: XmlError) -> PyErr {
     match e {
@@ -56,6 +52,95 @@ fn xml_error_to_pyerr(e: XmlError) -> PyErr {
             XsdValidationError::new_err(format!("{}{}", loc, ve.message))
         }
         XmlError::UnexpectedEof => XmlParseError::new_err("Unexpected end of input".to_string()),
+    }
+}
+
+fn is_xml_name_start(c: char) -> bool {
+    let u = c as u32;
+    c == ':'
+        || c == '_'
+        || c.is_ascii_alphabetic()
+        || (0x00C0..=0xD7FF).contains(&u)
+        || (0xF900..=0xFDCF).contains(&u)
+        || (0xFDF0..=0xFFFD).contains(&u)
+}
+
+fn is_xml_name_char(c: char) -> bool {
+    let u = c as u32;
+    is_xml_name_start(c)
+        || c == '-'
+        || c == '.'
+        || c.is_ascii_digit()
+        || c == '\u{00B7}'
+        || (0x0300..=0x036F).contains(&u)
+        || (0x203F..=0x2040).contains(&u)
+}
+
+fn validate_name_with<F, G>(value: &str, what: &str, start_ok: F, char_ok: G) -> PyResult<()>
+where
+    F: Fn(char) -> bool,
+    G: Fn(char) -> bool,
+{
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) if start_ok(first) && chars.all(char_ok) => Ok(()),
+        _ => Err(PyValueError::new_err(format!(
+            "Invalid {} name: {:?}",
+            what, value
+        ))),
+    }
+}
+
+fn validate_xml_name(value: &str, what: &str) -> PyResult<()> {
+    // The streaming writer accepts already-prefixed names like "x:item", so it
+    // validates XML Name rather than NCName.
+    validate_name_with(value, what, is_xml_name_start, is_xml_name_char)
+}
+
+fn validate_ncname(value: &str, what: &str) -> PyResult<()> {
+    // DOM builders receive local names and prefixes separately.  A colon inside
+    // either one would be ambiguous and can produce malformed serialized XML.
+    validate_name_with(
+        value,
+        what,
+        |c| c != ':' && is_xml_name_start(c),
+        |c| c != ':' && is_xml_name_char(c),
+    )
+}
+
+fn validate_prefix(prefix: Option<&str>) -> PyResult<Option<&str>> {
+    match prefix {
+        Some("") | None => Ok(None),
+        Some(p) => {
+            validate_ncname(p, "namespace prefix")?;
+            Ok(Some(p))
+        }
+    }
+}
+
+fn validate_pi_target(target: &str) -> PyResult<()> {
+    validate_xml_name(target, "processing instruction target")?;
+    if target.eq_ignore_ascii_case("xml") {
+        return Err(PyValueError::new_err(
+            "Invalid processing instruction target: reserved XML target",
+        ));
+    }
+    Ok(())
+}
+
+fn writer_attr_refs<'a>(
+    attrs: &'a Option<Vec<(String, String)>>,
+) -> PyResult<Vec<(&'a str, &'a str)>> {
+    // Attribute values are escaped by the writer. Attribute names are not, so
+    // validate them before handing references to the underlying writer.
+    match attrs {
+        Some(a) => {
+            for (name, _) in a {
+                validate_xml_name(name, "attribute")?;
+            }
+            Ok(a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect())
+        }
+        None => Ok(Vec::new()),
     }
 }
 
@@ -92,12 +177,21 @@ struct QName {
 impl QName {
     #[new]
     #[pyo3(signature = (local_name, namespace_uri=None, prefix=None))]
-    fn new(local_name: String, namespace_uri: Option<String>, prefix: Option<String>) -> Self {
-        QName {
+    fn new(
+        local_name: String,
+        namespace_uri: Option<String>,
+        prefix: Option<String>,
+    ) -> PyResult<Self> {
+        validate_ncname(&local_name, "local")?;
+        if let Some(p) = prefix.as_deref() {
+            validate_prefix(Some(p))?;
+        }
+        let prefix = prefix.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        Ok(QName {
             namespace_uri,
             prefix,
             local_name,
-        }
+        })
     }
 
     /// The local part of the name.
@@ -343,6 +437,8 @@ impl Node {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<Option<String>> {
+        validate_ncname(name, "attribute")?;
+        let prefix = validate_prefix(prefix)?;
         let mut guard = self
             .doc
             .lock()
@@ -608,6 +704,8 @@ impl Node {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<()> {
+        validate_ncname(local_name, "element")?;
+        let prefix = validate_prefix(prefix)?;
         let mut guard = self
             .doc
             .lock()
@@ -1091,6 +1189,8 @@ impl Document {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<Node> {
+        validate_ncname(local_name, "element")?;
+        let prefix = validate_prefix(prefix)?;
         let mut guard = self
             .inner
             .lock()
@@ -1150,6 +1250,7 @@ impl Document {
 
     /// Create a new processing instruction node (not yet attached to the tree).
     fn create_processing_instruction(&self, target: &str, data: Option<&str>) -> PyResult<Node> {
+        validate_pi_target(target)?;
         let mut guard = self
             .inner
             .lock()
@@ -1187,6 +1288,7 @@ impl Document {
         prefix: Option<&str>,
         uri: &str,
     ) -> PyResult<()> {
+        let prefix = validate_prefix(prefix)?;
         let mut guard = self
             .inner
             .lock()
@@ -1651,37 +1753,40 @@ impl XmlWriter {
     ///
     /// Attributes should be a list of (name, value) tuples.
     #[pyo3(signature = (name, attrs=None))]
-    fn start_element(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) {
-        let attr_refs: Vec<(&str, &str)> = match &attrs {
-            Some(a) => a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
-            None => Vec::new(),
-        };
+    fn start_element(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) -> PyResult<()> {
+        validate_xml_name(name, "element")?;
+        let attr_refs = writer_attr_refs(&attrs)?;
         self.inner.start_element(name, &attr_refs);
+        Ok(())
     }
 
     /// End the current element.
-    fn end_element(&mut self, name: &str) {
+    fn end_element(&mut self, name: &str) -> PyResult<()> {
+        validate_xml_name(name, "element")?;
         self.inner.end_element(name);
+        Ok(())
     }
 
     /// Write a self-closing empty element: <name/>
     #[pyo3(signature = (name, attrs=None))]
-    fn empty_element(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) {
-        let attr_refs: Vec<(&str, &str)> = match &attrs {
-            Some(a) => a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
-            None => Vec::new(),
-        };
+    fn empty_element(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) -> PyResult<()> {
+        validate_xml_name(name, "element")?;
+        let attr_refs = writer_attr_refs(&attrs)?;
         self.inner.empty_element(name, &attr_refs);
+        Ok(())
     }
 
     /// Write an expanded empty element: <name></name>
     #[pyo3(signature = (name, attrs=None))]
-    fn empty_element_expanded(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) {
-        let attr_refs: Vec<(&str, &str)> = match &attrs {
-            Some(a) => a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
-            None => Vec::new(),
-        };
+    fn empty_element_expanded(
+        &mut self,
+        name: &str,
+        attrs: Option<Vec<(String, String)>>,
+    ) -> PyResult<()> {
+        validate_xml_name(name, "element")?;
+        let attr_refs = writer_attr_refs(&attrs)?;
         self.inner.empty_element_expanded(name, &attr_refs);
+        Ok(())
     }
 
     /// Write text content (auto-escaped).
@@ -1700,8 +1805,10 @@ impl XmlWriter {
     }
 
     /// Write a processing instruction.
-    fn processing_instruction(&mut self, target: &str, data: Option<&str>) {
+    fn processing_instruction(&mut self, target: &str, data: Option<&str>) -> PyResult<()> {
+        validate_pi_target(target)?;
         self.inner.processing_instruction(target, data);
+        Ok(())
     }
 
     /// Write raw XML content (not escaped).

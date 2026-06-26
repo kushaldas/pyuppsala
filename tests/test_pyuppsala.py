@@ -122,6 +122,15 @@ class TestDocument:
         assert el.tag.namespace_uri == "urn:test"
         assert el.tag.prefix == "ns"
 
+    def test_create_element_rejects_invalid_names(self):
+        # Native DOM builders are a public construction path, independent of
+        # pyuppsala.etree, so they must enforce the same XML name boundary.
+        doc = Document.empty()
+        with pytest.raises(ValueError):
+            doc.create_element('x/><evil attr="1"')
+        with pytest.raises(ValueError):
+            doc.create_element("item", namespace_uri="urn:test", prefix="bad prefix")
+
     def test_create_text(self):
         doc = parse("<root/>")
         text = doc.create_text("hello")
@@ -151,6 +160,24 @@ class TestDocument:
         pi = doc.create_processing_instruction("target", None)
         doc.append_child(doc.document_element, pi)
         assert "<?target?>" in doc.to_xml()
+
+    def test_create_processing_instruction_rejects_invalid_target(self):
+        # PI targets are emitted verbatim by the serializer; whitespace would
+        # split the target from injected data.
+        doc = Document.empty()
+        with pytest.raises(ValueError):
+            doc.create_processing_instruction("bad target", "data")
+
+    def test_set_namespace_declaration_rejects_invalid_prefix(self):
+        # Namespace declaration prefixes become xmlns:prefix attributes during
+        # serialization, so prefix validation closes another injection route.
+        doc = parse("<root/>")
+        with pytest.raises(ValueError):
+            doc.set_namespace_declaration(
+                doc.document_element,
+                'p injected="1"',
+                "urn:test",
+            )
 
     def test_append_child(self):
         doc = parse("<root/>")
@@ -323,6 +350,23 @@ class TestNode:
             doc.document_element.get_attribute("key", namespace_uri="urn:test") == "val"
         )
 
+    def test_set_attribute_rejects_invalid_names(self):
+        # Attribute names are written as markup.  Values are escaped elsewhere,
+        # but names must be syntactically valid before storage.
+        doc = parse("<root/>")
+        el = doc.document_element
+        with pytest.raises(ValueError):
+            el.set_attribute('a="v"/><evil foo', "z")
+        with pytest.raises(ValueError):
+            el.set_attribute("key", "val", namespace_uri="urn:test", prefix="bad prefix")
+
+    def test_set_qname_rejects_invalid_names(self):
+        # Renaming an existing node has the same serialization risk as creating
+        # it with a bad name.
+        doc = parse("<root/>")
+        with pytest.raises(ValueError):
+            doc.document_element.set_qname('safe injected="1"')
+
     def test_remove_attribute(self):
         doc = parse('<root key="val"/>')
         old = doc.document_element.remove_attribute("key")
@@ -480,6 +524,14 @@ class TestQName:
         q = QName("item", namespace_uri="urn:test", prefix="ns")
         assert q.prefix == "ns"
         assert q.prefixed_name == "ns:item"
+
+    def test_rejects_invalid_names(self):
+        # QName stores local name and prefix separately, so each must be an
+        # NCName.  This mirrors the validation used by DOM construction.
+        with pytest.raises(ValueError):
+            QName("bad name")
+        with pytest.raises(ValueError):
+            QName("item", namespace_uri="urn:test", prefix="bad prefix")
 
     def test_prefixed_name_no_prefix(self):
         q = QName("root")
@@ -830,6 +882,13 @@ class TestXmlWriter:
         w.processing_instruction("target", None)
         assert "<?target?>" in w.to_string()
 
+    def test_processing_instruction_rejects_invalid_target(self):
+        # XmlWriter is intentionally low-level, but element/attribute/PI names
+        # are still structural XML and are not escaped by the writer.
+        w = XmlWriter()
+        with pytest.raises(ValueError):
+            w.processing_instruction("bad target", "data")
+
     def test_empty_element(self):
         w = XmlWriter()
         w.empty_element("br")
@@ -839,6 +898,21 @@ class TestXmlWriter:
         w = XmlWriter()
         w.empty_element_expanded("br")
         assert w.to_string() == "<br></br>"
+
+    def test_rejects_invalid_names(self):
+        # raw() remains the explicit escape hatch for trusted XML fragments;
+        # the structured writer methods reject names that would inject markup.
+        w = XmlWriter()
+        with pytest.raises(ValueError):
+            w.start_element('x/><evil attr="1"')
+        with pytest.raises(ValueError):
+            w.start_element("root", [('a="v"/><evil foo', "z")])
+        with pytest.raises(ValueError):
+            w.end_element('x injected="1"')
+        with pytest.raises(ValueError):
+            w.empty_element("bad name")
+        with pytest.raises(ValueError):
+            w.empty_element_expanded("bad name")
 
     def test_raw(self):
         w = XmlWriter()

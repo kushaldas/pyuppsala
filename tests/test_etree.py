@@ -359,6 +359,23 @@ class TestElementTreeDifferential:
         P.ElementTree(pr).write(str(f))
         assert lxml_canon(f.read_text()) == L.tostring(build_tree(L))
 
+    def test_elementtree_uses_selected_root(self):
+        # ElementTree(child) is a view rooted at that child, not at the outer
+        # document element.  This matters for serialization and validation
+        # because sibling data must not leak into operations on the subtree.
+        pr = P.fromstring("<r><a><x/></a><b>secret</b></r>")
+        lr = L.fromstring("<r><a><x/></a><b>secret</b></r>")
+
+        pt = P.ElementTree(pr[0])
+        lt = L.ElementTree(lr[0])
+
+        assert pt.getroot() is pr[0]
+        assert lt.getroot() is lr[0]
+        assert pt.getroot().tag == lt.getroot().tag == "a"
+        assert lxml_canon(P.tostring(pt, encoding="unicode")) == L.tostring(lt)
+        assert pt.getpath(pr[0]) == lt.getpath(lr[0]) == "/r/a"
+        assert pt.getpath(pr[0][0]) == lt.getpath(lr[0][0]) == "/a/x"
+
 
 SCHEMA = (
     "<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'>"
@@ -497,27 +514,33 @@ class TestStandalone:
         assert root[0].tail == "xyz"
         assert P.tostring(root, encoding="unicode") == "<a>tuv<b/>xyz</a>"
 
-    def test_strip_cdata_false_text_and_tail_are_contiguous(self):
+    def test_strip_cdata_false_exposes_contiguous_text_and_tail(self):
+        # With CDATA preservation, one logical lxml .text/.tail value can be
+        # split across text + CDATA + text native nodes.  The public API should
+        # expose and replace the whole contiguous run as one string.
         parser = P.XMLParser(strip_cdata=False)
-        root = P.fromstring("<a>t<![CDATA[u]]>v<b/>x<![CDATA[y]]>z</a>", parser)
+        root = P.fromstring(
+            "<a>t<![CDATA[u]]>v<b/>x<![CDATA[y]]>z<c/></a>",
+            parser,
+        )
+
         assert root.text == "tuv"
         assert root[0].tail == "xyz"
 
-    def test_text_tail_setters_replace_cdata_runs(self):
-        parser = P.XMLParser(strip_cdata=False)
-        root = P.fromstring("<a>t<![CDATA[u]]>v<b/>x<![CDATA[y]]>z</a>", parser)
-        root.text = "T"
-        root[0].tail = "L"
-        assert root.text == "T"
-        assert root[0].tail == "L"
-        assert P.tostring(root, encoding="unicode") == "<a>T<b/>L</a>"
+        root.text = "lead"
+        root[0].tail = "tail"
+        assert root.text == "lead"
+        assert root[0].tail == "tail"
+        assert (
+            P.tostring(root, encoding="unicode")
+            == "<a>lead<b/>tail<c/></a>"
+        )
 
-        root = P.fromstring("<a>t<![CDATA[u]]>v<b/>x<![CDATA[y]]>z</a>", parser)
         root.text = None
         root[0].tail = None
         assert root.text is None
         assert root[0].tail is None
-        assert P.tostring(root, encoding="unicode") == "<a><b/></a>"
+        assert P.tostring(root, encoding="unicode") == "<a><b/><c/></a>"
 
     def test_huge_tree_allows_deep_nesting(self):
         depth = 500
@@ -591,9 +614,35 @@ class TestStandalone:
 
         tree = P.ElementTree()
         with pytest.raises(AssertionError, match="missing root"):
+            P.tostring(tree, encoding="unicode")
+        with pytest.raises(AssertionError, match="missing root"):
             tree.write(io.BytesIO())
         with pytest.raises(AssertionError, match="missing root"):
             tree.write(tmp_path / "empty.xml", encoding="unicode")
+
+    def test_elementtree_schema_validation_uses_selected_root(self):
+        # XMLSchema.validate() serializes the tree it receives.  A tree rooted
+        # at <a/> must validate as <a/>, not as the original <r> document.
+        root = P.fromstring("<r><a/><b>secret</b></r>")
+        tree = P.ElementTree(root[0])
+        child_schema = P.XMLSchema(
+            P.fromstring(
+                "<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'>"
+                "<xs:element name='a'/>"
+                "</xs:schema>"
+            )
+        )
+        document_schema = P.XMLSchema(
+            P.fromstring(
+                "<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'>"
+                "<xs:element name='r'/>"
+                "</xs:schema>"
+            )
+        )
+
+        assert P.tostring(tree, encoding="unicode") == "<a/>"
+        assert child_schema.validate(tree) is True
+        assert document_schema.validate(tree) is False
 
     def test_elementtree_write_unicode_path_uses_utf8(self, tmp_path):
         path = tmp_path / "unicode.xml"
@@ -649,6 +698,37 @@ class TestStandalone:
         del el.attrib["k"]  # removes only the no-namespace one
         assert el.get("k") is None
         assert el.keys() == ["{http://a}k"]
+
+    def test_constructed_xml_names_are_validated(self):
+        # XML names are serialized as markup, so invalid names must be rejected
+        # before they can inject tag delimiters, attributes, or bogus prefixes.
+        with pytest.raises(ValueError):
+            P.Element("root/><evil")
+        with pytest.raises(ValueError):
+            P.Element("root", {"bad name": "1"})
+        with pytest.raises(ValueError):
+            P.Element("root", nsmap={'p injected="1"': "urn:x"})
+        with pytest.raises(ValueError):
+            P.register_namespace('p injected="1"', "urn:x")
+
+        root = P.Element("root")
+        with pytest.raises(ValueError):
+            P.SubElement(root, 'x/><evil attr="1"')
+        with pytest.raises(ValueError):
+            root.set('a="v"/><evil foo', "z")
+        with pytest.raises(ValueError):
+            root.tag = 'safe injected="1"'
+
+    def test_valid_constructed_xml_names_still_work(self):
+        root = P.Element("{urn:x}root", nsmap={"x": "urn:x"})
+        child = P.SubElement(root, "{urn:x}child")
+        child.set("{urn:y}attr", "v")
+        # The validation guard should not reject legitimate local names,
+        # prefixes, default namespace handling, or namespaced attributes.
+        roundtrip = P.fromstring(P.tostring(root))
+        assert roundtrip.tag == "{urn:x}root"
+        assert roundtrip[0].tag == "{urn:x}child"
+        assert roundtrip[0].get("{urn:y}attr") == "v"
 
     def test_cross_tree_membership_is_rejected(self):
         # node_id is per-document; a node from another tree whose id collides

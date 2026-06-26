@@ -18,6 +18,7 @@ See ``docs/etree.rst`` for the supported/unsupported feature matrix.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from weakref import WeakValueDictionary
 
@@ -117,14 +118,49 @@ _namespace_map = {
     "http://www.w3.org/2001/XMLSchema-instance": "xsi",
 }
 
+# XML construction APIs write names directly into serialized markup.  Validate
+# local names and namespace prefixes before they enter the native DOM so callers
+# cannot smuggle tag delimiters, quotes, or whitespace into element/attribute
+# positions.  The etree layer uses NCName because namespace URI and prefix are
+# tracked separately.
+_NCNAME_START = r"A-Z_a-z\xC0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD"
+_NCNAME_CHAR = _NCNAME_START + r"\-.0-9\xB7\u0300-\u036F\u203F-\u2040"
+_NCNAME_RE = re.compile(r"^[%s][%s]*$" % (_NCNAME_START, _NCNAME_CHAR))
+
+
+def _validate_ncname(value, what):
+    """Validate an XML NCName and return it.
+
+    etree represents namespaces in Clark notation or as separate
+    ``namespace_uri``/``prefix`` fields, so element local names, attribute local
+    names, and prefixes must be NCNames (no embedded colon).
+    """
+    if not isinstance(value, str):
+        raise TypeError("%s name must be a string" % what)
+    if not _NCNAME_RE.match(value):
+        raise ValueError("Invalid %s name %r" % (what, value))
+    return value
+
+
+def _validate_prefix(prefix):
+    """Validate a namespace prefix.
+
+    ``None`` denotes the default namespace.  An empty string is normalized to
+    ``None`` for compatibility with callers that use ``""`` to mean default.
+    """
+    if prefix in (None, ""):
+        return None
+    return _validate_ncname(prefix, "namespace prefix")
+
 
 def register_namespace(prefix, uri):
     """Register a prefix -> URI mapping used when serializing built trees."""
     if not isinstance(prefix, str) or not isinstance(uri, str):
         raise TypeError("prefix and uri must be strings")
-    import re as _re
-
-    if _re.match(r"ns\d+$", prefix):
+    prefix = _validate_prefix(prefix)
+    if prefix is None:
+        raise ValueError("Default namespaces must be declared with nsmap={None: uri}")
+    if re.match(r"ns\d+$", prefix):
         raise ValueError("Prefixes of the form ns<N> are reserved.")
     # Drop any existing mapping for this uri or prefix, then register.
     for u, p in list(_namespace_map.items()):
@@ -135,12 +171,14 @@ def register_namespace(prefix, uri):
 
 def _tag_split(tag):
     """Split a tag string into ``(namespace_uri_or_None, local_name)``."""
+    if not isinstance(tag, str):
+        raise TypeError("Invalid tag name %r" % (tag,))
     if tag and tag[0] == "{":
         uri, brace, local = tag[1:].partition("}")
         if not brace:
             raise ValueError("Invalid tag name %r" % tag)
-        return (uri or None), local
-    return None, tag
+        return (uri or None), _validate_ncname(local, "tag")
+    return None, _validate_ncname(tag, "tag")
 
 
 def _make_clark(namespace_uri, local):
@@ -162,13 +200,30 @@ def _split_key(key):
     return _tag_split(key)
 
 
+def _validate_nsmap(nsmap):
+    """Return a validated namespace map with default prefixes normalized.
+
+    lxml uses ``None`` for the default namespace in ``nsmap``.  We also accept
+    ``""`` as input and normalize it to ``None`` before passing declarations to
+    the native layer.
+    """
+    if nsmap is None:
+        return None
+    normalized = {}
+    for pfx, uri in nsmap.items():
+        if not isinstance(uri, str):
+            raise TypeError("namespace URI must be a string")
+        normalized[_validate_prefix(pfx)] = uri
+    return normalized
+
+
 def _prefix_for_ns(ns, nsmap):
     """Pick a serialization prefix for ``ns`` from ``nsmap``/registry, or None."""
     if nsmap:
         has_default = False
         for pfx, uri in nsmap.items():
             if uri == ns:
-                if pfx is None:
+                if pfx in (None, ""):
                     has_default = True
                 else:
                     return pfx
@@ -284,51 +339,46 @@ class _DocHolder:
         return pfx
 
 
-def _following_text_node(node):
-    """Return the text node immediately after ``node`` (its lxml ``.tail``), or None.
+def _text_run_from(node):
+    """Return adjacent text/CDATA nodes starting at ``node``.
 
-    In uppsala's DOM, the text following an element's end tag is stored as the
-    element's next sibling text node; that node is what lxml exposes as ``.tail``.
+    When ``strip_cdata=False`` is used, a single lxml ``.text`` or ``.tail``
+    value can be represented by multiple adjacent native nodes, for example
+    ``text`` + ``CDATA`` + ``text``.  The etree API exposes that whole run as
+    one logical string.
     """
-    ns = node.next_sibling
-    if ns is not None and ns.kind in _TEXT_KINDS:
-        return ns
-    return None
+    run = []
+    cur = node
+    while cur is not None and cur.kind in _TEXT_KINDS:
+        run.append(cur)
+        cur = cur.next_sibling
+    return run
 
 
-def _text_run_value(start):
-    """Return the concatenated value of a contiguous text/CDATA run."""
-    if start is None or start.kind not in _TEXT_KINDS:
+def _run_text(run):
+    """Convert a native text/CDATA run to the public etree string value."""
+    if not run:
         return None
-    parts = []
-    node = start
-    while node is not None and node.kind in _TEXT_KINDS:
-        parts.append(node.text or "")
-        node = node.next_sibling
-    return "".join(parts)
+    return "".join(n.text or "" for n in run)
 
 
-def _remove_text_run(doc, parent, start):
-    """Remove a contiguous text/CDATA run starting at ``start``."""
-    node = start
-    while node is not None and node.kind in _TEXT_KINDS:
-        next_node = node.next_sibling
-        doc.remove_child(parent, node)
-        node = next_node
+def _following_text_run(node):
+    """Return the text/CDATA run immediately after ``node`` (its lxml tail)."""
+    return _text_run_from(node.next_sibling)
 
 
-def _replace_text_run(doc, parent, start, value):
-    """Replace a contiguous text/CDATA run with one plain text node."""
-    if start is None or start.kind not in _TEXT_KINDS:
-        return False
-    next_node = start.next_sibling
-    if start.kind == "text":
-        start.set_text(value)
-    else:
-        replacement = doc.create_text(value)
-        doc.replace_child(parent, replacement, start)
-    _remove_text_run(doc, parent, next_node)
-    return True
+def _remove_text_run(holder, parent, run):
+    """Remove every node in a logical etree text/tail run."""
+    for text_node in run:
+        holder.doc.remove_child(parent, text_node)
+
+
+def _attach_tail(holder, parent_node, tail_run, after):
+    """Attach a detached logical tail run immediately after ``after``."""
+    ref = after
+    for tail_node in tail_run:
+        holder.doc.insert_after(parent_node, tail_node, ref)
+        ref = tail_node
 
 
 def _content_children(node):
@@ -402,30 +452,29 @@ def _repoint_subtree(src_holder, dst, snode, dnode):
 
 
 def _extract(holder, node):
-    """Detach ``node`` and its tail text node from their parent.
+    """Detach ``node`` and its logical tail run from their parent.
 
-    Returns the detached tail text node (or None). The tail travels with the
-    element so that moving or removing the element also moves/removes its
-    trailing text, matching lxml/ElementTree semantics.
+    Returns the detached tail run. The tail travels with the element so that
+    moving or removing the element also moves/removes its trailing text,
+    matching lxml/ElementTree semantics even when CDATA preservation split the
+    tail across adjacent text/CDATA nodes.
     """
-    tail = _following_text_node(node)
+    tail = _following_text_run(node)
     if node.parent is not None:
         # Detach the tail first while it is still a sibling, then the node.
-        if tail is not None:
-            holder.doc.detach(tail)
+        for text_node in tail:
+            holder.doc.detach(text_node)
         holder.doc.detach(node)
     return tail
 
 
 def _attach(holder, parent_node, node, tail, ref=None):
-    """Insert ``node`` under ``parent_node`` (before ``ref``, or appended), then
-    reattach its ``tail`` text node immediately after it."""
+    """Insert ``node`` and then reattach its logical tail run after it."""
     if ref is None:
         holder.doc.append_child(parent_node, node)
     else:
         holder.doc.insert_before(parent_node, node, ref)
-    if tail is not None:
-        holder.doc.insert_after(parent_node, tail, node)
+    _attach_tail(holder, parent_node, tail, node)
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +483,7 @@ def _attach(holder, parent_node, node, tail, ref=None):
 
 
 def _build_element(holder, tag, nsmap):
+    nsmap = _validate_nsmap(nsmap)
     ns, local = _split_key(tag)
     prefix = _prefix_for_ns(ns, nsmap) if ns else None
     node = holder.doc.create_element(local, ns, prefix)
@@ -598,11 +648,11 @@ class _Element:
             return self._node.comment_text
         if kind == "processing_instruction":
             return self._node.pi_data
-        return _text_run_value(self._node.first_child)
+        return _run_text(_text_run_from(self._node.first_child))
 
     @text.setter
     def text(self, value):
-        """Set the leading text, maintaining the single-leading-text-node invariant."""
+        """Set leading text and replace the full existing text/CDATA run."""
         kind = self._node.kind
         if kind == "comment":
             self._node.set_text("" if value is None else value)
@@ -613,38 +663,47 @@ class _Element:
         doc = self._holder.doc
         node = self._node
         fc = node.first_child
+        run = _text_run_from(fc)
         if value is None:
-            _remove_text_run(doc, node, fc)
+            _remove_text_run(self._holder, node, run)
             return
-        if _replace_text_run(doc, node, fc, value):
-            return
-        if fc is None:
-            doc.append_child(node, doc.create_text(value))
+        if run:
+            # Reuse the first native text-like node, then remove the rest so the
+            # public single-string assignment replaces the whole logical run.
+            run[0].set_text(value)
+            _remove_text_run(self._holder, node, run[1:])
         else:
-            doc.insert_before(node, doc.create_text(value), fc)
+            # No leading text node yet: create one and make it the first child.
+            tn = doc.create_text(value)
+            if fc is None:
+                doc.append_child(node, tn)
+            else:
+                doc.insert_before(node, tn, fc)
 
     @property
     def tail(self):
         """The text following this element's end tag, before the next sibling, or None."""
-        return _text_run_value(self._node.next_sibling)
+        return _run_text(_following_text_run(self._node))
 
     @tail.setter
     def tail(self, value):
-        """Set the trailing text by mutating/creating the following text node."""
+        """Set trailing text and replace the full existing text/CDATA run."""
         doc = self._holder.doc
         node = self._node
         parent = node.parent
-        ns = _following_text_node(node)
         if value is None:
-            if ns is not None and parent is not None:
-                _remove_text_run(doc, parent, ns)
+            if parent is not None:
+                _remove_text_run(self._holder, parent, _following_text_run(node))
             return
-        if parent is None:
-            return
-        if _replace_text_run(doc, parent, ns, value):
-            return
-        # A tail can only exist where there is a parent to host the text node.
-        doc.insert_after(parent, doc.create_text(value), node)
+        run = _following_text_run(node)
+        if run:
+            run[0].set_text(value)
+            if parent is not None:
+                _remove_text_run(self._holder, parent, run[1:])
+        elif parent is not None:
+            # A tail can only exist where there is a parent to host the text node.
+            tn = doc.create_text(value)
+            doc.insert_after(parent, tn, node)
 
     # -- attributes -------------------------------------------------------
 
@@ -752,8 +811,7 @@ class _Element:
         node, tail = self._adopt(element)
         self._holder.doc.insert_before(self._node, node, old)
         _extract(self._holder, old)
-        if tail is not None:
-            self._holder.doc.insert_after(self._node, tail, node)
+        _attach_tail(self._holder, self._node, tail, node)
 
     def __delitem__(self, index):
         """Remove the child at ``index`` (or the children in a slice)."""
@@ -829,18 +887,13 @@ class _Element:
         sh = src_el._holder
         dst = self._holder
         snode = src_el._node
-        stail = _following_text_node(snode)
+        stail = _following_text_run(snode)
         new_node = _clone_node(dst, snode)
-        if stail is None:
-            new_tail = None
-        elif stail.kind == "cdata":
-            new_tail = dst.doc.create_cdata(stail.text or "")
-        else:
-            new_tail = dst.doc.create_text(stail.text or "")
+        new_tail = [_clone_node(dst, text_node) for text_node in stail]
         _repoint_subtree(sh, dst, snode, new_node)
         if snode.parent is not None:
-            if stail is not None:
-                sh.doc.detach(stail)
+            for text_node in stail:
+                sh.doc.detach(text_node)
             sh.doc.detach(snode)
         return new_node, new_tail
 
@@ -881,8 +934,7 @@ class _Element:
         node, tail = self._adopt(new_element)
         self._holder.doc.insert_before(self._node, node, old_element._node)
         _extract(self._holder, old_element._node)
-        if tail is not None:
-            self._holder.doc.insert_after(self._node, tail, node)
+        _attach_tail(self._holder, self._node, tail, node)
 
     def addnext(self, element):
         """Insert ``element`` as this element's next sibling."""
@@ -891,8 +943,7 @@ class _Element:
             raise TypeError("cannot add sibling to a root element")
         node, tail = self._adopt(element)
         self._holder.doc.insert_after(parent, node, self._node)
-        if tail is not None:
-            self._holder.doc.insert_after(parent, tail, node)
+        _attach_tail(self._holder, parent, tail, node)
 
     def addprevious(self, element):
         """Insert ``element`` as this element's previous sibling."""
@@ -901,8 +952,7 @@ class _Element:
             raise TypeError("cannot add sibling to a root element")
         node, tail = self._adopt(element)
         self._holder.doc.insert_before(parent, node, self._node)
-        if tail is not None:
-            self._holder.doc.insert_after(parent, tail, node)
+        _attach_tail(self._holder, parent, tail, node)
 
     def makeelement(self, _tag, attrib=None, nsmap=None, **extra):
         """Create a new (detached) element in the same document as this one."""
@@ -961,7 +1011,7 @@ class _Element:
 
     def getroottree(self):
         """Return an :class:`_ElementTree` wrapping this element's document."""
-        return _ElementTree(self._holder)
+        return _ElementTree(self._holder, self._holder.doc.document_element)
 
     # -- traversal --------------------------------------------------------
 
@@ -1206,12 +1256,20 @@ def iselement(element):
 class _ElementTree:
     """A document wrapper (lxml's ``_ElementTree``) holding a root element."""
 
-    def __init__(self, holder):
+    def __init__(self, holder, root=None):
+        """Wrap ``holder`` with an optional selected tree root.
+
+        ``ElementTree(child)`` in lxml serializes and validates from ``child``,
+        not from the document's outer element.  Keeping the selected native root
+        here prevents callers from accidentally exposing sibling subtrees when
+        they meant to operate on a nested element.
+        """
         self._holder = holder
+        self._root = root
 
     def getroot(self):
         """Return the root element, or None for an empty document."""
-        root = self._holder.doc.document_element
+        root = self._root
         return self._holder.proxy(root) if root is not None else None
 
     def _require_root(self):
@@ -1225,6 +1283,7 @@ class _ElementTree:
         data = _read_source(source)
         el = fromstring(data, parser)
         self._holder = el._holder
+        self._root = el._node
         return el
 
     def write(
@@ -1285,12 +1344,27 @@ class _ElementTree:
         """Return an absolute XPath locating ``element`` within this tree.
 
         Positional predicates (``tag[n]``) are added only where a tag is
-        ambiguous among its siblings, matching lxml's ``getpath``.
+        ambiguous among its siblings, matching lxml's ``getpath``.  lxml keeps
+        the selected root itself document-absolute even for
+        ``ElementTree(child)``, but reports descendants relative to that
+        selected root.
         """
+        if not isinstance(element, _Element) or element._holder is not self._holder:
+            raise ValueError("Element is not in this tree")
+        selected = self._require_root()
+        stop_at_selected = element._id != selected._id
+        if stop_at_selected:
+            cur = element.getparent()
+            while cur is not None and cur._id != selected._id:
+                cur = cur.getparent()
+            stop_at_selected = cur is not None
         parts = []
         cur = element
         while cur is not None:
             parent = cur.getparent()
+            if stop_at_selected and cur._id == selected._id:
+                parts.append("/" + _path_tag(cur))
+                break
             if parent is None:
                 parts.append("/" + _path_tag(cur))
                 break
@@ -1323,7 +1397,7 @@ def ElementTree(element=None, *, file=None, parser=None):
     empty tree. Exposed as a factory function rather than a class.
     """
     if element is not None:
-        return _ElementTree(element._holder)
+        return _ElementTree(element._holder, element._node)
     if file is not None:
         return parse(file, parser)
     holder = _DocHolder(_u.Document.empty())
@@ -1567,7 +1641,7 @@ def parse(source, parser=None):
     """
     data = _read_source(source)
     el = fromstring(data, parser)
-    return _ElementTree(el._holder)
+    return _ElementTree(el._holder, el._node)
 
 
 def tostring(
