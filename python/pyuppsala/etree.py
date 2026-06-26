@@ -296,6 +296,41 @@ def _following_text_node(node):
     return None
 
 
+def _text_run_value(start):
+    """Return the concatenated value of a contiguous text/CDATA run."""
+    if start is None or start.kind not in _TEXT_KINDS:
+        return None
+    parts = []
+    node = start
+    while node is not None and node.kind in _TEXT_KINDS:
+        parts.append(node.text or "")
+        node = node.next_sibling
+    return "".join(parts)
+
+
+def _remove_text_run(doc, parent, start):
+    """Remove a contiguous text/CDATA run starting at ``start``."""
+    node = start
+    while node is not None and node.kind in _TEXT_KINDS:
+        next_node = node.next_sibling
+        doc.remove_child(parent, node)
+        node = next_node
+
+
+def _replace_text_run(doc, parent, start, value):
+    """Replace a contiguous text/CDATA run with one plain text node."""
+    if start is None or start.kind not in _TEXT_KINDS:
+        return False
+    next_node = start.next_sibling
+    if start.kind == "text":
+        start.set_text(value)
+    else:
+        replacement = doc.create_text(value)
+        doc.replace_child(parent, replacement, start)
+    _remove_text_run(doc, parent, next_node)
+    return True
+
+
 def _content_children(node):
     """Return the children lxml treats as element content: elements, comments, PIs.
 
@@ -563,10 +598,7 @@ class _Element:
             return self._node.comment_text
         if kind == "processing_instruction":
             return self._node.pi_data
-        fc = self._node.first_child
-        if fc is not None and fc.kind in _TEXT_KINDS:
-            return fc.text
-        return None
+        return _text_run_value(self._node.first_child)
 
     @text.setter
     def text(self, value):
@@ -581,29 +613,20 @@ class _Element:
         doc = self._holder.doc
         node = self._node
         fc = node.first_child
-        has_text = fc is not None and fc.kind in _TEXT_KINDS
         if value is None:
-            # Drop the leading text node entirely.
-            if has_text:
-                doc.remove_child(node, fc)
+            _remove_text_run(doc, node, fc)
             return
-        if has_text:
-            fc.set_text(value)
+        if _replace_text_run(doc, node, fc, value):
+            return
+        if fc is None:
+            doc.append_child(node, doc.create_text(value))
         else:
-            # No leading text node yet: create one and make it the first child.
-            tn = doc.create_text(value)
-            if fc is None:
-                doc.append_child(node, tn)
-            else:
-                doc.insert_before(node, tn, fc)
+            doc.insert_before(node, doc.create_text(value), fc)
 
     @property
     def tail(self):
         """The text following this element's end tag, before the next sibling, or None."""
-        ns = self._node.next_sibling
-        if ns is not None and ns.kind in _TEXT_KINDS:
-            return ns.text
-        return None
+        return _text_run_value(self._node.next_sibling)
 
     @tail.setter
     def tail(self, value):
@@ -614,14 +637,14 @@ class _Element:
         ns = _following_text_node(node)
         if value is None:
             if ns is not None and parent is not None:
-                doc.remove_child(parent, ns)
+                _remove_text_run(doc, parent, ns)
             return
-        if ns is not None:
-            ns.set_text(value)
-        elif parent is not None:
-            # A tail can only exist where there is a parent to host the text node.
-            tn = doc.create_text(value)
-            doc.insert_after(parent, tn, node)
+        if parent is None:
+            return
+        if _replace_text_run(doc, parent, ns, value):
+            return
+        # A tail can only exist where there is a parent to host the text node.
+        doc.insert_after(parent, doc.create_text(value), node)
 
     # -- attributes -------------------------------------------------------
 

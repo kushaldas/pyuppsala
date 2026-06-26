@@ -497,6 +497,28 @@ class TestStandalone:
         assert root[0].tail == "xyz"
         assert P.tostring(root, encoding="unicode") == "<a>tuv<b/>xyz</a>"
 
+    def test_strip_cdata_false_text_and_tail_are_contiguous(self):
+        parser = P.XMLParser(strip_cdata=False)
+        root = P.fromstring("<a>t<![CDATA[u]]>v<b/>x<![CDATA[y]]>z</a>", parser)
+        assert root.text == "tuv"
+        assert root[0].tail == "xyz"
+
+    def test_text_tail_setters_replace_cdata_runs(self):
+        parser = P.XMLParser(strip_cdata=False)
+        root = P.fromstring("<a>t<![CDATA[u]]>v<b/>x<![CDATA[y]]>z</a>", parser)
+        root.text = "T"
+        root[0].tail = "L"
+        assert root.text == "T"
+        assert root[0].tail == "L"
+        assert P.tostring(root, encoding="unicode") == "<a>T<b/>L</a>"
+
+        root = P.fromstring("<a>t<![CDATA[u]]>v<b/>x<![CDATA[y]]>z</a>", parser)
+        root.text = None
+        root[0].tail = None
+        assert root.text is None
+        assert root[0].tail is None
+        assert P.tostring(root, encoding="unicode") == "<a><b/></a>"
+
     def test_huge_tree_allows_deep_nesting(self):
         depth = 500
         xml = "<r>" + "<n>" * depth + "</n>" * depth + "</r>"
