@@ -895,6 +895,13 @@ class _Element:
     def _adopt(self, element):
         """Return ``(native_node, tail)`` in this holder for ``element``,
         cloning across documents when necessary."""
+        if not isinstance(element, _Element):
+            # All mutation entry points (append/insert/replace/addnext/...) flow
+            # through here, so this is the single place to reject non-elements
+            # with lxml's TypeError instead of a stray AttributeError.
+            raise TypeError(
+                "Argument must be an Element, got %s" % type(element).__name__
+            )
         if element._holder is self._holder:
             tail = _extract(self._holder, element._node)
             return element._node, tail

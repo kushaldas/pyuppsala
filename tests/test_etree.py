@@ -679,6 +679,23 @@ class TestStandalone:
         with pytest.raises(TypeError, match="with_tail"):
             P.tostring(el, encoding="unicode", with_tail=False)
 
+    def test_mutation_rejects_non_element(self):
+        # Passing a non-element to a mutation method raises TypeError (like
+        # lxml), not a stray AttributeError, for every entry point.
+        root = P.fromstring("<r><a/></r>")
+        with pytest.raises(TypeError):
+            root.append("x")
+        with pytest.raises(TypeError):
+            root.insert(0, 123)
+        with pytest.raises(TypeError):
+            root.replace(root[0], "x")
+        with pytest.raises(TypeError):
+            root[0].addnext("x")
+        with pytest.raises(TypeError):
+            root[0].addprevious("x")
+        with pytest.raises(TypeError):
+            root[0] = "x"
+
     def test_index_normalizes_negative_bounds(self):
         # Negative start/stop count from the end, like list.index / lxml.
         root = P.fromstring("<r><a/><b/><c/></r>")
