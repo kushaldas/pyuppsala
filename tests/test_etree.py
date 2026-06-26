@@ -790,6 +790,14 @@ class TestStandalone:
         with pytest.raises(NotImplementedError):
             P.XPathEvaluator(root)("//b", x=1)
 
+    def test_xpath_constructors_reject_unknown_kwargs(self):
+        # Unsupported options (or typos) must not be silently dropped.
+        root = P.fromstring("<a><b/></a>")
+        with pytest.raises(TypeError):
+            P.XPath("//b", smart_strings=False)
+        with pytest.raises(TypeError):
+            P.XPathEvaluator(root, regexp=False)
+
     def test_parser_encoding_override(self):
         # encoding= overrides the declared encoding for byte input.
         raw = '<?xml version="1.0"?><x>caf\u00e9</x>'.encode("latin-1")

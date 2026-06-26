@@ -1777,6 +1777,12 @@ class XPath:
     """A reusable, precompiled XPath expression callable on elements/trees."""
 
     def __init__(self, path, namespaces=None, **kwargs):
+        # No extra options (lxml's regexp/smart_strings/extensions) are
+        # supported; reject unknown kwargs rather than silently dropping them,
+        # matching XMLParser/tostring strictness.
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise TypeError("unexpected XPath keyword argument(s): %s" % names)
         self.path = path
         self._namespaces = namespaces
 
@@ -1797,6 +1803,11 @@ class ETXPath(XPath):
 
 def XPathEvaluator(element_or_tree, namespaces=None, **kwargs):
     """Return a callable that evaluates XPath expressions against a fixed context."""
+    # No extra options are supported here; reject unknown kwargs rather than
+    # silently dropping them, matching XMLParser/tostring strictness.
+    if kwargs:
+        names = ", ".join(sorted(kwargs))
+        raise TypeError("unexpected XPathEvaluator keyword argument(s): %s" % names)
     root = (
         element_or_tree.getroot()
         if isinstance(element_or_tree, _ElementTree)
