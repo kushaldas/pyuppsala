@@ -490,6 +490,13 @@ class TestStandalone:
         root = P.fromstring("<a><!--x--><b/></a>", parser)
         assert [e.tag for e in root] == ["b"]
 
+    def test_strip_cdata_merges_surrounding_text(self):
+        parser = P.XMLParser()
+        root = P.fromstring("<a>t<![CDATA[u]]>v<b/>x<![CDATA[y]]>z</a>", parser)
+        assert root.text == "tuv"
+        assert root[0].tail == "xyz"
+        assert P.tostring(root, encoding="unicode") == "<a>tuv<b/>xyz</a>"
+
     def test_huge_tree_allows_deep_nesting(self):
         depth = 500
         xml = "<r>" + "<n>" * depth + "</n>" * depth + "</r>"

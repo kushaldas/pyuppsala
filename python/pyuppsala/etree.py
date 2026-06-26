@@ -1409,14 +1409,14 @@ def _postprocess(holder, opts):
             remove_comments=opts.get("remove_comments"),
             remove_pis=opts.get("remove_pis"),
         )
-    if opts.get("strip_cdata", True):
+    strip_cdata = opts.get("strip_cdata", True)
+    if strip_cdata:
         _convert_cdata(holder, root)
-    if stripping:
+    if stripping or strip_cdata:
         # Removing a comment/PI can leave the text that surrounded it split
-        # across two adjacent text nodes. Merge them so .text/.tail expose a
-        # single contiguous run, matching lxml where the removed node (and the
-        # split it caused) never existed. Run after CDATA conversion so any
-        # converted nodes participate in the merge too.
+        # across two adjacent text nodes; converting CDATA can do the same.
+        # Merge them so .text/.tail expose a single contiguous run, matching
+        # lxml where the removed/converted node does not split plain text.
         _coalesce_text(holder, root)
 
 
