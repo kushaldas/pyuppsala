@@ -1613,10 +1613,17 @@ def tounicode(element_or_tree, **kwargs):
 
 
 def dump(elem, *, pretty_print=True, **kwargs):
-    """Write a debug serialization of ``elem`` to stdout."""
+    """Write a debug serialization of ``elem`` to stdout.
+
+    Extra keyword arguments are forwarded to :func:`tostring` (so options such
+    as ``xml_declaration`` take effect and unsupported options are rejected),
+    while ``encoding="unicode"`` is always used for stdout output.
+    """
     if isinstance(elem, _ElementTree):
         elem = elem.getroot()
-    print(tostring(elem, encoding="unicode", pretty_print=pretty_print), end="")
+    kwargs["encoding"] = "unicode"
+    kwargs.setdefault("pretty_print", pretty_print)
+    print(tostring(elem, **kwargs), end="")
 
 
 def indent(tree, space="  ", level=0):

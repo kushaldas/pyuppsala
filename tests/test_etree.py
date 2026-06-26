@@ -699,6 +699,17 @@ class TestStandalone:
         root = P.fromstring("<r><a/></r>", P.XMLParser(huge_tree=True))
         assert root.tag == "r"
 
+    def test_dump_forwards_kwargs(self, capsys):
+        root = P.fromstring("<a>x</a>")
+        # xml_declaration reaches tostring and prepends the declaration.
+        P.dump(root, xml_declaration=True)
+        out = capsys.readouterr().out
+        assert out.startswith('<?xml version="1.0"?>')
+        assert "<a>x</a>" in out
+        # Unsupported/typo kwargs are rejected by tostring, not silently dropped.
+        with pytest.raises(TypeError):
+            P.dump(root, bogus=True)
+
     def test_remove_comment_merges_surrounding_text(self):
         # Removing a comment/PI must merge the text it split, so .text/.tail
         # expose a single contiguous run as in lxml.
