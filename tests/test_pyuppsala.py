@@ -191,6 +191,46 @@ class TestDocument:
                 "urn:test",
             )
 
+    XML_NS = "http://www.w3.org/XML/1998/namespace"
+    XMLNS_NS = "http://www.w3.org/2000/xmlns/"
+
+    def test_set_namespace_declaration_rejects_reserved(self):
+        # The XML Namespaces spec reserves the xml/xmlns prefixes and their
+        # namespaces; declaring them in a non-standard way would serialize to
+        # invalid XML or clobber the standard xml binding.
+        doc = parse("<root/>")
+        el = doc.document_element
+        with pytest.raises(ValueError):  # xmlns prefix is reserved
+            doc.set_namespace_declaration(el, "xmlns", "urn:x")
+        with pytest.raises(ValueError):  # xml prefix bound elsewhere
+            doc.set_namespace_declaration(el, "xml", "urn:wrong")
+        with pytest.raises(ValueError):  # XML namespace under another prefix
+            doc.set_namespace_declaration(el, "foo", self.XML_NS)
+        with pytest.raises(ValueError):  # xmlns namespace is never declarable
+            doc.set_namespace_declaration(el, "p", self.XMLNS_NS)
+        # The canonical xml -> XML-namespace binding is still allowed.
+        doc.set_namespace_declaration(el, "xml", self.XML_NS)
+
+    def test_prefix_requires_namespace_uri(self):
+        # A prefix is only meaningful with a namespace URI; supplying one
+        # without a namespace is rejected rather than silently dropped.
+        doc = Document.empty()
+        with pytest.raises(ValueError):
+            doc.create_element("e", namespace_uri=None, prefix="p")
+        el = doc.create_element("e")
+        with pytest.raises(ValueError):
+            el.set_attribute("a", "v", namespace_uri=None, prefix="p")
+        with pytest.raises(ValueError):
+            el.set_qname("n", namespace_uri=None, prefix="p")
+
+    def test_xml_prefix_attribute_is_allowed(self):
+        # The reserved-prefix checks must not block the legitimate xml:lang
+        # attribute (prefix xml bound to the XML namespace).
+        doc = Document.empty()
+        el = doc.create_element("e")
+        el.set_attribute("lang", "en", namespace_uri=self.XML_NS, prefix="xml")
+        assert el.get_attribute("lang", namespace_uri=self.XML_NS) == "en"
+
     def test_append_child(self):
         doc = parse("<root/>")
         child = doc.create_element("child")

@@ -163,6 +163,10 @@ def register_namespace(prefix, uri):
     prefix = _validate_prefix(prefix)
     if prefix is None:
         raise ValueError("Default namespaces must be declared with nsmap={None: uri}")
+    if prefix in ("xml", "xmlns"):
+        # These prefixes are bound by the XML Namespaces spec; rebinding them
+        # would clobber the standard xml binding or produce invalid markup.
+        raise ValueError("Prefix %r is reserved." % prefix)
     if re.match(r"ns\d+$", prefix):
         raise ValueError("Prefixes of the form ns<N> are reserved.")
     # Drop any existing mapping for this uri or prefix, then register.

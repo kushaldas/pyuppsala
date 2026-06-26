@@ -710,6 +710,11 @@ class TestStandalone:
             P.Element("root", nsmap={'p injected="1"': "urn:x"})
         with pytest.raises(ValueError):
             P.register_namespace('p injected="1"', "urn:x")
+        # The xml/xmlns prefixes are reserved by the XML Namespaces spec.
+        with pytest.raises(ValueError):
+            P.register_namespace("xml", "urn:x")
+        with pytest.raises(ValueError):
+            P.register_namespace("xmlns", "urn:x")
 
         root = P.Element("root")
         with pytest.raises(ValueError):

@@ -119,6 +119,59 @@ fn validate_prefix(prefix: Option<&str>) -> PyResult<Option<&str>> {
     }
 }
 
+// The two namespaces the XML Namespaces spec reserves and binds to fixed
+// prefixes. They guard against rebinding `xml`/`xmlns` or declaring them in
+// ways that would produce invalid XML.
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// Validate a `(namespace_uri, prefix)` pair used to build an element or
+/// attribute QName.
+///
+/// Returns the normalized prefix (empty string mapped to `None`). A prefix is
+/// only meaningful alongside a namespace URI, so a prefix supplied without a
+/// namespace is rejected rather than being silently dropped.
+fn validate_qname_parts<'a>(
+    namespace_uri: Option<&str>,
+    prefix: Option<&'a str>,
+) -> PyResult<Option<&'a str>> {
+    let prefix = validate_prefix(prefix)?;
+    if namespace_uri.is_none() && prefix.is_some() {
+        return Err(PyValueError::new_err(
+            "a namespace prefix requires a namespace URI",
+        ));
+    }
+    Ok(prefix)
+}
+
+/// Reject `xmlns` declarations that the XML Namespaces spec forbids: the
+/// reserved `xmlns` prefix, rebinding the `xml` prefix or XML namespace to
+/// anything else, and declaring the `xmlns` namespace at all. These would
+/// otherwise serialize to invalid XML or clobber the standard `xml` binding.
+fn validate_ns_declaration(prefix: Option<&str>, uri: &str) -> PyResult<()> {
+    if prefix == Some("xmlns") {
+        return Err(PyValueError::new_err(
+            "the \"xmlns\" prefix is reserved and cannot be declared",
+        ));
+    }
+    if prefix == Some("xml") && uri != XML_NAMESPACE {
+        return Err(PyValueError::new_err(
+            "the \"xml\" prefix can only be bound to the XML namespace",
+        ));
+    }
+    if uri == XML_NAMESPACE && prefix != Some("xml") {
+        return Err(PyValueError::new_err(
+            "the XML namespace can only be bound to the \"xml\" prefix",
+        ));
+    }
+    if uri == XMLNS_NAMESPACE {
+        return Err(PyValueError::new_err(
+            "the xmlns namespace cannot be declared",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_pi_target(target: &str) -> PyResult<()> {
     validate_xml_name(target, "processing instruction target")?;
     if target.eq_ignore_ascii_case("xml") {
@@ -439,7 +492,7 @@ impl Node {
         prefix: Option<&str>,
     ) -> PyResult<Option<String>> {
         validate_ncname(name, "attribute")?;
-        let prefix = validate_prefix(prefix)?;
+        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .doc
             .lock()
@@ -706,7 +759,7 @@ impl Node {
         prefix: Option<&str>,
     ) -> PyResult<()> {
         validate_ncname(local_name, "element")?;
-        let prefix = validate_prefix(prefix)?;
+        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .doc
             .lock()
@@ -1191,7 +1244,7 @@ impl Document {
         prefix: Option<&str>,
     ) -> PyResult<Node> {
         validate_ncname(local_name, "element")?;
-        let prefix = validate_prefix(prefix)?;
+        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .inner
             .lock()
@@ -1281,7 +1334,9 @@ impl Document {
     /// `prefix=None` sets the default namespace (`xmlns="uri"`); otherwise sets
     /// `xmlns:prefix="uri"`. Used by the etree layer so namespaced trees built
     /// in memory serialize with correct namespace declarations. Raises
-    /// ValueError if `node` is not an element.
+    /// ValueError if `node` is not an element, or if the declaration is one the
+    /// XML Namespaces spec reserves (the `xmlns` prefix, rebinding `xml`/the XML
+    /// namespace, or declaring the `xmlns` namespace).
     #[pyo3(signature = (node, prefix, uri))]
     fn set_namespace_declaration(
         &self,
@@ -1290,6 +1345,7 @@ impl Document {
         uri: &str,
     ) -> PyResult<()> {
         let prefix = validate_prefix(prefix)?;
+        validate_ns_declaration(prefix, uri)?;
         let mut guard = self
             .inner
             .lock()
