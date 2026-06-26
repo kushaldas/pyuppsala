@@ -1016,6 +1016,29 @@ class TestExceptions:
         """XsdValidationError should be a valid exception class."""
         assert issubclass(XsdValidationError, Exception)
 
+    def test_exception_module_is_public_package(self):
+        """Exceptions report ``__module__ == 'pyuppsala'`` so tracebacks and
+        pickling resolve via the public package re-exports (there is no
+        importable top-level ``_pyuppsala`` module)."""
+        for exc in (
+            XmlParseError,
+            XmlWellFormednessError,
+            XmlNamespaceError,
+            XPathError,
+            XsdValidationError,
+        ):
+            assert exc.__module__ == "pyuppsala"
+
+    def test_exception_is_picklable(self):
+        """A custom exception round-trips through pickle (regression: a bad
+        ``__module__`` previously made this raise ``PicklingError``)."""
+        import pickle
+
+        original = XmlParseError("boom")
+        restored = pickle.loads(pickle.dumps(original))
+        assert isinstance(restored, XmlParseError)
+        assert str(restored) == "boom"
+
 
 # ============================================================================
 # Round-trip / integration tests

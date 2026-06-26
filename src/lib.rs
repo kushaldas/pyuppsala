@@ -15,16 +15,22 @@ use uppsala::{Document as UDocument, XmlError};
 // Custom Python exceptions
 // ---------------------------------------------------------------------------
 
-create_exception!(_pyuppsala, XmlParseError, pyo3::exceptions::PyException);
+// The module name passed to `create_exception!` becomes each exception's
+// Python `__module__`. Use the public package `pyuppsala` (which re-exports
+// these exceptions) rather than the internal `_pyuppsala` extension: there is
+// no importable top-level `_pyuppsala` module, so the latter breaks pickling
+// and produces misleading tracebacks. With `pyuppsala`, `__module__` resolves
+// via the package's re-exports.
+create_exception!(pyuppsala, XmlParseError, pyo3::exceptions::PyException);
 create_exception!(
-    _pyuppsala,
+    pyuppsala,
     XmlWellFormednessError,
     pyo3::exceptions::PyException
 );
-create_exception!(_pyuppsala, XmlNamespaceError, pyo3::exceptions::PyException);
-create_exception!(_pyuppsala, XPathError, pyo3::exceptions::PyException);
+create_exception!(pyuppsala, XmlNamespaceError, pyo3::exceptions::PyException);
+create_exception!(pyuppsala, XPathError, pyo3::exceptions::PyException);
 create_exception!(
-    _pyuppsala,
+    pyuppsala,
     XsdValidationError,
     pyo3::exceptions::PyException
 );
