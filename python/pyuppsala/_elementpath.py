@@ -55,15 +55,17 @@ def _prepare_descendant(next, token):
         raise SyntaxError("invalid descendant")
 
     if _EP._is_wildcard_tag(tag):
-        # Namespaced wildcards ({*}*, {ns}* ...) are already element-filtered by
-        # the stdlib's _prepare_tag, so reuse it directly.
+        # Namespaced wildcards ({*}*, {ns}* ...) reuse the stdlib's _prepare_tag
+        # for namespace matching. Filter to elements here as well so comments/PIs
+        # never reach the predicate steps, keeping the element-only contract
+        # independent of stdlib internals.
         select_tag = _EP._prepare_tag(tag)
 
         def select(context, result):
             def select_child(result):
                 for elem in result:
                     for e in elem.iter():
-                        if e is not elem:
+                        if e is not elem and _is_element(e):
                             yield e
 
             return select_tag(context, select_child(result))

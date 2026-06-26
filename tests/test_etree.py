@@ -144,7 +144,21 @@ class TestSearchDifferential:
 
     @pytest.mark.parametrize(
         "path",
-        ["*", ".//*", "*[1]", "*[2]", "*[last()]", "a[@k='2']", ".//a", "b/a"],
+        [
+            "*",
+            ".//*",
+            "*[1]",
+            "*[2]",
+            "*[last()]",
+            "a[@k='2']",
+            ".//a",
+            "b/a",
+            # Namespaced descendant wildcards go through the _is_wildcard_tag
+            # branch and must also exclude comments/PIs.
+            ".//{*}*",
+            ".//{*}*[1]",
+            ".//{*}a",
+        ],
     )
     def test_wildcards_with_comments(self, path):
         # Comments/PIs are children in our tree (like lxml) but must be excluded
