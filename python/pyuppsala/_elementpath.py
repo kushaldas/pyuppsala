@@ -108,7 +108,13 @@ def iterfind(elem, path, namespaces=None):
 
     cache_key = (path,)
     if namespaces:
-        cache_key += tuple(sorted(namespaces.items()))
+        # ``namespaces`` may mix a ``None`` key (the default namespace, as in
+        # ``element.nsmap``) with string prefixes, which are not orderable
+        # together. Sort with a key that places ``None`` first so building the
+        # cache key never raises ``TypeError``.
+        cache_key += tuple(
+            sorted(namespaces.items(), key=lambda kv: (kv[0] is not None, kv[0] or ""))
+        )
 
     try:
         selector = _cache[cache_key]

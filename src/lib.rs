@@ -662,10 +662,12 @@ impl Node {
         }))
     }
 
-    /// In-scope namespace declarations on this element as (prefix, uri) pairs.
+    /// The namespace declarations on this element as (prefix, uri) pairs.
     ///
-    /// The prefix is None for the default namespace (`xmlns="..."`). Returns an
-    /// empty list for non-element nodes.
+    /// Only the `xmlns`/`xmlns:*` declarations attached to this element itself
+    /// are returned, not declarations inherited from ancestors. The prefix is
+    /// None for the default namespace (`xmlns="..."`). Returns an empty list for
+    /// non-element nodes.
     #[getter]
     fn namespace_declarations(&self) -> PyResult<Vec<(Option<String>, String)>> {
         let guard = self

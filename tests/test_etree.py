@@ -828,6 +828,28 @@ class TestStandalone:
             "#" if not isinstance(e.tag, str) else e.tag for e in root.iter()
         ] == ["r", "a", "#", "b"]
 
+    def test_find_with_nsmap_default_namespace(self):
+        # nsmap has a None key for the default namespace; find/findall must not
+        # raise TypeError while building the selector cache key.
+        root = P.fromstring(
+            '<r xmlns="urn:d" xmlns:a="urn:a"><a:x/><y/></r>'
+        )
+        ns = root.nsmap
+        assert None in ns and "a" in ns
+        assert root.find(".//{urn:a}x") is not None
+        assert [e.tag for e in root.findall("a:x", ns)] == ["{urn:a}x"]
+
+    def test_generated_prefix_does_not_collide(self):
+        # A parsed document already using ns0 must keep that binding; a generated
+        # prefix for a new namespace must not reuse (and redeclare) ns0.
+        src = P.fromstring('<r xmlns:ns0="urn:existing"><ns0:keep/></r>')
+        P.SubElement(src, "{urn:new}item")
+        out = P.tostring(src, encoding="unicode")
+        assert 'xmlns:ns0="urn:existing"' in out  # original binding intact
+        assert "urn:new" in out
+        # The new namespace uses a different prefix, not ns0.
+        assert 'ns0="urn:new"' not in out
+
     def test_xpath_text_selection_returns_strings(self):
         # A text()/CDATA node-set yields plain strings (like lxml smart-strings),
         # not _Element node proxies.

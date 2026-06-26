@@ -339,11 +339,27 @@ class _DocHolder:
             el._node = node
         return el
 
-    def new_prefix(self):
-        """Generate a fresh, unused ``ns<N>`` namespace prefix for serialization."""
-        pfx = "ns%d" % self._ns_counter
-        self._ns_counter += 1
-        return pfx
+    def new_prefix(self, node):
+        """Generate a fresh ``ns<N>`` prefix not already in scope on ``node``.
+
+        Skips any ``ns<N>`` already declared on ``node`` or an ancestor so a
+        generated prefix never shadows or redeclares an existing binding. A
+        parsed document may itself use ``ns0``, ``ns1`` ... for its own
+        namespaces, and reusing one of those would silently change the URI those
+        QNames resolve to.
+        """
+        in_scope = set()
+        n = node
+        while n is not None and n.kind == "element":
+            for pfx, _uri in n.namespace_declarations:
+                if pfx is not None:
+                    in_scope.add(pfx)
+            n = n.parent
+        while True:
+            pfx = "ns%d" % self._ns_counter
+            self._ns_counter += 1
+            if pfx not in in_scope:
+                return pfx
 
 
 def _text_run_from(node):
@@ -524,7 +540,7 @@ def _finalize_element_ns(holder, node):
     # Not in scope anywhere: declare it on this element.
     prefix = q.prefix or _namespace_map.get(ns)
     if prefix is None:
-        prefix = holder.new_prefix()
+        prefix = holder.new_prefix(node)
     if q.prefix != prefix:
         node.set_qname(q.local_name, ns, prefix)
     holder.doc.set_namespace_declaration(node, prefix, ns)
@@ -735,7 +751,7 @@ class _Element:
             n = n.parent
         pfx = _namespace_map.get(ns)
         if pfx is None:
-            pfx = self._holder.new_prefix()
+            pfx = self._holder.new_prefix(self._node)
         self._holder.doc.set_namespace_declaration(self._node, pfx, ns)
         return pfx
 
