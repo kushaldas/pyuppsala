@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use std::sync::{Arc, Mutex};
 use uppsala::dom::{Attribute as UAttribute, NodeId, NodeKind, QName as UQName, XmlWriteOptions};
 use uppsala::parser::Parser as UParser;
-use uppsala::parser::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_EXPANSION};
+use uppsala::parser::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_DEPTH, DEFAULT_MAX_ENTITY_EXPANSION};
 use uppsala::writer::XmlWriter as UXmlWriter;
 use uppsala::xpath::{XPathEvaluator as UXPathEvaluator, XPathValue as UXPathValue};
 use uppsala::xsd::XsdValidator as UXsdValidator;
@@ -916,7 +916,11 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let opts = make_write_options(indent, expand_empty_elements);
+        // Node-level (fragment) serialization never emits a DOCTYPE, so
+        // `include_doctype` is fixed to false here. DOCTYPE round-tripping is
+        // only meaningful for whole-document serialization (see
+        // `Document.to_xml_with_options`).
+        let opts = make_write_options(indent, expand_empty_elements, false);
         Ok(guard.doc.node_to_xml_with_options(self.id, &opts))
     }
 
@@ -1243,6 +1247,22 @@ impl Document {
         Ok(guard.input.clone())
     }
 
+    /// The raw ``<!DOCTYPE ...>`` declaration preserved from the source, or None.
+    ///
+    /// Uppsala preserves the document type declaration verbatim (including the
+    /// ``<!DOCTYPE`` and trailing ``>``) for round-trip fidelity, but does not
+    /// process it. Returns None for documents without a DOCTYPE or for
+    /// programmatically constructed documents. Use
+    /// ``to_xml_with_options(include_doctype=True)`` to serialize it back out.
+    #[getter]
+    fn doctype(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.doctype.as_ref().map(|dt| dt.to_string()))
+    }
+
     /// Find all elements with the given local tag name.
     fn get_elements_by_tag_name(&self, name: &str) -> PyResult<Vec<Node>> {
         let guard = self
@@ -1489,17 +1509,22 @@ impl Document {
     /// Args:
     ///     indent: Indentation string (e.g. "  " for 2-space indent), or None for compact.
     ///     expand_empty_elements: If True, write <foo></foo> instead of <foo/>.
-    #[pyo3(signature = (indent=None, expand_empty_elements=false))]
+    ///     include_doctype: If True, serialize the preserved ``<!DOCTYPE ...>``
+    ///         declaration (if the document had one) ahead of the root element.
+    ///         Defaults to False so a parsed DTD is not re-emitted unless the
+    ///         caller deliberately opts into round-tripping it.
+    #[pyo3(signature = (indent=None, expand_empty_elements=false, include_doctype=false))]
     fn to_xml_with_options(
         &self,
         indent: Option<&str>,
         expand_empty_elements: bool,
+        include_doctype: bool,
     ) -> PyResult<String> {
         let guard = self
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let opts = make_write_options(indent, expand_empty_elements);
+        let opts = make_write_options(indent, expand_empty_elements, include_doctype);
         Ok(guard.doc.to_xml_with_options(&opts))
     }
 
@@ -1579,15 +1604,24 @@ impl XPathEvaluator {
     /// ``max_depth`` overrides the default expression-tree depth cap
     /// (default 32) used to bound recursive parsing of XPath expressions.
     ///
+    /// ``max_node_visits`` overrides the default per-evaluation node-visit
+    /// budget (default ``DEFAULT_MAX_XPATH_NODE_VISITS``, 100_000) that bounds
+    /// how many nodes a single expression may traverse, guarding against
+    /// algorithmic-complexity denial-of-service on adversarial documents.
+    ///
     /// .. warning::
-    ///    Do not source ``max_depth`` from untrusted input - an attacker
-    ///    who controls the cap can re-enable XPath stack-overflow attacks.
+    ///    Do not source ``max_depth`` or ``max_node_visits`` from untrusted
+    ///    input - an attacker who controls these caps can re-enable XPath
+    ///    stack-overflow or node-traversal denial-of-service attacks.
     #[new]
-    #[pyo3(signature = (*, max_depth=None))]
-    fn new(max_depth: Option<u32>) -> Self {
+    #[pyo3(signature = (*, max_depth=None, max_node_visits=None))]
+    fn new(max_depth: Option<u32>, max_node_visits: Option<usize>) -> Self {
         let mut inner = UXPathEvaluator::new();
         if let Some(d) = max_depth {
             inner = inner.with_max_depth(d);
+        }
+        if let Some(v) = max_node_visits {
+            inner = inner.with_max_node_visits(v);
         }
         XPathEvaluator { inner }
     }
@@ -2141,13 +2175,23 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
     })
 }
 
-fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlWriteOptions {
+fn make_write_options(
+    indent: Option<&str>,
+    expand_empty_elements: bool,
+    include_doctype: bool,
+) -> XmlWriteOptions {
     let mut opts = match indent {
         Some(s) => XmlWriteOptions::pretty(s),
         None => XmlWriteOptions::compact(),
     };
     if expand_empty_elements {
         opts = opts.with_expand_empty_elements(true);
+    }
+    if include_doctype {
+        // Opt-in serialization of the preserved `<!DOCTYPE ...>` declaration.
+        // Disabled by default so a parsed DTD is not handed to downstream
+        // processors unless the caller deliberately opts into round-tripping.
+        opts = opts.with_doctype(true);
     }
     opts
 }
@@ -2181,12 +2225,19 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(parse_bytes, m)?)?;
 
-    // Default resource-limit constants (uppsala 0.4.0 hardening)
+    // Default resource-limit constants (uppsala 0.4.0 / 0.5.0 hardening)
     m.add("DEFAULT_MAX_DEPTH", DEFAULT_MAX_DEPTH)?;
     m.add("DEFAULT_MAX_ENTITY_EXPANSION", DEFAULT_MAX_ENTITY_EXPANSION)?;
+    // Entity-nesting cap added in uppsala 0.5.0 (enforced internally; no builder).
+    m.add("DEFAULT_MAX_ENTITY_DEPTH", DEFAULT_MAX_ENTITY_DEPTH)?;
     m.add(
         "DEFAULT_MAX_XPATH_DEPTH",
         uppsala::xpath::DEFAULT_MAX_XPATH_DEPTH,
+    )?;
+    // Per-evaluation XPath node-visit budget added in uppsala 0.5.0.
+    m.add(
+        "DEFAULT_MAX_XPATH_NODE_VISITS",
+        uppsala::xpath::DEFAULT_MAX_XPATH_NODE_VISITS,
     )?;
     m.add(
         "DEFAULT_MAX_REGEX_GROUP_DEPTH",
