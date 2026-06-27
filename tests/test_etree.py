@@ -807,6 +807,41 @@ class TestStandalone:
             == "<dst><item/><![CDATA[tail]]></dst>"
         )
 
+    def test_cross_tree_move_keeps_inherited_prefix(self):
+        # A prefix declared on an ancestor outside the moved subtree must stay
+        # declared after the move, so prefixed names serialize correctly.
+        src = P.fromstring(
+            '<root xmlns:a="urn:a"><keep><moveme><a:inner/></moveme></keep></root>'
+        )
+        dst = P.Element("dst")
+        dst.append(src.find(".//moveme"))
+        out = P.tostring(dst, encoding="unicode")
+        # Re-parse: a:inner must still resolve to urn:a.
+        moved = P.fromstring(out)[0]
+        assert moved.tag == "moveme"
+        assert moved[0].tag == "{urn:a}inner"
+
+    def test_cross_tree_move_keeps_inherited_default_ns(self):
+        # A default namespace inherited from an ancestor must survive the move
+        # so the whole subtree stays in that namespace.
+        src = P.fromstring(
+            '<root xmlns="urn:d"><keep><moveme><inner/></moveme></keep></root>'
+        )
+        dst = P.Element("dst")
+        dst.append(src.find(".//{urn:d}moveme"))
+        moved = P.fromstring(P.tostring(dst, encoding="unicode"))[0]
+        assert moved.tag == "{urn:d}moveme"
+        assert moved[0].tag == "{urn:d}inner"
+
+    def test_tag_setter_reuses_inherited_default_ns(self):
+        # Renaming into a namespace declared as the default on an ancestor must
+        # reuse that default rather than forcing a generated prefix.
+        root = P.fromstring('<root xmlns="urn:d"><child/></root>')
+        root[0].tag = "{urn:d}renamed"
+        assert P.tostring(root, encoding="unicode") == (
+            '<root xmlns="urn:d"><renamed/></root>'
+        )
+
     def test_index_non_element_raises_valueerror(self):
         root = P.fromstring("<r><a/></r>")
         with pytest.raises(ValueError):

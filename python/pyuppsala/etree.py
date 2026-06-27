@@ -453,6 +453,29 @@ def _clone_node(dst, snode):
     return dn
 
 
+def _copy_inherited_ns(dst, snode, dnode):
+    """Declare on ``dnode`` the namespaces ``snode`` inherits from its ancestors.
+
+    ``_clone_node`` copies only each element's own ``xmlns`` declarations, so a
+    subtree that relied on a prefix (or default namespace) declared on an
+    ancestor *outside* the moved subtree would lose that binding after a
+    cross-tree move and serialize incorrectly. Walk ``snode``'s ancestors and
+    redeclare every in-scope binding it does not already declare itself onto the
+    cloned root ``dnode``, so all prefixes the subtree uses stay in scope. A
+    descendant that is genuinely in no namespace carries its own ``xmlns=""``
+    reset (preserved by ``_clone_node``), so this never recaptures it.
+    """
+    own = {pfx for pfx, _uri in snode.namespace_declarations}
+    seen = set(own)
+    n = snode.parent
+    while n is not None and n.kind == "element":
+        for pfx, uri in n.namespace_declarations:
+            if pfx not in seen:
+                seen.add(pfx)
+                dst.doc.set_namespace_declaration(dnode, pfx, uri)
+        n = n.parent
+
+
 def _repoint_subtree(src_holder, dst, snode, dnode):
     """Move any live proxies from the source subtree onto the cloned subtree.
 
@@ -647,12 +670,10 @@ class _Element:
         prefix = _prefix_for_ns(ns, self.nsmap) if ns else None
         self._node.set_qname(local, ns, prefix)
         if ns:
-            # Make sure the (possibly new) namespace has a usable, declared prefix.
-            if prefix is None:
-                prefix = self._ensure_ns_prefix(ns)
-                self._node.set_qname(local, ns, prefix)
-            else:
-                self._holder.doc.set_namespace_declaration(self._node, prefix, ns)
+            # Reuse an in-scope binding for ``ns`` when one exists - including an
+            # inherited default namespace - and only declare or generate a prefix
+            # when none is in scope, rather than always forcing a prefix.
+            _finalize_element_ns(self._holder, self._node)
 
     # -- text / tail ------------------------------------------------------
     # ElementTree's .text/.tail are virtual views over real sibling text nodes
@@ -919,6 +940,9 @@ class _Element:
         snode = src_el._node
         stail = _following_text_run(snode)
         new_node = _clone_node(dst, snode)
+        # Carry over namespaces inherited from ancestors outside the moved
+        # subtree so prefixed/defaulted names stay declared in the destination.
+        _copy_inherited_ns(dst, snode, new_node)
         new_tail = [_clone_node(dst, text_node) for text_node in stail]
         _repoint_subtree(sh, dst, snode, new_node)
         if snode.parent is not None:
