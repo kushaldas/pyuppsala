@@ -34,6 +34,7 @@ __all__ = [
     "PI",
     "QName",
     "ElementTree",
+    "DocInfo",
     # I/O
     "fromstring",
     "fromstringlist",
@@ -1314,6 +1315,32 @@ def iselement(element):
 # ---------------------------------------------------------------------------
 
 
+class DocInfo:
+    """Document-level metadata for a tree (lxml's ``DocInfo``).
+
+    Currently exposes the preserved ``<!DOCTYPE ...>`` declaration. Uppsala
+    keeps the DOCTYPE verbatim for round-trip fidelity but does not process it,
+    so the richer lxml fields derived from a parsed DTD (``public_id``,
+    ``system_url``, ``internalDTD``, ...) are not available.
+    """
+
+    __slots__ = ("_holder",)
+
+    def __init__(self, holder):
+        """Wrap the ``_DocHolder`` whose native document carries the metadata."""
+        self._holder = holder
+
+    @property
+    def doctype(self):
+        """The raw ``<!DOCTYPE ...>`` string, or ``""`` when the document has none.
+
+        Matches lxml, which returns an empty string (not ``None``) for a
+        document without a document type declaration.
+        """
+        dt = self._holder.doc.doctype
+        return dt if dt is not None else ""
+
+
 class _ElementTree:
     """A document wrapper (lxml's ``_ElementTree``) holding a root element."""
 
@@ -1332,6 +1359,11 @@ class _ElementTree:
         """Return the root element, or None for an empty document."""
         root = self._root
         return self._holder.proxy(root) if root is not None else None
+
+    @property
+    def docinfo(self):
+        """Return a :class:`DocInfo` exposing this tree's document metadata."""
+        return DocInfo(self._holder)
 
     def _require_root(self):
         root = self.getroot()
@@ -1711,6 +1743,7 @@ def tostring(
     method="xml",
     xml_declaration=None,
     pretty_print=False,
+    doctype=None,
     **kwargs,
 ):
     """Serialize an element or tree to XML.
@@ -1718,6 +1751,12 @@ def tostring(
     Returns ``str`` when ``encoding="unicode"``, otherwise ``bytes`` (default
     encoding is ASCII with no XML declaration, like lxml). ``pretty_print=True``
     indents the output.
+
+    ``doctype`` lets the caller inject a custom ``<!DOCTYPE ...>`` string ahead
+    of the root element (matching lxml). When serializing a whole
+    :class:`_ElementTree` and no explicit ``doctype`` is given, the DOCTYPE
+    preserved on the parsed document is emitted automatically; serializing a
+    bare element never emits one, also matching lxml.
 
     Only ``method="xml"`` is supported; other lxml serialization methods
     (``"html"``, ``"text"``, ``"c14n"``) change the output semantics and raise
@@ -1734,11 +1773,21 @@ def tostring(
             "tostring(method=%r) is not supported; only 'xml' is available" % method
         )
     if isinstance(element_or_tree, _ElementTree):
-        element = element_or_tree.getroot()
+        tree = element_or_tree
+        element = tree.getroot()
     else:
+        tree = None
         element = element_or_tree
     if element is None:
         raise AssertionError("ElementTree not initialized, missing root")
+
+    # Resolve the DOCTYPE to emit. An explicit ``doctype`` argument always wins;
+    # otherwise a serialized *tree* round-trips the DOCTYPE preserved on its
+    # document. A bare element never carries a DOCTYPE, matching lxml.
+    doctype_str = doctype
+    if doctype_str is None and tree is not None:
+        doctype_str = tree.docinfo.doctype or None
+
     node = element._node
     if pretty_print:
         text = node.to_xml_with_options("  ", False)
@@ -1746,6 +1795,11 @@ def tostring(
             text += "\n"
     else:
         text = node.to_xml()
+
+    # The DOCTYPE sits between the optional XML declaration and the root, so
+    # prepend it before the declaration logic below (which prepends in turn).
+    if doctype_str:
+        text = doctype_str + "\n" + text
 
     if encoding is not None and str(encoding).lower() == "unicode":
         if xml_declaration:

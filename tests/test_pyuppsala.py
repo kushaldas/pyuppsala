@@ -1626,6 +1626,30 @@ class TestSecurityLimits:
         assert pyuppsala.DEFAULT_MAX_REGEX_GROUP_DEPTH > 0
         assert isinstance(pyuppsala.DEFAULT_MAX_REGEX_STEPS, int)
         assert pyuppsala.DEFAULT_MAX_REGEX_STEPS > 0
+        # Constants introduced in uppsala 0.5.0.
+        assert isinstance(pyuppsala.DEFAULT_MAX_ENTITY_DEPTH, int)
+        assert pyuppsala.DEFAULT_MAX_ENTITY_DEPTH > 0
+        assert isinstance(pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS, int)
+        assert pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS > 0
+
+    def test_xpath_node_visit_budget_caps_traversal(self):
+        # A tiny per-evaluation node-visit budget should abort a traversal that
+        # would otherwise visit many nodes, raising XPathError (anti-DoS knob
+        # added in uppsala 0.5.0).
+        big = "<r>" + "".join(f"<a>{i}</a>" for i in range(50)) + "</r>"
+        doc = parse(big)
+        ev = XPathEvaluator(max_node_visits=5)
+        with pytest.raises(XPathError):
+            ev.select(doc, "//a")
+
+    def test_xpath_node_visit_default_allows_normal_traversal(self):
+        # Without a tightened budget the same traversal succeeds.
+        big = "<r>" + "".join(f"<a>{i}</a>" for i in range(50)) + "</r>"
+        doc = parse(big)
+        ev = XPathEvaluator()
+        result = ev.select(doc, "//a")
+        assert isinstance(result, list)
+        assert len(result) == 50
 
     def test_comment_round_trip_injection_blocked(self):
         doc = Document.empty()
@@ -1734,3 +1758,40 @@ class TestSecurityLimits:
         tag2 = doc2.document_element.tag
         assert tag2.namespace_uri == "urn:ex"
         assert tag2.local_name == "item"
+
+
+class TestDoctype:
+    """DOCTYPE preservation and serialization (uppsala 0.5.0)."""
+
+    def test_doctype_system_preserved(self):
+        doc = parse('<!DOCTYPE root SYSTEM "r.dtd"><root/>')
+        assert doc.doctype == '<!DOCTYPE root SYSTEM "r.dtd">'
+
+    def test_doctype_minimal_preserved(self):
+        doc = parse("<!DOCTYPE html><root/>")
+        assert doc.doctype == "<!DOCTYPE html>"
+
+    def test_doctype_public_preserved(self):
+        doc = parse('<!DOCTYPE root PUBLIC "-//id" "r.dtd"><root/>')
+        assert doc.doctype == '<!DOCTYPE root PUBLIC "-//id" "r.dtd">'
+
+    def test_doctype_absent_is_none(self):
+        assert parse("<root/>").doctype is None
+
+    def test_doctype_absent_for_constructed_document(self):
+        assert Document.empty().doctype is None
+
+    def test_to_xml_omits_doctype_by_default(self):
+        doc = parse('<!DOCTYPE root SYSTEM "r.dtd"><root/>')
+        # Default serialization does not re-emit the DTD.
+        assert doc.to_xml() == "<root/>"
+        assert doc.to_xml_with_options() == "<root/>"
+
+    def test_to_xml_with_options_includes_doctype(self):
+        doc = parse('<!DOCTYPE root SYSTEM "r.dtd"><root/>')
+        out = doc.to_xml_with_options(include_doctype=True)
+        assert out == '<!DOCTYPE root SYSTEM "r.dtd"><root/>'
+
+    def test_include_doctype_noop_without_doctype(self):
+        doc = parse("<root/>")
+        assert doc.to_xml_with_options(include_doctype=True) == "<root/>"

@@ -20,10 +20,25 @@ defaults when you need to.
 
    Default maximum total bytes from entity expansion (currently 1 MiB).
 
+.. data:: DEFAULT_MAX_ENTITY_DEPTH
+   :type: int
+
+   Default maximum entity-reference nesting depth (currently 256). Enforced
+   internally by the parser to bound recursive entity expansion; there is no
+   keyword to override it.
+
 .. data:: DEFAULT_MAX_XPATH_DEPTH
    :type: int
 
    Default maximum XPath expression-tree depth (currently 32).
+
+.. data:: DEFAULT_MAX_XPATH_NODE_VISITS
+   :type: int
+
+   Default maximum number of nodes a single XPath evaluation may visit
+   (currently 100,000). Bounds algorithmic-complexity denial-of-service on
+   adversarial documents; override per-evaluator with the ``max_node_visits``
+   argument to :class:`XPathEvaluator`.
 
 .. data:: DEFAULT_MAX_REGEX_GROUP_DEPTH
    :type: int
@@ -39,8 +54,9 @@ defaults when you need to.
 
 .. warning::
    Do not source the ``max_depth`` / ``max_entity_expansion`` /
-   ``max_steps`` keyword arguments from untrusted input. An attacker who
-   controls a cap can re-enable the DoS class it was designed to block.
+   ``max_node_visits`` / ``max_steps`` keyword arguments from untrusted input.
+   An attacker who controls a cap can re-enable the DoS class it was designed
+   to block.
    These arguments are intended for application authors who have a
    legitimate reason to relax (or tighten) the safe defaults.
 
@@ -157,6 +173,24 @@ Document
 
          empty = Document.empty()
          assert empty.input_text == ""
+
+   .. attribute:: doctype
+      :type: str | None
+
+      The raw ``<!DOCTYPE ...>`` declaration preserved from the source
+      (including the ``<!DOCTYPE`` and trailing ``>``), or ``None`` when the
+      document has no DOCTYPE or was constructed programmatically. The
+      declaration is preserved verbatim for round-trip fidelity but is not
+      otherwise processed.
+
+      .. code-block:: python
+
+         doc = Document('<!DOCTYPE root SYSTEM "r.dtd"><root/>')
+         assert doc.doctype == '<!DOCTYPE root SYSTEM "r.dtd">'
+         assert Document("<root/>").doctype is None
+
+      Use :meth:`to_xml_with_options` with ``include_doctype=True`` to serialize
+      it back out.
 
    .. method:: get_elements_by_tag_name(name: str) -> list[Node]
 
@@ -332,14 +366,22 @@ Document
          doc = Document("<root>  <child/>  </root>")
          print(doc.to_xml())  # "<root>  <child/>  </root>"
 
-   .. method:: to_xml_with_options(indent=None, expand_empty_elements=False) -> str
+   .. method:: to_xml_with_options(indent=None, expand_empty_elements=False, include_doctype=False) -> str
 
       Serialize with formatting options.
 
       :param indent: Indentation string (e.g. ``"  "``), or ``None`` for compact output.
       :param expand_empty_elements: If ``True``, write ``<foo></foo>`` instead of ``<foo/>``.
+      :param include_doctype: If ``True`` and the document preserved a
+          ``<!DOCTYPE ...>`` declaration (see :attr:`doctype`), serialize it
+          ahead of the root element. Defaults to ``False`` so a parsed DTD is
+          not re-emitted unless the caller deliberately opts in.
 
       .. code-block:: python
+
+         doc = Document('<!DOCTYPE root><root/>')
+         assert doc.to_xml() == "<root/>"  # DOCTYPE dropped by default
+         assert doc.to_xml_with_options(include_doctype=True) == "<!DOCTYPE root><root/>"
 
          doc = Document("<root><a/><b>text</b></root>")
 
@@ -822,12 +864,16 @@ Attribute
 XPathEvaluator
 --------------
 
-.. class:: XPathEvaluator(*, max_depth=None)
+.. class:: XPathEvaluator(*, max_depth=None, max_node_visits=None)
 
    XPath 1.0 expression evaluator.
 
    :param max_depth: Maximum XPath expression-tree depth.
        Defaults to :data:`DEFAULT_MAX_XPATH_DEPTH`.
+   :param max_node_visits: Maximum number of nodes a single evaluation may
+       visit before raising :class:`XPathError`. Defaults to
+       :data:`DEFAULT_MAX_XPATH_NODE_VISITS`. Lower it to tighten the
+       anti-denial-of-service budget on adversarial documents.
 
    .. code-block:: python
 

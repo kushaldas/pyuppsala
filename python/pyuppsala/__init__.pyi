@@ -295,6 +295,15 @@ class Document:
         Returns an empty string for programmatically constructed documents.
         """
         ...
+    @property
+    def doctype(self) -> Optional[str]:
+        """The raw ``<!DOCTYPE ...>`` declaration preserved from the source, or None.
+
+        Returns None for documents without a DOCTYPE or for programmatically
+        constructed documents. Use ``to_xml_with_options(include_doctype=True)``
+        to serialize it back out.
+        """
+        ...
     def get_elements_by_tag_name(self, name: str) -> list[Node]:
         """Find all elements with the given local tag name."""
         ...
@@ -365,8 +374,13 @@ class Document:
         self,
         indent: Optional[str] = None,
         expand_empty_elements: bool = False,
+        include_doctype: bool = False,
     ) -> str:
-        """Serialize the document to an XML string with formatting options."""
+        """Serialize the document to an XML string with formatting options.
+
+        If ``include_doctype`` is True and the document preserved a
+        ``<!DOCTYPE ...>`` declaration, it is serialized ahead of the root.
+        """
         ...
     def write_to_file(self, path: str) -> None:
         """Write the document to a file."""
@@ -384,11 +398,17 @@ class Document:
 class XPathEvaluator:
     """XPath 1.0 expression evaluator."""
 
-    def __init__(self, *, max_depth: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_depth: Optional[int] = None,
+        max_node_visits: Optional[int] = None,
+    ) -> None:
         """Create a new XPath evaluator.
 
         ``max_depth`` overrides the expression-tree depth cap
-        (see ``DEFAULT_MAX_XPATH_DEPTH``).
+        (see ``DEFAULT_MAX_XPATH_DEPTH``). ``max_node_visits`` overrides the
+        per-evaluation node-visit budget (see ``DEFAULT_MAX_XPATH_NODE_VISITS``).
         """
         ...
     def add_namespace(self, prefix: str, uri: str) -> None:
@@ -573,8 +593,14 @@ DEFAULT_MAX_DEPTH: int
 DEFAULT_MAX_ENTITY_EXPANSION: int
 """Default maximum total bytes from entity expansion (from uppsala's parser::DEFAULT_MAX_ENTITY_EXPANSION)."""
 
+DEFAULT_MAX_ENTITY_DEPTH: int
+"""Default maximum entity-reference nesting depth (from uppsala's parser::DEFAULT_MAX_ENTITY_DEPTH)."""
+
 DEFAULT_MAX_XPATH_DEPTH: int
 """Default maximum XPath expression-tree depth (from uppsala's xpath::DEFAULT_MAX_XPATH_DEPTH)."""
+
+DEFAULT_MAX_XPATH_NODE_VISITS: int
+"""Default maximum nodes visited per XPath evaluation (from uppsala's xpath::DEFAULT_MAX_XPATH_NODE_VISITS)."""
 
 DEFAULT_MAX_REGEX_GROUP_DEPTH: int
 """Default maximum XSD regex group-nesting depth (from uppsala's xsd_regex::DEFAULT_MAX_REGEX_GROUP_DEPTH)."""

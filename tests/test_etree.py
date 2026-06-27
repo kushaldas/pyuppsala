@@ -939,3 +939,60 @@ class TestStandalone:
         # Same for a removed PI splitting a tail run.
         root = P.fromstring("<a><b/>x<?pi y?>z</a>", P.XMLParser(remove_pis=True))
         assert root[0].tail == "xz"
+
+
+DOCTYPE_DOC = '<!DOCTYPE root SYSTEM "r.dtd"><root><a/></root>'
+
+
+@requires_lxml
+class TestDoctypeDifferential:
+    """DOCTYPE round-trip and docinfo vs lxml (uppsala 0.5.0)."""
+
+    def test_docinfo_doctype_matches_lxml(self):
+        pt = P.ElementTree(P.fromstring(DOCTYPE_DOC))
+        lt = L.ElementTree(L.fromstring(DOCTYPE_DOC))
+        assert pt.docinfo.doctype == lt.docinfo.doctype
+
+    def test_docinfo_doctype_empty_when_absent(self):
+        pt = P.ElementTree(P.fromstring("<root/>"))
+        lt = L.ElementTree(L.fromstring("<root/>"))
+        # lxml returns "" (not None) for a document without a DOCTYPE.
+        assert pt.docinfo.doctype == lt.docinfo.doctype == ""
+
+    def test_tostring_tree_includes_doctype(self):
+        pt = P.ElementTree(P.fromstring(DOCTYPE_DOC))
+        lt = L.ElementTree(L.fromstring(DOCTYPE_DOC))
+        assert P.tostring(pt, encoding="unicode") == L.tostring(lt, encoding="unicode")
+
+    def test_tostring_element_omits_doctype(self):
+        pr = P.fromstring(DOCTYPE_DOC)
+        lr = L.fromstring(DOCTYPE_DOC)
+        # Serializing a bare element never emits the DOCTYPE in lxml.
+        assert P.tostring(pr, encoding="unicode") == L.tostring(lr, encoding="unicode")
+
+    def test_tostring_explicit_doctype_kwarg(self):
+        pr = P.fromstring("<root><a/></root>")
+        lr = L.fromstring("<root><a/></root>")
+        assert P.tostring(pr, encoding="unicode", doctype="<!DOCTYPE x>") == L.tostring(
+            lr, encoding="unicode", doctype="<!DOCTYPE x>"
+        )
+
+
+class TestDoctypeStandalone:
+    """DOCTYPE behavior that does not depend on lxml."""
+
+    def test_docinfo_doctype_value(self):
+        tree = P.ElementTree(P.fromstring(DOCTYPE_DOC))
+        assert tree.docinfo.doctype == '<!DOCTYPE root SYSTEM "r.dtd">'
+
+    def test_tree_round_trips_doctype(self):
+        tree = P.ElementTree(P.fromstring(DOCTYPE_DOC))
+        assert (
+            P.tostring(tree, encoding="unicode")
+            == '<!DOCTYPE root SYSTEM "r.dtd">\n<root><a/></root>'
+        )
+
+    def test_explicit_doctype_overrides_preserved(self):
+        tree = P.ElementTree(P.fromstring(DOCTYPE_DOC))
+        out = P.tostring(tree, encoding="unicode", doctype="<!DOCTYPE other>")
+        assert out == "<!DOCTYPE other>\n<root><a/></root>"

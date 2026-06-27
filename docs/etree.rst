@@ -81,6 +81,12 @@ Supported features
   :class:`XMLSchema` (wrapping :class:`pyuppsala.XsdValidator`).
 - **Cross-tree moves**: appending an element from another tree deep-copies the
   subtree into the target document and preserves Python object identity.
+- **DOCTYPE**: ``tree.docinfo.doctype`` returns the ``<!DOCTYPE ...>``
+  declaration preserved from the source (``""`` when absent). Serializing a
+  whole :class:`_ElementTree` round-trips that DOCTYPE; serializing a bare
+  element omits it. :func:`tostring` also accepts a ``doctype=<str>`` argument
+  to inject a custom declaration, matching lxml. The DOCTYPE is preserved
+  verbatim and not otherwise processed (no DTD validation or entity loading).
 
 Exceptions
 ----------
@@ -155,6 +161,8 @@ API reference
 .. autofunction:: ProcessingInstruction
 .. autofunction:: register_namespace
 .. autoclass:: QName
+   :members:
+.. autoclass:: DocInfo
    :members:
 .. autoclass:: XMLParser
    :members:
