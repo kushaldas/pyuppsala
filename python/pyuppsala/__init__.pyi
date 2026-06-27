@@ -1,4 +1,4 @@
-"""Type stubs for pyuppsala — Python bindings for the Uppsala XML library."""
+"""Type stubs for pyuppsala - Python bindings for the Uppsala XML library."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ class Attribute:
 class Node:
     """A node within an XML document.
 
-    Nodes are lightweight handles — the actual data lives inside the Document.
+    Nodes are lightweight handles - the actual data lives inside the Document.
     Do not use a Node after its parent Document has been garbage collected.
     """
 
@@ -96,6 +96,56 @@ class Node:
         """The child nodes of this node."""
         ...
     @property
+    def node_id(self) -> int:
+        """A stable integer identity for this node within its Document."""
+        ...
+    @property
+    def first_child(self) -> Optional[Node]:
+        """The first child node, or None."""
+        ...
+    @property
+    def last_child(self) -> Optional[Node]:
+        """The last child node, or None."""
+        ...
+    @property
+    def next_sibling(self) -> Optional[Node]:
+        """The next sibling node, or None."""
+        ...
+    @property
+    def previous_sibling(self) -> Optional[Node]:
+        """The previous sibling node, or None."""
+        ...
+    @property
+    def namespace_declarations(self) -> list[tuple[Optional[str], str]]:
+        """In-scope (prefix, uri) namespace declarations; prefix is None for the default."""
+        ...
+    @property
+    def comment_text(self) -> Optional[str]:
+        """The content of a Comment node, or None for other node kinds."""
+        ...
+    @property
+    def pi_target(self) -> Optional[str]:
+        """The target of a ProcessingInstruction node, or None."""
+        ...
+    @property
+    def pi_data(self) -> Optional[str]:
+        """The data of a ProcessingInstruction node, or None."""
+        ...
+    def set_text(self, content: str) -> None:
+        """Set the content of a Text, CDATA, or Comment node in place."""
+        ...
+    def set_pi_data(self, data: Optional[str] = None) -> None:
+        """Set the data of a ProcessingInstruction node."""
+        ...
+    def set_qname(
+        self,
+        local_name: str,
+        namespace_uri: Optional[str] = None,
+        prefix: Optional[str] = None,
+    ) -> None:
+        """Rename an element node's qualified name in place."""
+        ...
+    @property
     def line(self) -> int:
         """The line number of this node in the source document."""
         ...
@@ -131,8 +181,16 @@ class Node:
     ) -> Optional[str]:
         """Set an attribute value. Returns the previous value if any."""
         ...
-    def remove_attribute(self, name: str) -> Optional[str]:
-        """Remove an attribute by local name. Returns the old value if any."""
+    def remove_attribute(
+        self, name: str, namespace_uri: Optional[str] = None
+    ) -> Optional[str]:
+        """Remove an attribute. Returns the old value if any.
+
+        ``namespace_uri=None`` removes the attribute with no namespace and the
+        given local name; a namespace URI removes the attribute in exactly that
+        namespace. An attribute in a different namespace that shares the local
+        name is left untouched.
+        """
         ...
     def to_xml(self) -> str:
         """Serialize this node and its subtree to XML."""
@@ -199,7 +257,7 @@ class Document:
         (see ``DEFAULT_MAX_DEPTH``, ``DEFAULT_MAX_ENTITY_EXPANSION``).
 
         Warning:
-            Do not source these values from untrusted input — an attacker
+            Do not source these values from untrusted input - an attacker
             who controls the cap can re-enable the corresponding DoS class.
         """
         ...
@@ -270,6 +328,14 @@ class Document:
         ...
     def append_child(self, parent: Node, child: Node) -> None:
         """Append a child node to a parent node."""
+        ...
+    def set_namespace_declaration(
+        self, node: Node, prefix: Optional[str], uri: str
+    ) -> None:
+        """Add or replace an ``xmlns`` declaration on an element node.
+
+        ``prefix=None`` sets the default namespace (``xmlns="uri"``).
+        """
         ...
     def insert_before(self, parent: Node, new_child: Node, reference: Node) -> None:
         """Insert a child node before a reference node."""
@@ -502,16 +568,16 @@ def parse_bytes(
 # Default resource-limit constants (uppsala 0.4.0 hardening)
 
 DEFAULT_MAX_DEPTH: int
-"""Default maximum element nesting depth (128)."""
+"""Default maximum element nesting depth (from uppsala's parser::DEFAULT_MAX_DEPTH)."""
 
 DEFAULT_MAX_ENTITY_EXPANSION: int
-"""Default maximum total bytes from entity expansion (1 MiB)."""
+"""Default maximum total bytes from entity expansion (from uppsala's parser::DEFAULT_MAX_ENTITY_EXPANSION)."""
 
 DEFAULT_MAX_XPATH_DEPTH: int
-"""Default maximum XPath expression-tree depth (32)."""
+"""Default maximum XPath expression-tree depth (from uppsala's xpath::DEFAULT_MAX_XPATH_DEPTH)."""
 
 DEFAULT_MAX_REGEX_GROUP_DEPTH: int
-"""Default maximum XSD regex group-nesting depth (64)."""
+"""Default maximum XSD regex group-nesting depth (from uppsala's xsd_regex::DEFAULT_MAX_REGEX_GROUP_DEPTH)."""
 
 DEFAULT_MAX_REGEX_STEPS: int
-"""Default maximum backtracking steps when matching an XSD regex (1,000,000)."""
+"""Default maximum backtracking steps when matching an XSD regex (from uppsala's xsd_regex::DEFAULT_MAX_REGEX_STEPS)."""

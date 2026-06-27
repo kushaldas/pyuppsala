@@ -7,7 +7,7 @@ license = "BSD-2-Clause"
 repository = "https://github.com/kushaldas/pyuppsala"
 
 [lib]
-name = "pyuppsala"
+name = "_pyuppsala"
 crate-type = ["cdylib"]
 
 [dependencies]

@@ -30,7 +30,11 @@ dev = [
     "pytest>=8.0",
     "sphinx>=8.0",
     "furo",
+    "lxml>=5.0",
+    "maturin>=1.0,<2.0",
 ]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "pyuppsala._pyuppsala"

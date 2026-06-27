@@ -73,7 +73,7 @@ Module-level functions
    Parse XML from bytes with automatic encoding detection (UTF-8, UTF-16
    LE/BE, with or without a BOM). Encoding detection is applied in all
    cases, so the keyword arguments below never change how the bytes are
-   decoded — UTF-16 input keeps working with or without custom limits.
+   decoded -- UTF-16 input keeps working with or without custom limits.
 
    :param data: Raw bytes of an XML document.
    :param max_depth: See :func:`parse`.
@@ -572,9 +572,16 @@ Node
 
          print(doc.to_xml())  # '<item id="2" status="active"/>'
 
-   .. method:: remove_attribute(name: str) -> str | None
+   .. method:: remove_attribute(name: str, namespace_uri: str | None = None) -> str | None
 
-      Remove an attribute by local name. Returns the old value, or ``None``.
+      Remove an attribute and return its old value, or ``None`` if absent.
+
+      The attribute is matched by both local name and namespace. With
+      ``namespace_uri=None`` (the default) only the attribute that has *no*
+      namespace is removed; passing a URI removes the attribute in exactly that
+      namespace. In both cases an attribute that merely shares the local name in
+      a different namespace is left untouched (mirroring ``get_attribute`` and
+      ``set_attribute``).
 
       .. code-block:: python
 
@@ -583,6 +590,13 @@ Node
          old = item.remove_attribute("status")
          print(old)  # "draft"
          print(doc.to_xml())  # '<item id="1"/>'
+
+         # Namespaced attributes require the matching URI; a plain name does
+         # not remove a namespaced attribute that shares the local name.
+         doc = Document('<item xmlns:x="urn:x" x:status="ok"/>')
+         item = doc.document_element
+         print(item.remove_attribute("status"))            # None (no-namespace)
+         print(item.remove_attribute("status", "urn:x"))   # "ok"
 
    .. method:: to_xml() -> str
 
@@ -1024,6 +1038,18 @@ XmlWriter
       print(w.to_string())
       # <?xml version="1.0" encoding="UTF-8"?><root>hello</root>
 
+   .. note::
+
+      Element names, attribute names, and processing-instruction targets are
+      written verbatim into the output, so they are validated as well-formed XML
+      names. ``start_element``, ``end_element``, ``empty_element``,
+      ``empty_element_expanded`` (including their *attrs* names), and
+      ``processing_instruction`` raise :class:`ValueError` on an invalid name or
+      target (for example one containing whitespace, quotes, or markup
+      delimiters). ``processing_instruction`` also rejects the reserved ``xml``
+      target. This prevents malformed or injected markup in the serialized
+      output.
+
    .. method:: write_declaration() -> None
 
       Write ``<?xml version="1.0" encoding="UTF-8"?>``.
@@ -1041,6 +1067,8 @@ XmlWriter
    .. method:: start_element(name, attrs=None) -> None
 
       Start an element. *attrs* is an optional list of ``(name, value)`` tuples.
+      Raises :class:`ValueError` if *name* or any attribute name is not a valid
+      XML name.
 
       .. code-block:: python
 
@@ -1053,11 +1081,13 @@ XmlWriter
 
    .. method:: end_element(name: str) -> None
 
-      Close the element.
+      Close the element. Raises :class:`ValueError` if *name* is not a valid XML
+      name.
 
    .. method:: empty_element(name, attrs=None) -> None
 
-      Write a self-closing element: ``<name/>``.
+      Write a self-closing element: ``<name/>``. Raises :class:`ValueError` if
+      *name* or any attribute name is not a valid XML name.
 
       .. code-block:: python
 
@@ -1069,7 +1099,9 @@ XmlWriter
 
    .. method:: empty_element_expanded(name, attrs=None) -> None
 
-      Write an expanded empty element: ``<name></name>``.
+      Write an expanded empty element: ``<name></name>``. Raises
+      :class:`ValueError` if *name* or any attribute name is not a valid XML
+      name.
 
       .. code-block:: python
 
@@ -1116,7 +1148,8 @@ XmlWriter
 
    .. method:: processing_instruction(target, data=None) -> None
 
-      Write a processing instruction.
+      Write a processing instruction. Raises :class:`ValueError` if *target* is
+      not a valid XML name or is the reserved ``xml`` target.
 
       .. code-block:: python
 

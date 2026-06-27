@@ -15,6 +15,12 @@ use uppsala::{Document as UDocument, XmlError};
 // Custom Python exceptions
 // ---------------------------------------------------------------------------
 
+// The module name passed to `create_exception!` becomes each exception's
+// Python `__module__`. Use the public package `pyuppsala` (which re-exports
+// these exceptions) rather than the internal `_pyuppsala` extension: there is
+// no importable top-level `_pyuppsala` module, so the latter breaks pickling
+// and produces misleading tracebacks. With `pyuppsala`, `__module__` resolves
+// via the package's re-exports.
 create_exception!(pyuppsala, XmlParseError, pyo3::exceptions::PyException);
 create_exception!(
     pyuppsala,
@@ -49,8 +55,191 @@ fn xml_error_to_pyerr(e: XmlError) -> PyErr {
     }
 }
 
+fn is_xml_name_start(c: char) -> bool {
+    // The exact XML 1.0 NameStartChar production. The ranges are kept literal
+    // (rather than a single 0xC0..=0xD7FF span) so disallowed code points such
+    // as U+00D7, U+00F7, and the combining marks at U+0300..U+036F are excluded.
+    let u = c as u32;
+    c == ':'
+        || c == '_'
+        || c.is_ascii_alphabetic()
+        || (0x00C0..=0x00D6).contains(&u)
+        || (0x00D8..=0x00F6).contains(&u)
+        || (0x00F8..=0x02FF).contains(&u)
+        || (0x0370..=0x037D).contains(&u)
+        || (0x037F..=0x1FFF).contains(&u)
+        || (0x200C..=0x200D).contains(&u)
+        || (0x2070..=0x218F).contains(&u)
+        || (0x2C00..=0x2FEF).contains(&u)
+        || (0x3001..=0xD7FF).contains(&u)
+        || (0xF900..=0xFDCF).contains(&u)
+        || (0xFDF0..=0xFFFD).contains(&u)
+        || (0x10000..=0xEFFFF).contains(&u)
+}
+
+fn is_xml_name_char(c: char) -> bool {
+    let u = c as u32;
+    is_xml_name_start(c)
+        || c == '-'
+        || c == '.'
+        || c.is_ascii_digit()
+        || c == '\u{00B7}'
+        || (0x0300..=0x036F).contains(&u)
+        || (0x203F..=0x2040).contains(&u)
+}
+
+fn validate_name_with<F, G>(value: &str, what: &str, start_ok: F, char_ok: G) -> PyResult<()>
+where
+    F: Fn(char) -> bool,
+    G: Fn(char) -> bool,
+{
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) if start_ok(first) && chars.all(char_ok) => Ok(()),
+        _ => Err(PyValueError::new_err(format!(
+            "Invalid {} name: {:?}",
+            what, value
+        ))),
+    }
+}
+
+fn validate_xml_name(value: &str, what: &str) -> PyResult<()> {
+    // The streaming writer accepts already-prefixed names like "x:item", so it
+    // validates XML Name rather than NCName.
+    validate_name_with(value, what, is_xml_name_start, is_xml_name_char)
+}
+
+fn validate_ncname(value: &str, what: &str) -> PyResult<()> {
+    // DOM builders receive local names and prefixes separately.  A colon inside
+    // either one would be ambiguous and can produce malformed serialized XML.
+    validate_name_with(
+        value,
+        what,
+        |c| c != ':' && is_xml_name_start(c),
+        |c| c != ':' && is_xml_name_char(c),
+    )
+}
+
+fn validate_prefix(prefix: Option<&str>) -> PyResult<Option<&str>> {
+    match prefix {
+        Some("") | None => Ok(None),
+        Some(p) => {
+            validate_ncname(p, "namespace prefix")?;
+            Ok(Some(p))
+        }
+    }
+}
+
+// The two namespaces the XML Namespaces spec reserves and binds to fixed
+// prefixes. They guard against rebinding `xml`/`xmlns` or declaring them in
+// ways that would produce invalid XML.
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// Validate a `(namespace_uri, prefix)` pair used to build an element or
+/// attribute QName.
+///
+/// Returns the normalized prefix (empty string mapped to `None`). A prefix is
+/// only meaningful alongside a namespace URI, so a prefix supplied without a
+/// namespace is rejected rather than being silently dropped. The XML
+/// Namespaces reserved bindings are enforced too, so a QName cannot use the
+/// `xmlns` prefix, rebind the `xml` prefix or XML namespace, or sit in the
+/// `xmlns` namespace - all of which would serialize to invalid XML.
+fn validate_qname_parts<'a>(
+    namespace_uri: Option<&str>,
+    prefix: Option<&'a str>,
+) -> PyResult<Option<&'a str>> {
+    let prefix = validate_prefix(prefix)?;
+    match namespace_uri {
+        None => {
+            if prefix.is_some() {
+                return Err(PyValueError::new_err(
+                    "a namespace prefix requires a namespace URI",
+                ));
+            }
+        }
+        Some(ns) => {
+            if prefix == Some("xmlns") {
+                return Err(PyValueError::new_err(
+                    "the \"xmlns\" prefix is reserved and cannot be used as a name prefix",
+                ));
+            }
+            if ns == XMLNS_NAMESPACE {
+                return Err(PyValueError::new_err(
+                    "the xmlns namespace cannot be used for element or attribute names",
+                ));
+            }
+            if prefix == Some("xml") && ns != XML_NAMESPACE {
+                return Err(PyValueError::new_err(
+                    "the \"xml\" prefix can only be bound to the XML namespace",
+                ));
+            }
+            if ns == XML_NAMESPACE && prefix != Some("xml") {
+                return Err(PyValueError::new_err(
+                    "the XML namespace can only be used with the \"xml\" prefix",
+                ));
+            }
+        }
+    }
+    Ok(prefix)
+}
+
+/// Reject `xmlns` declarations that the XML Namespaces spec forbids: the
+/// reserved `xmlns` prefix, rebinding the `xml` prefix or XML namespace to
+/// anything else, and declaring the `xmlns` namespace at all. These would
+/// otherwise serialize to invalid XML or clobber the standard `xml` binding.
+fn validate_ns_declaration(prefix: Option<&str>, uri: &str) -> PyResult<()> {
+    if prefix == Some("xmlns") {
+        return Err(PyValueError::new_err(
+            "the \"xmlns\" prefix is reserved and cannot be declared",
+        ));
+    }
+    if prefix == Some("xml") && uri != XML_NAMESPACE {
+        return Err(PyValueError::new_err(
+            "the \"xml\" prefix can only be bound to the XML namespace",
+        ));
+    }
+    if uri == XML_NAMESPACE && prefix != Some("xml") {
+        return Err(PyValueError::new_err(
+            "the XML namespace can only be bound to the \"xml\" prefix",
+        ));
+    }
+    if uri == XMLNS_NAMESPACE {
+        return Err(PyValueError::new_err(
+            "the xmlns namespace cannot be declared",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pi_target(target: &str) -> PyResult<()> {
+    validate_xml_name(target, "processing instruction target")?;
+    if target.eq_ignore_ascii_case("xml") {
+        return Err(PyValueError::new_err(
+            "Invalid processing instruction target: reserved XML target",
+        ));
+    }
+    Ok(())
+}
+
+fn writer_attr_refs<'a>(
+    attrs: &'a Option<Vec<(String, String)>>,
+) -> PyResult<Vec<(&'a str, &'a str)>> {
+    // Attribute values are escaped by the writer. Attribute names are not, so
+    // validate them before handing references to the underlying writer.
+    match attrs {
+        Some(a) => {
+            for (name, _) in a {
+                validate_xml_name(name, "attribute")?;
+            }
+            Ok(a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Shared document handle — allows multiple Python objects to reference one DOM
+// Shared document handle - allows multiple Python objects to reference one DOM
 // ---------------------------------------------------------------------------
 
 /// Wraps a Document alongside the original input text.
@@ -66,7 +255,7 @@ struct DocWithInput {
 type SharedDoc = Arc<Mutex<DocWithInput>>;
 
 // ---------------------------------------------------------------------------
-// QName — Python wrapper
+// QName - Python wrapper
 // ---------------------------------------------------------------------------
 
 /// A qualified XML name with optional namespace URI and prefix.
@@ -82,12 +271,23 @@ struct QName {
 impl QName {
     #[new]
     #[pyo3(signature = (local_name, namespace_uri=None, prefix=None))]
-    fn new(local_name: String, namespace_uri: Option<String>, prefix: Option<String>) -> Self {
-        QName {
+    fn new(
+        local_name: String,
+        namespace_uri: Option<String>,
+        prefix: Option<String>,
+    ) -> PyResult<Self> {
+        validate_ncname(&local_name, "local")?;
+        // Enforce the same QName invariants as the DOM builders (a prefix
+        // requires a namespace URI, plus the reserved xml/xmlns bindings) and
+        // normalize an empty prefix to None, so a QName can never represent a
+        // name that create_element/set_attribute/set_qname would reject.
+        let prefix =
+            validate_qname_parts(namespace_uri.as_deref(), prefix.as_deref())?.map(str::to_string);
+        Ok(QName {
             namespace_uri,
             prefix,
             local_name,
-        }
+        })
     }
 
     /// The local part of the name.
@@ -166,7 +366,7 @@ impl QName {
 }
 
 // ---------------------------------------------------------------------------
-// Attribute — Python wrapper
+// Attribute - Python wrapper
 // ---------------------------------------------------------------------------
 
 /// An XML attribute with a qualified name and string value.
@@ -210,12 +410,12 @@ impl Attribute {
 }
 
 // ---------------------------------------------------------------------------
-// Node — a lightweight handle into a Document
+// Node - a lightweight handle into a Document
 // ---------------------------------------------------------------------------
 
 /// A node within an XML document.
 ///
-/// Nodes are lightweight handles — the actual data lives inside the Document.
+/// Nodes are lightweight handles - the actual data lives inside the Document.
 /// Do not use a Node after its parent Document has been garbage collected.
 #[pyclass(name = "Node", from_py_object)]
 #[derive(Clone)]
@@ -333,6 +533,8 @@ impl Node {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<Option<String>> {
+        validate_ncname(name, "attribute")?;
+        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .doc
             .lock()
@@ -353,14 +555,30 @@ impl Node {
         }
     }
 
-    /// Remove an attribute by local name. Returns the old value if any.
-    fn remove_attribute(&self, name: &str) -> PyResult<Option<String>> {
+    /// Remove an attribute. Returns the old value if any.
+    ///
+    /// `namespace_uri=None` removes the attribute that has *no* namespace and
+    /// the given local name; a namespace URI removes the attribute in exactly
+    /// that namespace. In both cases an attribute in a different namespace that
+    /// merely shares the local name is left untouched.
+    #[pyo3(signature = (name, namespace_uri=None))]
+    fn remove_attribute(
+        &self,
+        name: &str,
+        namespace_uri: Option<&str>,
+    ) -> PyResult<Option<String>> {
         let mut guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(self.id) {
-            Some(el) => Ok(el.remove_attribute(name).map(|s| s.to_string())),
+            Some(el) => {
+                let pos = el.attributes.iter().position(|a| {
+                    a.name.local_name.as_ref() == name
+                        && a.name.namespace_uri.as_deref() == namespace_uri
+                });
+                Ok(pos.map(|i| el.attributes.remove(i).value.into_owned()))
+            }
             None => Err(PyValueError::new_err("Node is not an element")),
         }
     }
@@ -394,6 +612,217 @@ impl Node {
                 id: cid,
             })
             .collect())
+    }
+
+    /// A stable integer identity for this node within its Document.
+    ///
+    /// Two `Node` handles referring to the same underlying node return the same
+    /// value. Used by the etree layer to maintain an identity-stable proxy cache.
+    #[getter]
+    fn node_id(&self) -> usize {
+        self.id.index()
+    }
+
+    /// The first child node, or None.
+    #[getter]
+    fn first_child(&self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.first_child(self.id).map(|cid| Node {
+            doc: Arc::clone(&self.doc),
+            id: cid,
+        }))
+    }
+
+    /// The last child node, or None.
+    #[getter]
+    fn last_child(&self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.last_child(self.id).map(|cid| Node {
+            doc: Arc::clone(&self.doc),
+            id: cid,
+        }))
+    }
+
+    /// The next sibling node, or None.
+    #[getter]
+    fn next_sibling(&self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.next_sibling(self.id).map(|sid| Node {
+            doc: Arc::clone(&self.doc),
+            id: sid,
+        }))
+    }
+
+    /// The previous sibling node, or None.
+    #[getter]
+    fn previous_sibling(&self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.previous_sibling(self.id).map(|sid| Node {
+            doc: Arc::clone(&self.doc),
+            id: sid,
+        }))
+    }
+
+    /// The namespace declarations on this element as (prefix, uri) pairs.
+    ///
+    /// Only the `xmlns`/`xmlns:*` declarations attached to this element itself
+    /// are returned, not declarations inherited from ancestors. The prefix is
+    /// None for the default namespace (`xmlns="..."`). Returns an empty list for
+    /// non-element nodes.
+    #[getter]
+    fn namespace_declarations(&self) -> PyResult<Vec<(Option<String>, String)>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.element(self.id) {
+            Some(el) => Ok(el
+                .namespace_declarations
+                .iter()
+                .map(|(p, u)| {
+                    let prefix = if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.to_string())
+                    };
+                    (prefix, u.to_string())
+                })
+                .collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Set the content of a Text, CDATA, or Comment node in place.
+    ///
+    /// Raises ValueError for other node kinds. Used by the etree layer to assign
+    /// element `.text`/`.tail` and comment text without recreating nodes.
+    fn set_text(&self, content: &str) -> PyResult<()> {
+        let mut guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind_mut(self.id) {
+            Some(NodeKind::Text(t)) => {
+                *t = std::borrow::Cow::Owned(content.to_string());
+                Ok(())
+            }
+            Some(NodeKind::CData(t)) => {
+                *t = std::borrow::Cow::Owned(content.to_string());
+                Ok(())
+            }
+            Some(NodeKind::Comment(t)) => {
+                *t = std::borrow::Cow::Owned(content.to_string());
+                Ok(())
+            }
+            _ => Err(PyValueError::new_err(
+                "Node is not a text, cdata, or comment node",
+            )),
+        }
+    }
+
+    /// The content of a Comment node, or None for other node kinds.
+    #[getter]
+    fn comment_text(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind(self.id) {
+            Some(NodeKind::Comment(t)) => Ok(Some(t.to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    /// The target of a ProcessingInstruction node, or None for other kinds.
+    #[getter]
+    fn pi_target(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind(self.id) {
+            Some(NodeKind::ProcessingInstruction(pi)) => Ok(Some(pi.target.to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    /// The data of a ProcessingInstruction node, or None.
+    #[getter]
+    fn pi_data(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind(self.id) {
+            Some(NodeKind::ProcessingInstruction(pi)) => {
+                Ok(pi.data.as_ref().map(|d| d.to_string()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Set the data of a ProcessingInstruction node. Raises ValueError otherwise.
+    #[pyo3(signature = (data=None))]
+    fn set_pi_data(&self, data: Option<&str>) -> PyResult<()> {
+        let mut guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind_mut(self.id) {
+            Some(NodeKind::ProcessingInstruction(pi)) => {
+                pi.data = data.map(|d| std::borrow::Cow::Owned(d.to_string()));
+                Ok(())
+            }
+            _ => Err(PyValueError::new_err(
+                "Node is not a processing instruction",
+            )),
+        }
+    }
+
+    /// Rename an element node's qualified name in place.
+    ///
+    /// Raises ValueError if the node is not an element. Used by the etree layer
+    /// for `element.tag = ...` assignment.
+    #[pyo3(signature = (local_name, namespace_uri=None, prefix=None))]
+    fn set_qname(
+        &self,
+        local_name: &str,
+        namespace_uri: Option<&str>,
+        prefix: Option<&str>,
+    ) -> PyResult<()> {
+        validate_ncname(local_name, "element")?;
+        let prefix = validate_qname_parts(namespace_uri, prefix)?;
+        let mut guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.element_mut(self.id) {
+            Some(el) => {
+                el.name = match (namespace_uri, prefix) {
+                    (Some(ns), Some(p)) => {
+                        UQName::full(p.to_string(), ns.to_string(), local_name.to_string())
+                    }
+                    (Some(ns), None) => {
+                        UQName::with_namespace(ns.to_string(), local_name.to_string())
+                    }
+                    _ => UQName::local(local_name.to_string()),
+                };
+                Ok(())
+            }
+            None => Err(PyValueError::new_err("Node is not an element")),
+        }
     }
 
     /// The line number of this node in the source document (1-based).
@@ -689,7 +1118,7 @@ impl NodeIterator {
 }
 
 // ---------------------------------------------------------------------------
-// Document — Python wrapper
+// Document - Python wrapper
 // ---------------------------------------------------------------------------
 
 /// An XML document.
@@ -706,12 +1135,13 @@ struct Document {
 impl Document {
     /// Parse an XML string into a Document.
     ///
-    /// Optional keyword arguments override uppsala's safe defaults (see module constants like ``DEFAULT_MAX_DEPTH``):
+    /// Optional keyword arguments override uppsala's safe defaults:
     ///
-    /// * ``max_depth`` — maximum element nesting depth (default ``DEFAULT_MAX_DEPTH``).
-    /// * ``max_entity_expansion`` — maximum total bytes from entity expansion
-    ///   (default ``DEFAULT_MAX_ENTITY_EXPANSION``).
-    /// * ``namespace_aware`` — when False, disables XML namespace processing.
+    /// * ``max_depth`` - maximum element nesting depth (default
+    ///   ``DEFAULT_MAX_DEPTH``, from ``uppsala::parser``).
+    /// * ``max_entity_expansion`` - maximum total bytes from entity expansion
+    ///   (default ``DEFAULT_MAX_ENTITY_EXPANSION``, from ``uppsala::parser``).
+    /// * ``namespace_aware`` - when False, disables XML namespace processing.
     ///
     /// .. warning::
     ///    Do not source these values from untrusted input. An attacker who
@@ -737,7 +1167,7 @@ impl Document {
     /// with or without BOM).
     ///
     /// Optional keyword arguments override uppsala's safe defaults. Encoding
-    /// auto-detection is applied in all cases — passing ``max_depth``,
+    /// auto-detection is applied in all cases - passing ``max_depth``,
     /// ``max_entity_expansion``, or ``namespace_aware`` does not change how
     /// the bytes are decoded, so UTF-16 input keeps working regardless.
     ///
@@ -857,6 +1287,8 @@ impl Document {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<Node> {
+        validate_ncname(local_name, "element")?;
+        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .inner
             .lock()
@@ -916,6 +1348,7 @@ impl Document {
 
     /// Create a new processing instruction node (not yet attached to the tree).
     fn create_processing_instruction(&self, target: &str, data: Option<&str>) -> PyResult<Node> {
+        validate_pi_target(target)?;
         let mut guard = self
             .inner
             .lock()
@@ -938,6 +1371,47 @@ impl Document {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         guard.doc.append_child(parent.id, child.id);
         Ok(())
+    }
+
+    /// Add or replace an `xmlns` declaration on an element node.
+    ///
+    /// `prefix=None` sets the default namespace (`xmlns="uri"`); otherwise sets
+    /// `xmlns:prefix="uri"`. Used by the etree layer so namespaced trees built
+    /// in memory serialize with correct namespace declarations. Raises
+    /// ValueError if `node` is not an element, or if the declaration is one the
+    /// XML Namespaces spec reserves (the `xmlns` prefix, rebinding `xml`/the XML
+    /// namespace, or declaring the `xmlns` namespace).
+    #[pyo3(signature = (node, prefix, uri))]
+    fn set_namespace_declaration(
+        &self,
+        node: &Node,
+        prefix: Option<&str>,
+        uri: &str,
+    ) -> PyResult<()> {
+        let prefix = validate_prefix(prefix)?;
+        validate_ns_declaration(prefix, uri)?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.element_mut(node.id) {
+            Some(el) => {
+                let p = prefix.unwrap_or("");
+                match el
+                    .namespace_declarations
+                    .iter_mut()
+                    .find(|(existing, _)| existing.as_ref() == p)
+                {
+                    Some(slot) => slot.1 = std::borrow::Cow::Owned(uri.to_string()),
+                    None => el.namespace_declarations.push((
+                        std::borrow::Cow::Owned(p.to_string()),
+                        std::borrow::Cow::Owned(uri.to_string()),
+                    )),
+                }
+                Ok(())
+            }
+            None => Err(PyValueError::new_err("Node is not an element")),
+        }
     }
 
     /// Insert a child node before a reference node.
@@ -1106,7 +1580,7 @@ impl XPathEvaluator {
     /// (default 32) used to bound recursive parsing of XPath expressions.
     ///
     /// .. warning::
-    ///    Do not source ``max_depth`` from untrusted input — an attacker
+    ///    Do not source ``max_depth`` from untrusted input - an attacker
     ///    who controls the cap can re-enable XPath stack-overflow attacks.
     #[new]
     #[pyo3(signature = (*, max_depth=None))]
@@ -1339,7 +1813,7 @@ impl XsdValidator {
 }
 
 // ---------------------------------------------------------------------------
-// XmlWriter — imperative XML builder
+// XmlWriter - imperative XML builder
 // ---------------------------------------------------------------------------
 
 /// An imperative XML builder for constructing XML fragments.
@@ -1380,37 +1854,40 @@ impl XmlWriter {
     ///
     /// Attributes should be a list of (name, value) tuples.
     #[pyo3(signature = (name, attrs=None))]
-    fn start_element(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) {
-        let attr_refs: Vec<(&str, &str)> = match &attrs {
-            Some(a) => a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
-            None => Vec::new(),
-        };
+    fn start_element(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) -> PyResult<()> {
+        validate_xml_name(name, "element")?;
+        let attr_refs = writer_attr_refs(&attrs)?;
         self.inner.start_element(name, &attr_refs);
+        Ok(())
     }
 
     /// End the current element.
-    fn end_element(&mut self, name: &str) {
+    fn end_element(&mut self, name: &str) -> PyResult<()> {
+        validate_xml_name(name, "element")?;
         self.inner.end_element(name);
+        Ok(())
     }
 
     /// Write a self-closing empty element: <name/>
     #[pyo3(signature = (name, attrs=None))]
-    fn empty_element(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) {
-        let attr_refs: Vec<(&str, &str)> = match &attrs {
-            Some(a) => a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
-            None => Vec::new(),
-        };
+    fn empty_element(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) -> PyResult<()> {
+        validate_xml_name(name, "element")?;
+        let attr_refs = writer_attr_refs(&attrs)?;
         self.inner.empty_element(name, &attr_refs);
+        Ok(())
     }
 
     /// Write an expanded empty element: <name></name>
     #[pyo3(signature = (name, attrs=None))]
-    fn empty_element_expanded(&mut self, name: &str, attrs: Option<Vec<(String, String)>>) {
-        let attr_refs: Vec<(&str, &str)> = match &attrs {
-            Some(a) => a.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
-            None => Vec::new(),
-        };
+    fn empty_element_expanded(
+        &mut self,
+        name: &str,
+        attrs: Option<Vec<(String, String)>>,
+    ) -> PyResult<()> {
+        validate_xml_name(name, "element")?;
+        let attr_refs = writer_attr_refs(&attrs)?;
         self.inner.empty_element_expanded(name, &attr_refs);
+        Ok(())
     }
 
     /// Write text content (auto-escaped).
@@ -1429,8 +1906,10 @@ impl XmlWriter {
     }
 
     /// Write a processing instruction.
-    fn processing_instruction(&mut self, target: &str, data: Option<&str>) {
+    fn processing_instruction(&mut self, target: &str, data: Option<&str>) -> PyResult<()> {
+        validate_pi_target(target)?;
         self.inner.processing_instruction(target, data);
+        Ok(())
     }
 
     /// Write raw XML content (not escaped).
@@ -1487,7 +1966,7 @@ impl XsdRegex {
     /// applied to the pattern at compile time.
     ///
     /// .. warning::
-    ///    Do not source ``max_depth`` from untrusted input — an attacker
+    ///    Do not source ``max_depth`` from untrusted input - an attacker
     ///    who controls the cap can re-enable regex compiler stack overflows.
     #[new]
     #[pyo3(signature = (pattern, *, max_depth=None))]
@@ -1510,7 +1989,7 @@ impl XsdRegex {
     /// is reached, which prevents catastrophic-backtracking ReDoS.
     ///
     /// .. warning::
-    ///    Do not source ``max_steps`` from untrusted input — an attacker
+    ///    Do not source ``max_steps`` from untrusted input - an attacker
     ///    who controls the cap can re-enable polynomial-ReDoS attacks.
     #[pyo3(signature = (input, *, max_steps=None))]
     fn is_match(&self, input: &str, max_steps: Option<usize>) -> bool {
@@ -1594,12 +2073,12 @@ fn build_parser(
 /// Decode raw XML bytes to a String, auto-detecting the encoding (UTF-8 and
 /// UTF-16 LE/BE, with or without BOM). This mirrors uppsala's internal
 /// `decode_xml_bytes` so the keyword-argument code path keeps the same
-/// encoding support as the plain `parse_bytes` fast path — the `Parser`
+/// encoding support as the plain `parse_bytes` fast path - the `Parser`
 /// builder only accepts `&str`, so without this the only option would be a
 /// lossy UTF-8 decode that mangles UTF-16 input.
 fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
     if data.len() < 2 {
-        // Too short for BOM detection — assume UTF-8.
+        // Too short for BOM detection - assume UTF-8.
         return decode_utf8(data);
     }
 
@@ -1611,11 +2090,11 @@ fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
         return decode_utf16(&data[2..], true); // UTF-16 BE BOM
     }
     if data.len() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
-        // UTF-8 BOM — strip it and decode as UTF-8.
+        // UTF-8 BOM - strip it and decode as UTF-8.
         return decode_utf8(&data[3..]);
     }
 
-    // No BOM — check for UTF-16 without BOM (XML spec Appendix F).
+    // No BOM - check for UTF-16 without BOM (XML spec Appendix F).
     if data[0] == 0x00 && data[1] == 0x3C {
         return decode_utf16(data, true); // UTF-16 BE without BOM
     }
@@ -1629,7 +2108,7 @@ fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
 
 /// Validate UTF-8 bytes and copy them into a String. Borrows the slice for
 /// validation (`std::str::from_utf8`) so there is no intermediate `Vec<u8>`
-/// allocation on the common UTF-8 path — only the final owned copy.
+/// allocation on the common UTF-8 path - only the final owned copy.
 fn decode_utf8(bytes: &[u8]) -> PyResult<String> {
     std::str::from_utf8(bytes)
         .map(str::to_owned)
@@ -1677,7 +2156,7 @@ fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlW
 // Module definition
 // ---------------------------------------------------------------------------
 
-/// pyuppsala — Python bindings for the Uppsala XML library.
+/// pyuppsala - Python bindings for the Uppsala XML library.
 ///
 /// A zero-dependency XML library providing:
 /// - XML 1.0 parsing and well-formedness checking
@@ -1686,7 +2165,7 @@ fn make_write_options(indent: Option<&str>, expand_empty_elements: bool) -> XmlW
 /// - XSD validation
 /// - XSD regex pattern matching
 #[pymodule]
-fn pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Classes
     m.add_class::<Document>()?;
     m.add_class::<Node>()?;

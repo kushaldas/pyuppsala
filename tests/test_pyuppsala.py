@@ -122,6 +122,27 @@ class TestDocument:
         assert el.tag.namespace_uri == "urn:test"
         assert el.tag.prefix == "ns"
 
+    def test_create_element_rejects_invalid_names(self):
+        # Native DOM builders are a public construction path, independent of
+        # pyuppsala.etree, so they must enforce the same XML name boundary.
+        doc = Document.empty()
+        with pytest.raises(ValueError):
+            doc.create_element('x/><evil attr="1"')
+        with pytest.raises(ValueError):
+            doc.create_element("item", namespace_uri="urn:test", prefix="bad prefix")
+
+    def test_create_element_accepts_supplementary_plane_names(self):
+        doc = Document.empty()
+        local = "\U00010000name"
+        prefix = "\U00010000p"
+        el = doc.create_element(local, namespace_uri="urn:test", prefix=prefix)
+        doc.set_namespace_declaration(el, prefix, "urn:test")
+        doc.append_child(doc.root, el)
+
+        assert doc.document_element.tag.local_name == local
+        assert doc.document_element.tag.prefix == prefix
+        assert "<%s:%s" % (prefix, local) in doc.to_xml()
+
     def test_create_text(self):
         doc = parse("<root/>")
         text = doc.create_text("hello")
@@ -151,6 +172,81 @@ class TestDocument:
         pi = doc.create_processing_instruction("target", None)
         doc.append_child(doc.document_element, pi)
         assert "<?target?>" in doc.to_xml()
+
+    def test_create_processing_instruction_rejects_invalid_target(self):
+        # PI targets are emitted verbatim by the serializer; whitespace would
+        # split the target from injected data.
+        doc = Document.empty()
+        with pytest.raises(ValueError):
+            doc.create_processing_instruction("bad target", "data")
+
+    def test_set_namespace_declaration_rejects_invalid_prefix(self):
+        # Namespace declaration prefixes become xmlns:prefix attributes during
+        # serialization, so prefix validation closes another injection route.
+        doc = parse("<root/>")
+        with pytest.raises(ValueError):
+            doc.set_namespace_declaration(
+                doc.document_element,
+                'p injected="1"',
+                "urn:test",
+            )
+
+    XML_NS = "http://www.w3.org/XML/1998/namespace"
+    XMLNS_NS = "http://www.w3.org/2000/xmlns/"
+
+    def test_set_namespace_declaration_rejects_reserved(self):
+        # The XML Namespaces spec reserves the xml/xmlns prefixes and their
+        # namespaces; declaring them in a non-standard way would serialize to
+        # invalid XML or clobber the standard xml binding.
+        doc = parse("<root/>")
+        el = doc.document_element
+        with pytest.raises(ValueError):  # xmlns prefix is reserved
+            doc.set_namespace_declaration(el, "xmlns", "urn:x")
+        with pytest.raises(ValueError):  # xml prefix bound elsewhere
+            doc.set_namespace_declaration(el, "xml", "urn:wrong")
+        with pytest.raises(ValueError):  # XML namespace under another prefix
+            doc.set_namespace_declaration(el, "foo", self.XML_NS)
+        with pytest.raises(ValueError):  # xmlns namespace is never declarable
+            doc.set_namespace_declaration(el, "p", self.XMLNS_NS)
+        # The canonical xml -> XML-namespace binding is still allowed.
+        doc.set_namespace_declaration(el, "xml", self.XML_NS)
+
+    def test_prefix_requires_namespace_uri(self):
+        # A prefix is only meaningful with a namespace URI; supplying one
+        # without a namespace is rejected rather than silently dropped.
+        doc = Document.empty()
+        with pytest.raises(ValueError):
+            doc.create_element("e", namespace_uri=None, prefix="p")
+        el = doc.create_element("e")
+        with pytest.raises(ValueError):
+            el.set_attribute("a", "v", namespace_uri=None, prefix="p")
+        with pytest.raises(ValueError):
+            el.set_qname("n", namespace_uri=None, prefix="p")
+
+    def test_xml_prefix_attribute_is_allowed(self):
+        # The reserved-prefix checks must not block the legitimate xml:lang
+        # attribute (prefix xml bound to the XML namespace).
+        doc = Document.empty()
+        el = doc.create_element("e")
+        el.set_attribute("lang", "en", namespace_uri=self.XML_NS, prefix="xml")
+        assert el.get_attribute("lang", namespace_uri=self.XML_NS) == "en"
+
+    def test_qname_rejects_reserved_namespace_bindings(self):
+        # create_element/set_attribute/set_qname must also enforce the XML
+        # Namespaces reserved bindings, so a QName cannot use the xmlns prefix,
+        # rebind the xml prefix or XML namespace, or sit in the xmlns namespace.
+        doc = Document.empty()
+        el = doc.create_element("e")
+        with pytest.raises(ValueError):  # element in the xmlns namespace
+            doc.create_element("x", namespace_uri=self.XMLNS_NS, prefix="p")
+        with pytest.raises(ValueError):  # xmlns prefix on an attribute
+            el.set_attribute("a", "v", namespace_uri="urn:y", prefix="xmlns")
+        with pytest.raises(ValueError):  # xmlns prefix on an element name
+            el.set_qname("n", namespace_uri="urn:y", prefix="xmlns")
+        with pytest.raises(ValueError):  # xml prefix bound to a non-XML namespace
+            el.set_attribute("a", "v", namespace_uri="urn:wrong", prefix="xml")
+        with pytest.raises(ValueError):  # XML namespace under a different prefix
+            el.set_attribute("a", "v", namespace_uri=self.XML_NS, prefix="other")
 
     def test_append_child(self):
         doc = parse("<root/>")
@@ -323,6 +419,23 @@ class TestNode:
             doc.document_element.get_attribute("key", namespace_uri="urn:test") == "val"
         )
 
+    def test_set_attribute_rejects_invalid_names(self):
+        # Attribute names are written as markup.  Values are escaped elsewhere,
+        # but names must be syntactically valid before storage.
+        doc = parse("<root/>")
+        el = doc.document_element
+        with pytest.raises(ValueError):
+            el.set_attribute('a="v"/><evil foo', "z")
+        with pytest.raises(ValueError):
+            el.set_attribute("key", "val", namespace_uri="urn:test", prefix="bad prefix")
+
+    def test_set_qname_rejects_invalid_names(self):
+        # Renaming an existing node has the same serialization risk as creating
+        # it with a bad name.
+        doc = parse("<root/>")
+        with pytest.raises(ValueError):
+            doc.document_element.set_qname('safe injected="1"')
+
     def test_remove_attribute(self):
         doc = parse('<root key="val"/>')
         old = doc.document_element.remove_attribute("key")
@@ -332,6 +445,34 @@ class TestNode:
     def test_remove_attribute_missing(self):
         doc = parse("<root/>")
         assert doc.document_element.remove_attribute("missing") is None
+
+    def test_remove_attribute_namespace_exact(self):
+        # remove_attribute matches both local name and namespace: a plain name
+        # only targets the no-namespace attribute, and a URI targets exactly
+        # that namespace. An attribute sharing the local name in a different
+        # namespace must be left untouched.
+        doc = parse(
+            '<root xmlns:a="urn:a" xmlns:b="urn:b" '
+            'k="plain" a:k="va" b:k="vb"/>'
+        )
+        el = doc.document_element
+
+        def attr_map():
+            # Map of (namespace_uri, local_name) -> value for every attribute.
+            return {
+                (a.name.namespace_uri, a.name.local_name): a.value
+                for a in el.attributes
+            }
+
+        # A plain name removes only the no-namespace attribute.
+        assert el.remove_attribute("k") == "plain"
+        assert attr_map() == {("urn:a", "k"): "va", ("urn:b", "k"): "vb"}
+        # A namespace URI removes exactly the attribute in that namespace.
+        assert el.remove_attribute("k", namespace_uri="urn:a") == "va"
+        assert attr_map() == {("urn:b", "k"): "vb"}
+        # A non-matching namespace removes nothing.
+        assert el.remove_attribute("k", namespace_uri="urn:missing") is None
+        assert attr_map() == {("urn:b", "k"): "vb"}
 
     def test_parent(self):
         doc = parse("<root><child/></root>")
@@ -453,6 +594,14 @@ class TestQName:
         assert q.prefix == "ns"
         assert q.prefixed_name == "ns:item"
 
+    def test_rejects_invalid_names(self):
+        # QName stores local name and prefix separately, so each must be an
+        # NCName.  This mirrors the validation used by DOM construction.
+        with pytest.raises(ValueError):
+            QName("bad name")
+        with pytest.raises(ValueError):
+            QName("item", namespace_uri="urn:test", prefix="bad prefix")
+
     def test_prefixed_name_no_prefix(self):
         q = QName("root")
         assert q.prefixed_name == "root"
@@ -488,8 +637,20 @@ class TestQName:
         assert "urn:test" in repr(q)
 
     def test_str(self):
-        q = QName("item", prefix="ns")
+        # A prefix is only meaningful alongside a namespace URI.
+        q = QName("item", namespace_uri="urn:test", prefix="ns")
         assert str(q) == "ns:item"
+
+    def test_prefix_without_namespace_rejected(self):
+        # QName enforces the same invariants as the DOM builders: a prefix
+        # without a namespace URI, or a reserved xml/xmlns binding, is rejected
+        # at construction rather than producing an invalid QName downstream.
+        with pytest.raises(ValueError):
+            QName("item", prefix="ns")
+        with pytest.raises(ValueError):
+            QName("item", namespace_uri="urn:test", prefix="xmlns")
+        with pytest.raises(ValueError):
+            QName("item", namespace_uri="urn:test", prefix="xml")
 
 
 # ============================================================================
@@ -802,6 +963,13 @@ class TestXmlWriter:
         w.processing_instruction("target", None)
         assert "<?target?>" in w.to_string()
 
+    def test_processing_instruction_rejects_invalid_target(self):
+        # XmlWriter is intentionally low-level, but element/attribute/PI names
+        # are still structural XML and are not escaped by the writer.
+        w = XmlWriter()
+        with pytest.raises(ValueError):
+            w.processing_instruction("bad target", "data")
+
     def test_empty_element(self):
         w = XmlWriter()
         w.empty_element("br")
@@ -811,6 +979,21 @@ class TestXmlWriter:
         w = XmlWriter()
         w.empty_element_expanded("br")
         assert w.to_string() == "<br></br>"
+
+    def test_rejects_invalid_names(self):
+        # raw() remains the explicit escape hatch for trusted XML fragments;
+        # the structured writer methods reject names that would inject markup.
+        w = XmlWriter()
+        with pytest.raises(ValueError):
+            w.start_element('x/><evil attr="1"')
+        with pytest.raises(ValueError):
+            w.start_element("root", [('a="v"/><evil foo', "z")])
+        with pytest.raises(ValueError):
+            w.end_element('x injected="1"')
+        with pytest.raises(ValueError):
+            w.empty_element("bad name")
+        with pytest.raises(ValueError):
+            w.empty_element_expanded("bad name")
 
     def test_raw(self):
         w = XmlWriter()
@@ -987,6 +1170,29 @@ class TestExceptions:
     def test_xsd_validation_error_exception(self):
         """XsdValidationError should be a valid exception class."""
         assert issubclass(XsdValidationError, Exception)
+
+    def test_exception_module_is_public_package(self):
+        """Exceptions report ``__module__ == 'pyuppsala'`` so tracebacks and
+        pickling resolve via the public package re-exports (there is no
+        importable top-level ``_pyuppsala`` module)."""
+        for exc in (
+            XmlParseError,
+            XmlWellFormednessError,
+            XmlNamespaceError,
+            XPathError,
+            XsdValidationError,
+        ):
+            assert exc.__module__ == "pyuppsala"
+
+    def test_exception_is_picklable(self):
+        """A custom exception round-trips through pickle (regression: a bad
+        ``__module__`` previously made this raise ``PicklingError``)."""
+        import pickle
+
+        original = XmlParseError("boom")
+        restored = pickle.loads(pickle.dumps(original))
+        assert isinstance(restored, XmlParseError)
+        assert str(restored) == "boom"
 
 
 # ============================================================================

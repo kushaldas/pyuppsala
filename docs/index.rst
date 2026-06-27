@@ -15,8 +15,11 @@ Features
 - **XSD 1.1 validation** with 44+ built-in types, facets, identity constraints
 - **XSD regex** pattern matching
 - **XmlWriter** for imperative XML construction
+- **lxml.etree-compatible API** via :mod:`pyuppsala.etree` -- a drop-in for much
+  of ``lxml.etree`` backed by Uppsala's secure parser
 - **SIMD-accelerated** parsing on x86_64
-- **Zero Python dependencies** -- ships as a single native extension
+- **Zero Python dependencies** -- ships as a native extension plus a thin
+  pure-Python ``etree`` layer
 
 .. toctree::
    :maxdepth: 2
@@ -24,5 +27,6 @@ Features
 
    quickstart
    api
+   etree
    exceptions
    examples
