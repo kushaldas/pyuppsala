@@ -123,9 +123,16 @@ _namespace_map = {
 # cannot smuggle tag delimiters, quotes, or whitespace into element/attribute
 # positions.  The etree layer uses NCName because namespace URI and prefix are
 # tracked separately.
+# The exact XML 1.0 NCNameStartChar / NCNameChar code-point sets, kept in sync
+# with is_xml_name_start / is_xml_name_char in src/lib.rs. Spelled out range by
+# range (rather than a single \xC0-\uD7FF span) so disallowed code points such
+# as U+00D7, U+00F7, and the combining marks at U+0300..U+036F are excluded from
+# the start set, and only valid names round-trip through other XML parsers.
 _NCNAME_START = (
-    r"A-Z_a-z\xC0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD"
-    r"\U00010000-\U000EFFFF"
+    r"A-Z_a-z"
+    r"\xC0-\xD6\xD8-\xF6\xF8-\u02FF\u0370-\u037D\u037F-\u1FFF"
+    r"\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF"
+    r"\uF900-\uFDCF\uFDF0-\uFFFD\U00010000-\U000EFFFF"
 )
 _NCNAME_CHAR = _NCNAME_START + r"\-.0-9\xB7\u0300-\u036F\u203F-\u2040"
 _NCNAME_RE = re.compile(r"^[%s][%s]*$" % (_NCNAME_START, _NCNAME_CHAR))

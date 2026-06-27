@@ -56,11 +56,22 @@ fn xml_error_to_pyerr(e: XmlError) -> PyErr {
 }
 
 fn is_xml_name_start(c: char) -> bool {
+    // The exact XML 1.0 NameStartChar production. The ranges are kept literal
+    // (rather than a single 0xC0..=0xD7FF span) so disallowed code points such
+    // as U+00D7, U+00F7, and the combining marks at U+0300..U+036F are excluded.
     let u = c as u32;
     c == ':'
         || c == '_'
         || c.is_ascii_alphabetic()
-        || (0x00C0..=0xD7FF).contains(&u)
+        || (0x00C0..=0x00D6).contains(&u)
+        || (0x00D8..=0x00F6).contains(&u)
+        || (0x00F8..=0x02FF).contains(&u)
+        || (0x0370..=0x037D).contains(&u)
+        || (0x037F..=0x1FFF).contains(&u)
+        || (0x200C..=0x200D).contains(&u)
+        || (0x2070..=0x218F).contains(&u)
+        || (0x2C00..=0x2FEF).contains(&u)
+        || (0x3001..=0xD7FF).contains(&u)
         || (0xF900..=0xFDCF).contains(&u)
         || (0xFDF0..=0xFFFD).contains(&u)
         || (0x10000..=0xEFFFF).contains(&u)
@@ -266,10 +277,12 @@ impl QName {
         prefix: Option<String>,
     ) -> PyResult<Self> {
         validate_ncname(&local_name, "local")?;
-        if let Some(p) = prefix.as_deref() {
-            validate_prefix(Some(p))?;
-        }
-        let prefix = prefix.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        // Enforce the same QName invariants as the DOM builders (a prefix
+        // requires a namespace URI, plus the reserved xml/xmlns bindings) and
+        // normalize an empty prefix to None, so a QName can never represent a
+        // name that create_element/set_attribute/set_qname would reject.
+        let prefix =
+            validate_qname_parts(namespace_uri.as_deref(), prefix.as_deref())?.map(str::to_string);
         Ok(QName {
             namespace_uri,
             prefix,

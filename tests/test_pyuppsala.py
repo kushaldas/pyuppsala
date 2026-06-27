@@ -637,8 +637,20 @@ class TestQName:
         assert "urn:test" in repr(q)
 
     def test_str(self):
-        q = QName("item", prefix="ns")
+        # A prefix is only meaningful alongside a namespace URI.
+        q = QName("item", namespace_uri="urn:test", prefix="ns")
         assert str(q) == "ns:item"
+
+    def test_prefix_without_namespace_rejected(self):
+        # QName enforces the same invariants as the DOM builders: a prefix
+        # without a namespace URI, or a reserved xml/xmlns binding, is rejected
+        # at construction rather than producing an invalid QName downstream.
+        with pytest.raises(ValueError):
+            QName("item", prefix="ns")
+        with pytest.raises(ValueError):
+            QName("item", namespace_uri="urn:test", prefix="xmlns")
+        with pytest.raises(ValueError):
+            QName("item", namespace_uri="urn:test", prefix="xml")
 
 
 # ============================================================================
