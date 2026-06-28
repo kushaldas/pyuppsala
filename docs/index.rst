@@ -1,9 +1,11 @@
 pyuppsala documentation
 =======================
 
-**pyuppsala** is a Python binding for the `Uppsala <https://crates.io/crates/uppsala>`_
-XML library -- a zero-dependency, pure-Rust implementation of XML 1.0, Namespaces,
-XPath 1.0, and XSD validation.
+**pyuppsala** is a Python binding for the `Uppsala
+<https://crates.io/crates/uppsala>`_ XML library -- a zero-dependency,
+pure-Rust implementation of XML 1.0, Namespaces, XPath 1.0, and XSD validation.
+
+This release is against `0.5.0` of Uppsala library.
 
 Features
 --------
