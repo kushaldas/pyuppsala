@@ -1,11 +1,13 @@
 # pyuppsala
 
 Python bindings for the [Uppsala](https://crates.io/crates/uppsala) XML library
--- a zero-dependency, pure-Rust implementation of XML 1.0, Namespaces, XPath 1.0,
-and XSD validation.
+-- a zero-dependency, pure-Rust implementation of XML 1.0, Namespaces, XPath
+1.0, and XSD validation.
 
-pyuppsala gives you a fast, correct, and memory-safe XML toolkit from Python with
-no C dependencies to compile and no transitive native libraries to audit.
+pyuppsala gives you a fast, correct, and memory-safe XML toolkit from Python
+with no C dependencies to compile and no transitive native libraries to audit.
+
+This release is against `0.5.0` of Uppsala library.
 
 ## Features
 
