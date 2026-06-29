@@ -1,7 +1,10 @@
 # Changelog
 
 
-## 0.5.0
+## 0.5.1
+
+First released version of the 0.5.x line (0.5.0 was never published). Built
+against uppsala 0.5.1.
 
 ### Breaking Changes
 
@@ -32,6 +35,19 @@ XML, raising `ValueError`:
   attribute names and PI targets and can now raise `ValueError`.
 
 ### Added
+
+#### Opt-in DTD / entity hardening (defusedxml-style)
+
+`parse`, `parse_bytes`, `Document`, and `Document.from_bytes` accept two new
+keyword-only arguments (both default off, so existing behavior is unchanged):
+
+- `forbid_dtd=True` rejects any `<!DOCTYPE` declaration at parse time.
+- `forbid_entities=True` rejects `<!ENTITY>` declarations (general and
+  parameter) while still allowing the rest of a DTD.
+
+The `etree.XMLParser` facade gains the same `forbid_dtd` / `forbid_entities`
+options. Backed by uppsala 0.5.1's `Parser::with_forbid_dtd` /
+`with_forbid_entities`.
 
 #### `pyuppsala.etree` — an `lxml.etree`-compatible API
 

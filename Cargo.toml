@@ -1,6 +1,6 @@
 [package]
 name = "pyuppsala"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Python bindings for the Uppsala XML library"
 license = "BSD-2-Clause"
@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py310"] }
-uppsala = "0.5.0"
+uppsala = "0.5.1"

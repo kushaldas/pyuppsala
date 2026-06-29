@@ -250,6 +250,8 @@ class Document:
         max_depth: Optional[int] = None,
         max_entity_expansion: Optional[int] = None,
         namespace_aware: Optional[bool] = None,
+        forbid_dtd: Optional[bool] = None,
+        forbid_entities: Optional[bool] = None,
     ) -> None:
         """Parse an XML string into a Document.
 
@@ -268,6 +270,8 @@ class Document:
         max_depth: Optional[int] = None,
         max_entity_expansion: Optional[int] = None,
         namespace_aware: Optional[bool] = None,
+        forbid_dtd: Optional[bool] = None,
+        forbid_entities: Optional[bool] = None,
     ) -> Document:
         """Parse XML from bytes, with automatic encoding detection (UTF-8/UTF-16).
 
@@ -563,6 +567,8 @@ def parse(
     max_depth: Optional[int] = None,
     max_entity_expansion: Optional[int] = None,
     namespace_aware: Optional[bool] = None,
+    forbid_dtd: Optional[bool] = None,
+    forbid_entities: Optional[bool] = None,
 ) -> Document:
     """Parse an XML string and return a Document.
 
@@ -577,6 +583,8 @@ def parse_bytes(
     max_depth: Optional[int] = None,
     max_entity_expansion: Optional[int] = None,
     namespace_aware: Optional[bool] = None,
+    forbid_dtd: Optional[bool] = None,
+    forbid_entities: Optional[bool] = None,
 ) -> Document:
     """Parse XML bytes and return a Document, with automatic encoding detection.
 

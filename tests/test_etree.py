@@ -565,6 +565,27 @@ class TestStandalone:
         root = P.fromstring(xml, parser)
         assert root.tag == "r"
 
+    def test_forbid_dtd_parser_rejects_doctype(self):
+        xml = '<!DOCTYPE r SYSTEM "r.dtd"><r/>'
+        # Default parser accepts (DTD ignored); forbid_dtd rejects.
+        assert P.fromstring(xml).tag == "r"
+        parser = P.XMLParser(forbid_dtd=True)
+        with pytest.raises(P.XMLSyntaxError):
+            P.fromstring(xml, parser)
+
+    def test_forbid_entities_parser_rejects_entity_decl(self):
+        xml = '<!DOCTYPE r [ <!ENTITY x "y"> ]><r>&x;</r>'
+        assert P.fromstring(xml).tag == "r"
+        parser = P.XMLParser(forbid_entities=True)
+        with pytest.raises(P.XMLSyntaxError):
+            P.fromstring(xml, parser)
+
+    def test_forbid_entities_allows_entity_free_dtd(self):
+        # Narrower than forbid_dtd: an <!ELEMENT>-only DTD is still accepted.
+        xml = "<!DOCTYPE r [ <!ELEMENT r EMPTY> ]><r/>"
+        parser = P.XMLParser(forbid_entities=True)
+        assert P.fromstring(xml, parser).tag == "r"
+
     def test_identity_stability(self):
         root = P.fromstring(SAMPLE)
         assert root[0] is root[0]
