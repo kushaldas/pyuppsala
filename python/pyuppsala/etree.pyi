@@ -233,6 +233,8 @@ class XMLParser:
         max_depth: Optional[int] = None,
         max_entity_expansion: Optional[int] = None,
         namespace_aware: Optional[bool] = None,
+        forbid_dtd: bool = False,
+        forbid_entities: bool = False,
         collect_ids: bool = True,
         compact: bool = True,
         target: Any = None,

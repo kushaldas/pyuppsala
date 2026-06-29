@@ -1795,3 +1795,74 @@ class TestDoctype:
     def test_include_doctype_noop_without_doctype(self):
         doc = parse("<root/>")
         assert doc.to_xml_with_options(include_doctype=True) == "<root/>"
+
+
+# ============================================================================
+# Opt-in DTD / entity hardening (defusedxml-style switches)
+# ============================================================================
+
+
+class TestForbidDtd:
+    DOCTYPE_XML = '<!DOCTYPE root SYSTEM "r.dtd"><root/>'
+    ENTITY_XML = '<!DOCTYPE root [ <!ENTITY x "y"> ]><root>&x;</root>'
+    PARAM_ENTITY_XML = '<!DOCTYPE root [ <!ENTITY % p "<!ELEMENT root EMPTY>"> ]><root/>'
+    ELEMENT_ONLY_DTD = "<!DOCTYPE root [ <!ELEMENT root EMPTY> ]><root/>"
+
+    def test_defaults_still_parse_dtd_and_entities(self):
+        # Both flags off (default): existing behavior is unchanged.
+        assert parse(self.DOCTYPE_XML).document_element is not None
+        assert parse(self.ENTITY_XML).document_element is not None
+
+    def test_forbid_dtd_rejects_doctype(self):
+        with pytest.raises(XmlParseError):
+            parse(self.DOCTYPE_XML, forbid_dtd=True)
+
+    def test_forbid_dtd_false_is_noop(self):
+        assert parse(self.DOCTYPE_XML, forbid_dtd=False).document_element is not None
+
+    def test_forbid_dtd_allows_dtd_free(self):
+        assert parse("<root/>", forbid_dtd=True).document_element is not None
+
+    def test_forbid_dtd_parse_bytes(self):
+        with pytest.raises(XmlParseError):
+            parse_bytes(self.DOCTYPE_XML.encode(), forbid_dtd=True)
+
+    def test_forbid_entities_rejects_general_entity(self):
+        with pytest.raises(XmlParseError):
+            parse(self.ENTITY_XML, forbid_entities=True)
+
+    def test_forbid_entities_rejects_parameter_entity(self):
+        with pytest.raises(XmlParseError):
+            parse(self.PARAM_ENTITY_XML, forbid_entities=True)
+
+    def test_forbid_entities_allows_entity_free_dtd(self):
+        # Narrower than forbid_dtd: an entity-free DTD is still accepted.
+        doc = parse(self.ELEMENT_ONLY_DTD, forbid_entities=True)
+        assert doc.document_element is not None
+
+    def test_forbid_entities_parse_bytes(self):
+        with pytest.raises(XmlParseError):
+            parse_bytes(self.ENTITY_XML.encode(), forbid_entities=True)
+
+    def test_document_constructor_kwargs(self):
+        with pytest.raises(XmlParseError):
+            Document(self.DOCTYPE_XML, forbid_dtd=True)
+        with pytest.raises(XmlParseError):
+            Document(self.ENTITY_XML, forbid_entities=True)
+
+    def test_document_from_bytes_kwargs(self):
+        with pytest.raises(XmlParseError):
+            Document.from_bytes(self.DOCTYPE_XML.encode(), forbid_dtd=True)
+        with pytest.raises(XmlParseError):
+            Document.from_bytes(self.ENTITY_XML.encode(), forbid_entities=True)
+        # Flags off / entity-free DTD still parse via this entry point.
+        assert (
+            Document.from_bytes(self.DOCTYPE_XML.encode()).document_element
+            is not None
+        )
+        assert (
+            Document.from_bytes(
+                self.ELEMENT_ONLY_DTD.encode(), forbid_entities=True
+            ).document_element
+            is not None
+        )

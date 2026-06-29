@@ -1529,6 +1529,8 @@ class XMLParser:
         max_depth=None,
         max_entity_expansion=None,
         namespace_aware=None,
+        forbid_dtd=False,
+        forbid_entities=False,
         collect_ids=True,
         compact=True,
         **kwargs,
@@ -1536,10 +1538,13 @@ class XMLParser:
         """Validate and store parser options.
 
         Options that map onto uppsala's parser (``huge_tree``, ``max_depth``,
-        ``max_entity_expansion``, ``namespace_aware``) and post-parse transforms
-        (``remove_comments``, ``remove_pis``, ``strip_cdata``) are honored.
-        Options whose absence would silently change correctness raise
-        ``NotImplementedError``; purely cosmetic options are accepted and ignored.
+        ``max_entity_expansion``, ``namespace_aware``, ``forbid_dtd``,
+        ``forbid_entities``) and post-parse transforms (``remove_comments``,
+        ``remove_pis``, ``strip_cdata``) are honored. ``forbid_dtd`` rejects any
+        ``<!DOCTYPE`` at parse time and ``forbid_entities`` rejects ``<!ENTITY>``
+        declarations (defusedxml-style hardening). Options whose absence would
+        silently change correctness raise ``NotImplementedError``; purely
+        cosmetic options are accepted and ignored.
         """
         if recover:
             raise NotImplementedError("recover-mode parsing is not supported")
@@ -1564,6 +1569,8 @@ class XMLParser:
             "max_depth": max_depth,
             "max_entity_expansion": max_entity_expansion,
             "namespace_aware": namespace_aware,
+            "forbid_dtd": forbid_dtd,
+            "forbid_entities": forbid_entities,
             # Honored for byte input: overrides the document's declared encoding
             # by decoding in Python before parsing (see fromstring).
             "encoding": encoding,
@@ -1583,6 +1590,10 @@ def _parse_kwargs(opts):
         kw["max_entity_expansion"] = opts["max_entity_expansion"]
     if opts.get("namespace_aware") is not None:
         kw["namespace_aware"] = opts["namespace_aware"]
+    if opts.get("forbid_dtd"):
+        kw["forbid_dtd"] = True
+    if opts.get("forbid_entities"):
+        kw["forbid_entities"] = True
     return kw
 
 

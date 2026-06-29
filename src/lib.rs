@@ -1146,21 +1146,35 @@ impl Document {
     /// * ``max_entity_expansion`` - maximum total bytes from entity expansion
     ///   (default ``DEFAULT_MAX_ENTITY_EXPANSION``, from ``uppsala::parser``).
     /// * ``namespace_aware`` - when False, disables XML namespace processing.
+    /// * ``forbid_dtd`` - when True, reject any ``<!DOCTYPE`` at parse time.
+    /// * ``forbid_entities`` - when True, reject ``<!ENTITY>`` declarations
+    ///   (general and parameter) while still allowing the rest of a DTD.
     ///
     /// .. warning::
-    ///    Do not source these values from untrusted input. An attacker who
-    ///    controls the cap can re-enable the corresponding DoS attack class
-    ///    (deep-nesting stack overflow, billion-laughs entity expansion).
+    ///    Do not source the resource-limit kwargs (``max_depth``,
+    ///    ``max_entity_expansion``) from untrusted input. An attacker who
+    ///    controls those caps can re-enable the corresponding DoS attack class
+    ///    (deep-nesting stack overflow, billion-laughs entity expansion). This
+    ///    does not apply to ``forbid_dtd`` / ``forbid_entities``, which only
+    ///    tighten parsing.
     #[new]
-    #[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None))]
+    #[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
     fn new(
         xml: &str,
         max_depth: Option<u32>,
         max_entity_expansion: Option<usize>,
         namespace_aware: Option<bool>,
+        forbid_dtd: Option<bool>,
+        forbid_entities: Option<bool>,
     ) -> PyResult<Self> {
         let input = xml.to_string();
-        let parser = build_parser(max_depth, max_entity_expansion, namespace_aware);
+        let parser = build_parser(
+            max_depth,
+            max_entity_expansion,
+            namespace_aware,
+            forbid_dtd,
+            forbid_entities,
+        );
         let doc = parser.parse(xml).map_err(xml_error_to_pyerr)?.into_static();
         Ok(Document {
             inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
@@ -1179,15 +1193,23 @@ impl Document {
     ///    Do not source the resource-limit kwargs from untrusted input.
     ///    See :class:`Document` for details.
     #[staticmethod]
-    #[pyo3(signature = (data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None))]
+    #[pyo3(signature = (data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
     fn from_bytes(
         data: &[u8],
         max_depth: Option<u32>,
         max_entity_expansion: Option<usize>,
         namespace_aware: Option<bool>,
+        forbid_dtd: Option<bool>,
+        forbid_entities: Option<bool>,
     ) -> PyResult<Document> {
         let input = decode_xml_bytes(data)?;
-        let parser = build_parser(max_depth, max_entity_expansion, namespace_aware);
+        let parser = build_parser(
+            max_depth,
+            max_entity_expansion,
+            namespace_aware,
+            forbid_dtd,
+            forbid_entities,
+        );
         let doc = parser
             .parse(&input)
             .map_err(xml_error_to_pyerr)?
@@ -2057,14 +2079,23 @@ impl XsdRegex {
 /// See ``Document.__init__`` for the keyword arguments that override the
 /// safe parser defaults.
 #[pyfunction]
-#[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None))]
+#[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
 fn parse(
     xml: &str,
     max_depth: Option<u32>,
     max_entity_expansion: Option<usize>,
     namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
 ) -> PyResult<Document> {
-    Document::new(xml, max_depth, max_entity_expansion, namespace_aware)
+    Document::new(
+        xml,
+        max_depth,
+        max_entity_expansion,
+        namespace_aware,
+        forbid_dtd,
+        forbid_entities,
+    )
 }
 
 /// Parse XML bytes and return a Document, with automatic encoding detection.
@@ -2072,14 +2103,23 @@ fn parse(
 /// See ``Document.from_bytes`` for the keyword arguments that override
 /// the safe parser defaults.
 #[pyfunction]
-#[pyo3(signature = (data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None))]
+#[pyo3(signature = (data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
 fn parse_bytes(
     data: &[u8],
     max_depth: Option<u32>,
     max_entity_expansion: Option<usize>,
     namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
 ) -> PyResult<Document> {
-    Document::from_bytes(data, max_depth, max_entity_expansion, namespace_aware)
+    Document::from_bytes(
+        data,
+        max_depth,
+        max_entity_expansion,
+        namespace_aware,
+        forbid_dtd,
+        forbid_entities,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2090,6 +2130,8 @@ fn build_parser(
     max_depth: Option<u32>,
     max_entity_expansion: Option<usize>,
     namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
 ) -> UParser {
     let mut parser = match namespace_aware {
         Some(false) => UParser::with_namespace_aware(false),
@@ -2100,6 +2142,12 @@ fn build_parser(
     }
     if let Some(b) = max_entity_expansion {
         parser = parser.with_max_entity_expansion(b);
+    }
+    if let Some(true) = forbid_dtd {
+        parser = parser.with_forbid_dtd(true);
+    }
+    if let Some(true) = forbid_entities {
+        parser = parser.with_forbid_entities(true);
     }
     parser
 }
