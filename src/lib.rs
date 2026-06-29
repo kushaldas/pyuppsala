@@ -1436,23 +1436,13 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element_mut(node.id) {
-            Some(el) => {
-                let p = prefix.unwrap_or("");
-                match el
-                    .namespace_declarations
-                    .iter_mut()
-                    .find(|(existing, _)| existing.as_ref() == p)
-                {
-                    Some(slot) => slot.1 = std::borrow::Cow::Owned(uri.to_string()),
-                    None => el.namespace_declarations.push((
-                        std::borrow::Cow::Owned(p.to_string()),
-                        std::borrow::Cow::Owned(uri.to_string()),
-                    )),
-                }
-                Ok(())
-            }
-            None => Err(PyValueError::new_err("Node is not an element")),
+        if guard
+            .doc
+            .declare_namespace(node.id, prefix, uri.to_string())
+        {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err("Node is not an element"))
         }
     }
 

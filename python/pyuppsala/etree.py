@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import warnings
 from weakref import WeakValueDictionary
 
 from . import _elementpath as ElementPath
@@ -539,6 +540,13 @@ def _attach(holder, parent_node, node, tail, ref=None):
 def _build_element(holder, tag, nsmap):
     nsmap = _validate_nsmap(nsmap)
     ns, local = _split_key(tag)
+    # lxml parity: a bare tag (no Clark namespace) combined with a default
+    # declaration in nsmap places the element *in* that default namespace.
+    # Otherwise the element would be in no namespace while carrying an
+    # xmlns="uri" declaration, which the serializer resolves to xmlns="" and
+    # the URI would be lost.
+    if ns is None and nsmap and nsmap.get(None):
+        ns = nsmap[None]
     prefix = _prefix_for_ns(ns, nsmap) if ns else None
     node = holder.doc.create_element(local, ns, prefix)
     if nsmap:
@@ -813,7 +821,28 @@ class _Element:
 
         For namespaced attributes, ensures a usable prefix is in scope (declaring
         one if needed) so the attribute serializes correctly.
+
+        ``set("xmlns", uri)`` and ``set("xmlns:<prefix>", uri)`` are treated as
+        namespace *declarations* (matching ``lxml``), recorded on the element so
+        they serialize as real ``xmlns`` output rather than a sanitized
+        ``xmlns_`` attribute. Use ``nsmap`` at construction time for the common
+        case; this is the in-place equivalent.
         """
+        if isinstance(key, str):
+            if key == "xmlns":
+                self._holder.doc.set_namespace_declaration(self._node, None, value)
+                # Place a no-namespace element into the newly declared default
+                # namespace so the URI is not dropped as xmlns="" on output
+                # (matches Element(tag, nsmap={None: uri})).
+                q = self._node.tag
+                if value and q.namespace_uri is None:
+                    self._node.set_qname(q.local_name, value, None)
+                return
+            if key.startswith("xmlns:"):
+                self._holder.doc.set_namespace_declaration(
+                    self._node, key[len("xmlns:") :], value
+                )
+                return
         ns, local = _split_key(key)
         prefix = None
         if ns:
@@ -1545,9 +1574,18 @@ class XMLParser:
         declarations (defusedxml-style hardening). Options whose absence would
         silently change correctness raise ``NotImplementedError``; purely
         cosmetic options are accepted and ignored.
+
+        ``recover=True`` is accepted for ``lxml`` compatibility but has no effect:
+        uppsala has no error-recovery mode and always parses strictly, so a
+        :class:`UserWarning` is emitted and malformed input still raises
+        :class:`XMLSyntaxError` rather than being repaired.
         """
         if recover:
-            raise NotImplementedError("recover-mode parsing is not supported")
+            warnings.warn(
+                "recover=True is not supported by pyuppsala; parsing strictly "
+                "instead (malformed input will raise XMLSyntaxError)",
+                stacklevel=2,
+            )
         if dtd_validation or load_dtd:
             raise NotImplementedError("DTD processing is not supported")
         if not resolve_entities:
@@ -1986,6 +2024,16 @@ class XMLSchema:
         if not self.validate(tree):
             messages = "; ".join(e.message for e in self.error_log)
             raise DocumentInvalid(messages or "Document does not validate")
+
+    def assert_(self, tree):
+        """Raise :class:`AssertionError` if ``tree`` does not validate.
+
+        Mirrors ``lxml.etree.XMLSchema.assert_``; existing lxml code that
+        catches ``AssertionError`` keeps working.
+        """
+        if not self.validate(tree):
+            messages = "; ".join(e.message for e in self.error_log)
+            raise AssertionError(messages or "Document does not validate")
 
     def __call__(self, tree):
         """Return True if ``tree`` validates (alias for :meth:`validate`)."""

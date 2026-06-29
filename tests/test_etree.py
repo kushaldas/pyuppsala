@@ -498,13 +498,33 @@ class TestStandalone:
 
     def test_unsupported_parser_options_raise(self):
         for kwargs in (
-            {"recover": True},
             {"dtd_validation": True},
             {"load_dtd": True},
             {"resolve_entities": False},
         ):
             with pytest.raises(NotImplementedError):
                 P.XMLParser(**kwargs)
+
+    def test_recover_warns_and_is_ignored(self):
+        # recover=True has no effect (uppsala parses strictly) but must not
+        # hard-fail, so lxml code passing recover=True keeps running.
+        with pytest.warns(UserWarning):
+            parser = P.XMLParser(recover=True)
+        # Well-formed input still parses; malformed input still raises.
+        assert P.fromstring("<a><b/></a>", parser).tag == "a"
+        with pytest.raises(P.XMLSyntaxError):
+            P.fromstring("<a><b></a>", parser)
+
+    def test_schema_assert_raises_assertionerror(self):
+        # lxml parity: assert_() raises AssertionError, assertValid() raises
+        # DocumentInvalid.
+        schema = P.XMLSchema(P.fromstring(SCHEMA))
+        schema.assert_(P.fromstring("<note>hi</note>"))  # valid: no raise
+        bad = P.fromstring("<wrong/>")
+        with pytest.raises(AssertionError):
+            schema.assert_(bad)
+        with pytest.raises(P.DocumentInvalid):
+            schema.assertValid(bad)
 
     def test_cosmetic_parser_options_ignored(self):
         parser = P.XMLParser(collect_ids=False, compact=False, no_network=True)
@@ -862,6 +882,35 @@ class TestStandalone:
         assert P.tostring(root, encoding="unicode") == (
             '<root xmlns="urn:d"><renamed/></root>'
         )
+
+    def test_nsmap_default_on_bare_tag_preserves_uri(self):
+        # Issue #6 item 4: Element(tag, nsmap={None: uri}) with a bare tag used
+        # to serialize as xmlns="" (URI lost). The element is now placed in the
+        # default namespace and the URI is preserved.
+        uri = "http://www.opengis.net/kml/2.2"
+        root = P.Element("kml", nsmap={None: uri})
+        assert P.tostring(root, encoding="unicode") == '<kml xmlns="%s"/>' % uri
+        assert root.tag == "{%s}kml" % uri
+        reparsed = P.fromstring(P.tostring(root, encoding="unicode"))
+        assert reparsed.tag == "{%s}kml" % uri
+
+    def test_set_xmlns_declares_default_namespace(self):
+        # Issue #6 item 3: set("xmlns", uri) is a namespace declaration, not an
+        # xmlns_ attribute. The element is placed in that default namespace.
+        uri = "http://www.opengis.net/kml/2.2"
+        root = P.Element("kml")
+        root.set("xmlns", uri)
+        out = P.tostring(root, encoding="unicode")
+        assert "xmlns_" not in out, out
+        assert out == '<kml xmlns="%s"/>' % uri
+        assert root.get("xmlns") is None  # not stored as an attribute
+
+    def test_set_xmlns_prefixed_declares_prefix(self):
+        # set("xmlns:p", uri) declares prefix p rather than setting an attribute.
+        el = P.Element("a")
+        el.set("xmlns:foo", "urn:foo")
+        out = P.tostring(el, encoding="unicode")
+        assert out == '<a xmlns:foo="urn:foo"/>', out
 
     def test_index_non_element_raises_valueerror(self):
         root = P.fromstring("<r><a/></r>")

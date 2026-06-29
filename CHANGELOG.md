@@ -1,6 +1,38 @@
 # Changelog
 
 
+## 0.5.2
+
+Built against uppsala 0.5.2. Resolves the fastkml integration report (issue #6).
+
+### Added
+
+- `etree.Element(tag, nsmap={None: uri})` with a bare (non-Clark) tag now
+  places the element in that default namespace and serializes as `xmlns="uri"`,
+  instead of dropping the URI as `xmlns=""`.
+- `element.set("xmlns", uri)` and `element.set("xmlns:<prefix>", uri)` are now
+  treated as namespace declarations (lxml parity), serializing as real `xmlns`
+  output rather than a sanitized `xmlns_` attribute. The default form also
+  places a no-namespace element in the declared namespace.
+- `etree.XMLSchema` gains an `assert_()` method (lxml parity) that raises
+  `AssertionError` on an invalid document, alongside the existing
+  `assertValid()` which raises `DocumentInvalid`.
+- Valid KML now validates: uppsala 0.5.2 fixes XSD `xs:choice` content models
+  whose alternatives are all optional, so e.g.
+  `<Document><Placemark/></Document>` no longer reports "does not match any
+  choice alternative".
+
+### Changed
+
+- Requires uppsala 0.5.2. Namespace declarations are recorded via uppsala's new
+  `Document::declare_namespace` helper rather than mutating the declaration list
+  directly.
+- `etree.XMLParser(recover=True)` no longer raises `NotImplementedError`; it
+  emits a `UserWarning` and is ignored (uppsala parses strictly), so lxml code
+  passing `recover=True` keeps running. Malformed input still raises
+  `XMLSyntaxError`.
+
+
 ## 0.5.1
 
 First released version of the 0.5.x line (0.5.0 was never published). Built
