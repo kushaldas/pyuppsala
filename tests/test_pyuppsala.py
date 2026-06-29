@@ -1849,3 +1849,20 @@ class TestForbidDtd:
             Document(self.DOCTYPE_XML, forbid_dtd=True)
         with pytest.raises(XmlParseError):
             Document(self.ENTITY_XML, forbid_entities=True)
+
+    def test_document_from_bytes_kwargs(self):
+        with pytest.raises(XmlParseError):
+            Document.from_bytes(self.DOCTYPE_XML.encode(), forbid_dtd=True)
+        with pytest.raises(XmlParseError):
+            Document.from_bytes(self.ENTITY_XML.encode(), forbid_entities=True)
+        # Flags off / entity-free DTD still parse via this entry point.
+        assert (
+            Document.from_bytes(self.DOCTYPE_XML.encode()).document_element
+            is not None
+        )
+        assert (
+            Document.from_bytes(
+                self.ELEMENT_ONLY_DTD.encode(), forbid_entities=True
+            ).document_element
+            is not None
+        )

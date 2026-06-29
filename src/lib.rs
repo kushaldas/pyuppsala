@@ -1151,9 +1151,12 @@ impl Document {
     ///   (general and parameter) while still allowing the rest of a DTD.
     ///
     /// .. warning::
-    ///    Do not source these values from untrusted input. An attacker who
-    ///    controls the cap can re-enable the corresponding DoS attack class
-    ///    (deep-nesting stack overflow, billion-laughs entity expansion).
+    ///    Do not source the resource-limit kwargs (``max_depth``,
+    ///    ``max_entity_expansion``) from untrusted input. An attacker who
+    ///    controls those caps can re-enable the corresponding DoS attack class
+    ///    (deep-nesting stack overflow, billion-laughs entity expansion). This
+    ///    does not apply to ``forbid_dtd`` / ``forbid_entities``, which only
+    ///    tighten parsing.
     #[new]
     #[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
     fn new(
