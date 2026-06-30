@@ -1,6 +1,20 @@
 # Changelog
 
 
+## 0.6.0
+
+Built against uppsala 0.6.0, which brings the SIMD / lookup-table byte-scanning
+and `try_reserve` arena pre-allocation parser performance work — pyuppsala
+inherits these transparently through the dependency upgrade.
+
+### Build
+
+- The release profile now uses fat LTO and a single codegen unit
+  (`[profile.release] lto = "fat"`, `codegen-units = 1`). Since the cdylib is the
+  final compiled artifact, this lets uppsala's hot scanning loops inline across
+  the crate boundary into pyuppsala's call sites.
+
+
 ## 0.5.1
 
 First released version of the 0.5.x line (0.5.0 was never published). Built

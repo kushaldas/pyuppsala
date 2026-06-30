@@ -5,7 +5,7 @@ pyuppsala documentation
 <https://crates.io/crates/uppsala>`_ XML library -- a zero-dependency,
 pure-Rust implementation of XML 1.0, Namespaces, XPath 1.0, and XSD validation.
 
-This release is against `0.5.1` of Uppsala library.
+This release is against `0.6.0` of Uppsala library.
 
 Features
 --------
