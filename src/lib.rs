@@ -479,6 +479,22 @@ impl Node {
         Ok(guard.doc.text_content_deep(self.id))
     }
 
+    /// For attribute nodes (e.g. from an XPath ``@name`` / attribute-axis
+    /// selection), the attribute's string value; ``None`` for every other node
+    /// kind. The etree layer uses this to return attribute values as plain
+    /// strings, matching lxml's ``xpath("...//@attr")``.
+    #[getter]
+    fn attribute_value(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.node_kind(self.id) {
+            Some(NodeKind::Attribute(_, value)) => Ok(Some(value.to_string())),
+            _ => Ok(None),
+        }
+    }
+
     /// The text of the first Text or CDATA child, or None.
     ///
     /// This is a fast, zero-copy way to get the text content of simple elements
@@ -2070,6 +2086,51 @@ impl XsdRegex {
     }
 }
 
+/// A compiled XSLT 1.0 stylesheet.
+///
+/// Compiling once and transforming many documents avoids re-parsing and
+/// re-compiling the stylesheet on every call (the `pyuppsala.etree.XSLT`
+/// facade caches one of these per stylesheet). The compiled form fully owns
+/// its data, so the stylesheet text need not outlive this object.
+#[pyclass(name = "Xslt")]
+struct Xslt {
+    inner: uppsala::xslt::Stylesheet,
+}
+
+#[pymethods]
+impl Xslt {
+    /// Compile an XSLT 1.0 stylesheet from its XML source text.
+    ///
+    /// ``exslt`` enables the opt-in EXSLT extension-function library
+    /// (``str:``/``math:``/``set:``/``exsl:``); ``date:date-time()`` is always
+    /// available. Defaults to ``True`` to match lxml, which ships EXSLT on.
+    /// ``max_depth`` overrides the template-activation recursion cap.
+    #[new]
+    #[pyo3(signature = (stylesheet_xml, *, exslt=true, max_depth=None))]
+    fn new(stylesheet_xml: &str, exslt: bool, max_depth: Option<u32>) -> PyResult<Self> {
+        let style_doc = UParser::new()
+            .parse(stylesheet_xml)
+            .map_err(xml_error_to_pyerr)?;
+        let mut sheet =
+            uppsala::xslt::Stylesheet::compile(&style_doc).map_err(xml_error_to_pyerr)?;
+        if let Some(d) = max_depth {
+            sheet = sheet.set_max_depth(d);
+        }
+        sheet = sheet.with_exslt(exslt);
+        Ok(Xslt { inner: sheet })
+    }
+
+    /// Apply the stylesheet to a source XML string, returning the serialized
+    /// result. The source is parsed and prepared for XPath internally.
+    fn transform(&self, source_xml: &str) -> PyResult<String> {
+        let mut source = UParser::new()
+            .parse(source_xml)
+            .map_err(xml_error_to_pyerr)?;
+        source.prepare_xpath();
+        self.inner.transform(&source).map_err(xml_error_to_pyerr)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Module-level convenience functions
 // ---------------------------------------------------------------------------
@@ -2268,6 +2329,7 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ValidationErrorPy>()?;
     m.add_class::<XmlWriter>()?;
     m.add_class::<XsdRegex>()?;
+    m.add_class::<Xslt>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(parse, m)?)?;
@@ -2295,6 +2357,8 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "DEFAULT_MAX_REGEX_STEPS",
         uppsala::xsd_regex::DEFAULT_MAX_REGEX_STEPS,
     )?;
+    // XSLT template-activation recursion cap (uppsala XSLT 1.0 engine).
+    m.add("DEFAULT_MAX_XSLT_DEPTH", uppsala::xslt::DEFAULT_MAX_XSLT_DEPTH)?;
 
     // Exceptions
     m.add("XmlParseError", m.py().get_type::<XmlParseError>())?;

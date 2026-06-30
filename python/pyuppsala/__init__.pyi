@@ -559,6 +559,28 @@ class XsdRegex:
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
 
+class Xslt:
+    """A compiled XSLT 1.0 stylesheet.
+
+    Compile once and transform many documents to avoid re-parsing and
+    re-compiling the stylesheet on every call.
+    """
+
+    def __init__(
+        self, stylesheet_xml: str, *, exslt: bool = True, max_depth: Optional[int] = None
+    ) -> None:
+        """Compile an XSLT 1.0 stylesheet from its XML source text.
+
+        ``exslt`` enables the opt-in EXSLT extension-function library
+        (``str:``/``math:``/``set:``/``exsl:``); ``date:date-time()`` is always
+        available. ``max_depth`` overrides the template-activation recursion cap
+        (see ``DEFAULT_MAX_XSLT_DEPTH``).
+        """
+        ...
+    def transform(self, source_xml: str) -> str:
+        """Apply the stylesheet to a source XML string, returning the result."""
+        ...
+
 # Module-level functions
 
 def parse(
@@ -615,3 +637,6 @@ DEFAULT_MAX_REGEX_GROUP_DEPTH: int
 
 DEFAULT_MAX_REGEX_STEPS: int
 """Default maximum backtracking steps when matching an XSD regex (from uppsala's xsd_regex::DEFAULT_MAX_REGEX_STEPS)."""
+
+DEFAULT_MAX_XSLT_DEPTH: int
+"""Default maximum XSLT template-activation recursion depth (from uppsala's xslt::DEFAULT_MAX_XSLT_DEPTH)."""

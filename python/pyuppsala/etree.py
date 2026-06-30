@@ -53,6 +53,8 @@ __all__ = [
     "XMLParser",
     "register_namespace",
     "XMLSchema",
+    # Transformation
+    "XSLT",
     # Exceptions
     "LxmlError",
     "Error",
@@ -63,6 +65,10 @@ __all__ = [
     "XPathSyntaxError",
     "DocumentInvalid",
     "XMLSchemaParseError",
+    "XSLTError",
+    "XSLTParseError",
+    "XSLTApplyError",
+    "XIncludeError",
 ]
 
 
@@ -99,11 +105,33 @@ class XPathSyntaxError(XPathError, SyntaxError):
 
 
 class DocumentInvalid(LxmlError):
-    """Raised by ``XMLSchema.assertValid`` when a document fails validation."""
+    """Raised by ``XMLSchema.assertValid`` when a document fails validation.
+
+    Carries an ``error_log`` list of validation errors (lxml-compatible);
+    populated by ``assertValid`` and otherwise an empty list.
+    """
+
+    error_log = []
 
 
 class XMLSchemaParseError(LxmlError):
     """Raised when an XSD schema cannot be built."""
+
+
+class XSLTError(LxmlError):
+    """Base class for XSLT errors."""
+
+
+class XSLTParseError(XSLTError):
+    """Raised when an XSLT stylesheet cannot be compiled."""
+
+
+class XSLTApplyError(XSLTError):
+    """Raised when applying a compiled XSLT stylesheet fails."""
+
+
+class XIncludeError(LxmlError):
+    """Raised when XInclude processing fails (and no fallback applies)."""
 
 
 # ---------------------------------------------------------------------------
@@ -312,12 +340,14 @@ _TEXT_KINDS = ("text", "cdata")
 class _DocHolder:
     """Owns one native Document and an identity-stable proxy cache."""
 
-    __slots__ = ("doc", "_proxies", "_ns_counter", "__weakref__")
+    __slots__ = ("doc", "_proxies", "_ns_counter", "base_url", "__weakref__")
 
     def __init__(self, doc):
         self.doc = doc
         self._proxies = WeakValueDictionary()
         self._ns_counter = 0
+        # Base URL/path for resolving relative XInclude hrefs (set by parse()).
+        self.base_url = None
 
     def proxy(self, node):
         """Return the identity-stable ``_Element`` wrapper for ``node``.
@@ -1024,6 +1054,20 @@ class _Element:
         _apply_attribs(el, attrib, extra)
         return el
 
+    def __copy__(self):
+        """Return a detached deep copy in its own document (lxml copies subtrees)."""
+        return self.__deepcopy__(None)
+
+    def __deepcopy__(self, memo):
+        """Return a detached deep copy of this element and its subtree.
+
+        Serializing (with inherited namespace declarations) and reparsing yields
+        an independent element in a fresh document, matching lxml, where
+        ``copy.deepcopy(element)`` produces a standalone subtree. The copy carries
+        no parent and no tail.
+        """
+        return fromstring(tostring(self, encoding="unicode"))
+
     # -- navigation -------------------------------------------------------
 
     def getparent(self):
@@ -1085,25 +1129,78 @@ class _Element:
         * ``tag=None`` yields everything (elements, comments and PIs);
         * ``tag="*"`` is an element-only wildcard (comments/PIs excluded);
         * a specific tag yields only matching elements.
+
+        Implementation note: this is a performance-critical path. Callers (and
+        ElementPath, which routes through here) walk large subtrees repeatedly,
+        so the traversal is hand-tuned to minimise per-node cost:
+
+        * an **explicit stack** instead of a recursive ``yield from`` generator,
+          which avoids the O(tree-depth)-per-yielded-value cost of bubbling each
+          value up through a chain of nested generators;
+        * for a specific tag, the requested Clark-notation name is split into its
+          ``(namespace, local)`` parts **once** up front, and each visited element
+          is matched by comparing those parts directly, instead of rebuilding a
+          ``"{ns}local"`` string for every node (the old per-node ``_make_clark``
+          allocation was a top profile cost under heavy iteration);
+        * the three matching modes are specialised into separate loops so the hot
+          loop carries no per-node ``tag is None`` / wildcard branching.
+
+        Children are pushed onto the stack in reverse so they pop in document
+        order, preserving lxml's pre-order semantics.
         """
         proxy = self._holder.proxy
-        wildcard = tag == "*"
+        start = self._node
 
-        def matches(node):
-            if tag is None:
-                return True  # elements, comments and PIs
-            if wildcard:
-                return node.kind == "element"  # element-only wildcard
-            return _tag_matches(node, tag)
+        if tag is None:
+            # Everything: elements, comments and PIs (text/CDATA excluded).
+            def walk(node0):
+                stack = [node0]
+                while stack:
+                    node = stack.pop()
+                    if node.kind in _CONTENT_KINDS:
+                        yield proxy(node)
+                    children = node.children
+                    for i in range(len(children) - 1, -1, -1):
+                        stack.append(children[i])
+            return walk(start)
 
-        def walk(node):
-            # Pre-order: emit the node itself (if it qualifies), then recurse.
-            if node.kind in _CONTENT_KINDS and matches(node):
-                yield proxy(node)
-            for c in node.children:
-                yield from walk(c)
+        if tag == "*":
+            # Element-only wildcard (comments/PIs excluded).
+            def walk(node0):
+                stack = [node0]
+                while stack:
+                    node = stack.pop()
+                    if node.kind == "element":
+                        yield proxy(node)
+                    children = node.children
+                    for i in range(len(children) - 1, -1, -1):
+                        stack.append(children[i])
+            return walk(start)
 
-        return walk(self._node)
+        # Specific name test: pre-split the Clark-notation tag once. A node
+        # matches when its local name equals ``want_local`` and its namespace
+        # (normalised to "" when absent) equals ``want_ns``; this reproduces the
+        # old ``_make_clark(...) == tag`` comparison without the per-node alloc.
+        name = tag.text if isinstance(tag, QName) else tag
+        if name and name[0] == "{":
+            want_ns, _, want_local = name[1:].partition("}")
+        else:
+            want_ns, want_local = "", name
+
+        def walk(node0):
+            stack = [node0]
+            while stack:
+                node = stack.pop()
+                if node.kind == "element":
+                    q = node.tag
+                    if (q is not None
+                            and q.local_name == want_local
+                            and (q.namespace_uri or "") == want_ns):
+                        yield proxy(node)
+                children = node.children
+                for i in range(len(children) - 1, -1, -1):
+                    stack.append(children[i])
+        return walk(start)
 
     def itertext(self):
         """Yield all text and tail content in this subtree, in document order."""
@@ -1138,32 +1235,59 @@ class _Element:
         """Iterate over all subelements matching the ElementPath ``path``."""
         return ElementPath.iterfind(self, path, namespaces)
 
-    def xpath(self, _path, namespaces=None, **variables):
+    def xpath(self, _path, namespaces=None, smart_strings=True, **variables):
         """Evaluate a full XPath 1.0 expression against this element as context.
 
         Delegates to the native :class:`pyuppsala.XPathEvaluator`. Node-set
         results are returned as ``_Element`` proxies; string/number/boolean
         results are returned as the corresponding Python types.
 
+        ``smart_strings`` is accepted for lxml call-signature compatibility and
+        ignored: pyuppsala already returns plain ``str`` (never lxml's
+        parent-aware "smart" strings), so the flag has no effect.
+
         XPath variable binding (lxml's ``$name`` keyword arguments) is not
         supported by the underlying engine; passing any raises
         ``NotImplementedError`` rather than silently ignoring it.
         """
+        del smart_strings  # accepted for lxml compatibility; no behavioral effect
         if variables:
             raise NotImplementedError(
                 "XPath variable binding is not supported (got %r)"
                 % sorted(variables)
             )
-        ev = _u.XPathEvaluator()
+        # lxml's .xpath() has no per-evaluation node-visit cap; the native
+        # evaluator defaults to one (anti-DoS) that is far too low for large
+        # trusted documents (e.g. a SAML aggregate with thousands of entities),
+        # so lift it to effectively unbounded here to match lxml semantics.
+        ev = _u.XPathEvaluator(max_node_visits=sys.maxsize)
         if namespaces:
             for pfx, uri in namespaces.items():
                 if pfx:
                     ev.add_namespace(pfx, uri)
+        # Build the attribute-node and document-order indexes the engine needs
+        # for the attribute axis (``@name``) and correct node-set ordering/dedup.
+        # prepare_xpath() rebuilds from scratch, so it also picks up any tree
+        # mutations made since the last evaluation.
+        self._holder.doc.prepare_xpath()
         try:
             result = ev.evaluate(self._holder.doc, _path, self._node)
         except _u.XPathError as e:
             raise XPathEvalError(str(e)) from e
         return _wrap_xpath_result(self._holder, result)
+
+    def xinclude(self):
+        """Process W3C XInclude ``xi:include`` directives in this subtree.
+
+        Replaces each ``{http://www.w3.org/2001/XInclude}include`` element with
+        the referenced resource: ``parse="xml"`` (the default) splices in the
+        included document's root element; ``parse="text"`` inserts its text. A
+        child ``xi:fallback`` provides content if the resource cannot be loaded.
+        Relative ``href`` values resolve against the document's ``base_url``
+        (set by :func:`parse`); ``http(s)``/``file`` URLs and filesystem paths
+        are supported. Processing is recursive (included XML is itself scanned).
+        """
+        _process_xincludes(self, self._holder.base_url)
 
     # -- misc properties --------------------------------------------------
 
@@ -1209,7 +1333,18 @@ def _tag_matches(node, tag):
     if node.kind != "element":
         return False
     q = node.tag
-    return _make_clark(q.namespace_uri, q.local_name) == tag
+    if q is None:
+        return False
+    # Compare (namespace, local) components directly rather than building a
+    # "{ns}local" string for every call; equivalent to the old
+    # ``_make_clark(q.namespace_uri, q.local_name) == tag`` but allocation-free.
+    if isinstance(tag, QName):
+        tag = tag.text
+    if tag and tag[0] == "{":
+        ns, _, local = tag[1:].partition("}")
+    else:
+        ns, local = "", tag
+    return q.local_name == local and (q.namespace_uri or "") == ns
 
 
 def _wrap_xpath_result(holder, result):
@@ -1227,6 +1362,10 @@ def _wrap_xpath_result(holder, result):
             if isinstance(n, _u.Node):
                 if n.kind in _TEXT_KINDS:
                     wrapped.append(n.text or "")
+                elif n.kind == "attribute":
+                    # Attribute-axis results (``@name``) become their string
+                    # value, matching lxml's ``xpath("...//@attr")``.
+                    wrapped.append(n.attribute_value or "")
                 else:
                     wrapped.append(holder.proxy(n))
             else:
@@ -1371,13 +1510,28 @@ class _ElementTree:
             raise AssertionError("ElementTree not initialized, missing root")
         return root
 
-    def parse(self, source, parser=None):
+    def parse(self, source, parser=None, base_url=None):
         """Parse ``source`` into this tree, replacing its contents. Returns the root."""
         data = _read_source(source)
         el = fromstring(data, parser)
+        if base_url is None and isinstance(source, (str, bytes, os.PathLike)):
+            base_url = os.fspath(source)
+            if isinstance(base_url, bytes):
+                base_url = base_url.decode("utf-8", "replace")
+        el._holder.base_url = base_url
         self._holder = el._holder
         self._root = el._node
         return el
+
+    def xinclude(self):
+        """Process W3C XInclude ``xi:include`` directives in place.
+
+        Relative ``href`` references resolve against the tree's ``base_url``
+        (set by :func:`parse`). See :meth:`_Element.xinclude`.
+        """
+        root = self.getroot()
+        if root is not None:
+            root.xinclude()
 
     def write(
         self,
@@ -1429,9 +1583,14 @@ class _ElementTree:
             return iter(())
         return root.iter(tag)
 
-    def xpath(self, path, namespaces=None, **variables):
-        """Evaluate an XPath expression with the root as context."""
-        return self._require_root().xpath(path, namespaces=namespaces, **variables)
+    def xpath(self, path, namespaces=None, smart_strings=True, **variables):
+        """Evaluate an XPath expression with the root as context.
+
+        ``smart_strings`` is accepted for lxml compatibility and ignored.
+        """
+        return self._require_root().xpath(
+            path, namespaces=namespaces, smart_strings=smart_strings, **variables
+        )
 
     def getpath(self, element):
         """Return an absolute XPath locating ``element`` within this tree.
@@ -1735,17 +1894,65 @@ def _read_source(source):
         return fh.read()
 
 
-def parse(source, parser=None):
+def parse(source, parser=None, base_url=None):
     """Parse from a filename/path or file-like ``source`` into an ElementTree.
 
     As in ``lxml.etree``, ``source`` is interpreted as a filesystem path (when a
     ``str``/``bytes``/``os.PathLike``) or as a file-like object; it is **not**
     treated as inline XML. To parse an in-memory string or bytes use
     :func:`fromstring`, or wrap it in ``io.BytesIO``/``io.StringIO``.
+
+    ``base_url`` records the document's base for resolving relative XInclude
+    ``href`` references in a later :meth:`_ElementTree.xinclude` call. When not
+    given, a filesystem ``source`` path is used as the base.
     """
     data = _read_source(source)
     el = fromstring(data, parser)
+    if base_url is None and isinstance(source, (str, bytes, os.PathLike)):
+        base_url = os.fspath(source)
+        if isinstance(base_url, bytes):
+            base_url = base_url.decode("utf-8", "replace")
+    el._holder.base_url = base_url
     return _ElementTree(el._holder, el._node)
+
+
+def _tostring_open_tag_end(text):
+    """Index of the ``>`` (or the ``/`` of ``/>``) that closes the first start
+    tag in ``text``, respecting quoted attribute values; ``None`` if not found.
+    """
+    quote = None
+    for i, c in enumerate(text):
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in ('"', "'"):
+            quote = c
+        elif c == ">":
+            return i - 1 if i > 0 and text[i - 1] == "/" else i
+    return None
+
+
+def _inject_inherited_namespaces(element, text):
+    """Add namespace declarations the element inherits from its ancestors to the
+    serialized top start tag, so a serialized sub-element round-trips (matching
+    lxml). A no-op for the document root, whose in-scope map equals its own
+    declarations.
+    """
+    nsmap = element.nsmap
+    if not nsmap:
+        return text
+    own = {(pfx or None) for pfx, _uri in element._node.namespace_declarations}
+    missing = [(pfx, uri) for pfx, uri in nsmap.items() if pfx not in own]
+    if not missing:
+        return text
+    decls = "".join(
+        ' xmlns="%s"' % uri if pfx is None else ' xmlns:%s="%s"' % (pfx, uri)
+        for pfx, uri in missing
+    )
+    insert_at = _tostring_open_tag_end(text)
+    if insert_at is None:
+        return text
+    return text[:insert_at] + decls + text[insert_at:]
 
 
 def tostring(
@@ -1806,6 +2013,15 @@ def tostring(
             text += "\n"
     else:
         text = node.to_xml()
+
+    # uppsala's serializer emits only the namespace declarations made *on* the
+    # serialized element, not those it inherits from ancestors. Serializing a
+    # sub-element that uses an inherited prefix (or default namespace) would then
+    # drop the binding and produce a fragment that cannot reparse. lxml keeps
+    # in-scope declarations on the serialization root, so mirror that by adding
+    # any inherited-but-undeclared bindings to the top start tag. For a document
+    # root this is a no-op (its nsmap equals its own declarations).
+    text = _inject_inherited_namespaces(element, text)
 
     # The DOCTYPE sits between the optional XML declaration and the root, so
     # prepend it before the declaration logic below (which prepends in turn).
@@ -1954,7 +2170,11 @@ class XMLSchema:
     not include an ``<?xml ...?>`` declaration.
     """
 
-    def __init__(self, etree=None, *, file=None):
+    def __init__(self, etree=None, *, file=None, base_path=None):
+        # ``base_path`` (a directory) lets the native validator resolve
+        # ``xsd:import``/``xsd:include`` ``schemaLocation`` references. When a
+        # filesystem ``file`` is given it defaults to that file's directory,
+        # matching lxml's resolution of relative imports against the schema file.
         if etree is not None:
             schema_xml = tostring(etree, encoding="unicode")
         elif file is not None:
@@ -1965,10 +2185,15 @@ class XMLSchema:
             else:
                 with open(file, "r", encoding="utf-8") as fh:
                     schema_xml = fh.read()
+                if base_path is None:
+                    base_path = os.path.dirname(os.fspath(file))
         else:
             raise XMLSchemaParseError("XMLSchema requires an etree or file argument")
         try:
-            self._validator = _u.XsdValidator(schema_xml)
+            if base_path:
+                self._validator = _u.XsdValidator.from_file(schema_xml, base_path)
+            else:
+                self._validator = _u.XsdValidator(schema_xml)
         except _u.XsdValidationError as e:
             raise XMLSchemaParseError(str(e)) from e
         # Populated by validate(); mirrors lxml's ``.error_log`` (best effort).
@@ -1977,16 +2202,273 @@ class XMLSchema:
     def validate(self, tree):
         """Return True if ``tree`` is valid; record failures in ``error_log``."""
         root = tree.getroot() if isinstance(tree, _ElementTree) else tree
-        xml = root._node.to_xml()
+        # Serialize via tostring (not raw node.to_xml) so a validated sub-element
+        # keeps the namespace declarations it inherits from ancestors; otherwise
+        # the standalone fragment would fail to reparse for validation.
+        xml = tostring(root, encoding="unicode")
         self.error_log = self._validator.validate_str(xml)
         return len(self.error_log) == 0
 
     def assertValid(self, tree):
-        """Raise :class:`DocumentInvalid` if ``tree`` does not validate."""
+        """Raise :class:`DocumentInvalid` if ``tree`` does not validate.
+
+        The raised exception carries an ``error_log`` list (the validation
+        errors), matching lxml so callers can inspect ``ex.error_log``.
+        """
         if not self.validate(tree):
             messages = "; ".join(e.message for e in self.error_log)
-            raise DocumentInvalid(messages or "Document does not validate")
+            exc = DocumentInvalid(messages or "Document does not validate")
+            exc.error_log = self.error_log
+            raise exc
 
     def __call__(self, tree):
         """Return True if ``tree`` validates (alias for :meth:`validate`)."""
         return self.validate(tree)
+
+
+# ---------------------------------------------------------------------------
+# XSLT 1.0 transformation
+# ---------------------------------------------------------------------------
+
+# Native compile/transform failures surface as these pyuppsala exceptions; map
+# them onto the lxml-compatible XSLT error names.
+_XSLT_NATIVE_ERRORS = (
+    _u.XmlParseError,
+    _u.XmlWellFormednessError,
+    _u.XmlNamespaceError,
+    _u.XPathError,
+)
+
+
+class _XSLTLogEntry:
+    """A single XSLT error-log entry (best-effort lxml ``_LogEntry`` shape)."""
+
+    def __init__(self, message):
+        self.message = message
+        # lxml callers (e.g. pyFF) read these attributes off each entry. We do
+        # not carry libxml2's structured error fields, so report neutral values.
+        self.line = 0
+        self.column = 0
+        self.domain = 0
+        self.domain_name = "XSLT"
+        self.type = 0
+        self.type_name = "ERR_OK"
+        self.level = 2  # XML_ERR_ERROR
+        self.level_name = "ERROR"
+        self.filename = "<string>"
+
+    def __repr__(self):
+        return "<_XSLTLogEntry %s>" % self.message
+
+
+class _XSLTResultTree:
+    """The result of applying an :class:`XSLT`.
+
+    Mirrors lxml's ``_XSLTResultTree``: it serializes to the transformation's
+    output via ``str()``/``bytes()`` and exposes the result document through
+    ``getroot()`` and the usual tree methods (parsed lazily, so non-XML output
+    methods such as ``text``/``html`` can still be retrieved as a string).
+    """
+
+    def __init__(self, text):
+        self._text = text
+        self._tree = None  # lazily parsed _ElementTree
+
+    def _ensure_tree(self):
+        if self._tree is None:
+            self._tree = fromstring(self._text).getroottree()
+        return self._tree
+
+    def getroot(self):
+        """Return the root element of the result document."""
+        return self._ensure_tree().getroot()
+
+    def write(self, file, **kwargs):
+        """Serialize the result document to ``file`` (delegates to the tree)."""
+        return self._ensure_tree().write(file, **kwargs)
+
+    def __getattr__(self, name):
+        # Delegate tree-ish access (find/findall/xpath/iter/getpath/docinfo...)
+        # to the lazily parsed result document.
+        return getattr(self._ensure_tree(), name)
+
+    def __str__(self):
+        return self._text
+
+    def __bytes__(self):
+        return self._text.encode("utf-8")
+
+    def __repr__(self):
+        return "<_XSLTResultTree>"
+
+
+class XSLT:
+    """A compiled XSLT 1.0 stylesheet, callable on an element or tree.
+
+    Construct from a parsed stylesheet (``XSLT(stylesheet_root)``) and apply it
+    with ``XSLT(...)(doc)``. The result is an :class:`_XSLTResultTree`; call
+    ``str()``/``bytes()`` on it for the serialized output or ``getroot()`` for
+    the result element. EXSLT extension functions are enabled (matching lxml).
+
+    XSLT parameters (``transform(doc, name=value)``) are not yet supported and
+    raise :class:`NotImplementedError`.
+    """
+
+    def __init__(self, xslt_input, *, extensions=None, regexp=True, access_control=None):
+        # lxml accepts these keyword options; we do not implement custom
+        # extension functions or access control, so reject them rather than
+        # silently ignoring (matches XMLParser/tostring strictness).
+        if extensions:
+            raise NotImplementedError("XSLT extension functions are not supported")
+        if access_control is not None:
+            raise NotImplementedError("XSLT access control is not supported")
+        stylesheet_xml = tostring(xslt_input, encoding="unicode")
+        try:
+            self._native = _u.Xslt(stylesheet_xml)
+        except _XSLT_NATIVE_ERRORS as e:
+            raise XSLTParseError(str(e)) from e
+        # Mirrors lxml's ``.error_log``; populated when a transform fails.
+        self.error_log = []
+
+    def __call__(self, _input, profile_run=False, **kwargs):
+        """Apply the stylesheet to ``_input`` (an element or tree)."""
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise NotImplementedError(
+                "XSLT parameters are not yet supported: %s" % names
+            )
+        source_xml = tostring(_input, encoding="unicode")
+        try:
+            result = self._native.transform(source_xml)
+        except _XSLT_NATIVE_ERRORS as e:
+            self.error_log = [_XSLTLogEntry(str(e))]
+            raise XSLTApplyError(str(e)) from e
+        self.error_log = []
+        return _XSLTResultTree(result)
+
+    @staticmethod
+    def strparam(value):
+        """Wrap a string as an XSLT string parameter (lxml-compatible helper)."""
+        # lxml returns an opaque token quoting the value for use as a param.
+        # Parameters are not yet wired through to the engine, but provide the
+        # helper so call sites that build params do not break at import time.
+        return "'%s'" % str(value).replace("'", "&apos;")
+
+
+# ---------------------------------------------------------------------------
+# XInclude 1.0 processing
+# ---------------------------------------------------------------------------
+
+XINCLUDE_NS = "http://www.w3.org/2001/XInclude"
+_XI_INCLUDE = "{%s}include" % XINCLUDE_NS
+_XI_FALLBACK = "{%s}fallback" % XINCLUDE_NS
+_XINCLUDE_MAX_DEPTH = 250
+
+
+def _xinclude_resolve(href, base_url):
+    """Resolve an XInclude ``href`` against ``base_url`` (URL or filesystem)."""
+    import urllib.parse
+
+    if urllib.parse.urlparse(href).scheme:
+        return href  # already absolute (has a scheme)
+    if base_url:
+        return urllib.parse.urljoin(base_url, href)
+    return href  # relative to the current working directory
+
+
+def _xinclude_read_bytes(resolved):
+    """Fetch the bytes for a resolved XInclude target (http(s)/ftp/file/path)."""
+    import urllib.parse
+    import urllib.request
+
+    parts = urllib.parse.urlparse(resolved)
+    if parts.scheme in ("http", "https", "ftp"):
+        with urllib.request.urlopen(resolved) as response:  # noqa: S310
+            return response.read()
+    if parts.scheme == "file":
+        path = urllib.request.url2pathname(parts.path)
+        with open(path, "rb") as fh:
+            return fh.read()
+    with open(resolved, "rb") as fh:
+        return fh.read()
+
+
+def _xinclude_insert_text(parent, idx, text):
+    """Merge ``text`` into the character stream just before child ``idx``."""
+    if not text:
+        return
+    if idx == 0:
+        parent.text = (parent.text or "") + text
+    else:
+        prev = parent[idx - 1]
+        prev.tail = (prev.tail or "") + text
+
+
+def _process_xincludes(elem, base_url, _depth=0):
+    """Recursively expand ``xi:include`` directives within ``elem`` in place."""
+    if _depth > _XINCLUDE_MAX_DEPTH:
+        raise XIncludeError("XInclude recursion limit exceeded")
+    # Snapshot children: the list is mutated as includes are expanded.
+    for child in list(elem):
+        if not isinstance(child.tag, str):
+            continue  # comment / processing instruction
+        if child.tag == _XI_INCLUDE:
+            _expand_include(elem, child, base_url, _depth)
+        else:
+            _process_xincludes(child, base_url, _depth)
+
+
+def _expand_include(parent, include, base_url, depth):
+    """Replace a single ``xi:include`` element with its referenced content."""
+    href = include.get("href")
+    parse_kind = include.get("parse", "xml")
+    encoding = include.get("encoding")
+    tail = include.tail
+    idx = parent.index(include)
+
+    data = None
+    load_error = None
+    try:
+        if href is None:
+            raise XIncludeError("xi:include without href is not supported")
+        resolved = _xinclude_resolve(href, base_url)
+        data = _xinclude_read_bytes(resolved)
+    except (OSError, ValueError, XIncludeError) as exc:
+        load_error = exc
+
+    # The include element itself is always removed.
+    parent.remove(include)
+
+    if load_error is not None:
+        fallback = include.find(_XI_FALLBACK)
+        if fallback is None:
+            raise XIncludeError(
+                "could not load XInclude href %r: %s" % (href, load_error)
+            )
+        # Expand any includes nested in the fallback, then splice its content in.
+        _process_xincludes(fallback, base_url, depth + 1)
+        _xinclude_insert_text(parent, idx, fallback.text)
+        kids = list(fallback)
+        for offset, kid in enumerate(kids):
+            parent.insert(idx + offset, kid)
+        if kids:
+            kids[-1].tail = (kids[-1].tail or "") + (tail or "")
+        else:
+            _xinclude_insert_text(parent, idx, tail)
+        return
+
+    if parse_kind == "text":
+        text = data.decode(encoding or "utf-8")
+        _xinclude_insert_text(parent, idx, text + (tail or ""))
+        return
+
+    if parse_kind != "xml":
+        raise XIncludeError("unsupported xi:include parse=%r" % parse_kind)
+
+    # parse="xml": splice in the referenced document's root element, after
+    # recursively expanding any includes it contains (resolved against its own
+    # location). insert() deep-copies the cross-document subtree into this tree.
+    included = fromstring(data)
+    _process_xincludes(included, resolved, depth + 1)
+    included.tail = tail
+    parent.insert(idx, included)

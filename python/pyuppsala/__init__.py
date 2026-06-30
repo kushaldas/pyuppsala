@@ -19,6 +19,7 @@ from ._pyuppsala import (
     ValidationError,
     XmlWriter,
     XsdRegex,
+    Xslt,
     # Functions
     parse,
     parse_bytes,
@@ -30,6 +31,7 @@ from ._pyuppsala import (
     DEFAULT_MAX_XPATH_NODE_VISITS,
     DEFAULT_MAX_REGEX_GROUP_DEPTH,
     DEFAULT_MAX_REGEX_STEPS,
+    DEFAULT_MAX_XSLT_DEPTH,
     # Exceptions
     XmlParseError,
     XmlWellFormednessError,
@@ -50,6 +52,7 @@ __all__ = [
     "ValidationError",
     "XmlWriter",
     "XsdRegex",
+    "Xslt",
     "parse",
     "parse_bytes",
     "DEFAULT_MAX_DEPTH",
@@ -59,6 +62,7 @@ __all__ = [
     "DEFAULT_MAX_XPATH_NODE_VISITS",
     "DEFAULT_MAX_REGEX_GROUP_DEPTH",
     "DEFAULT_MAX_REGEX_STEPS",
+    "DEFAULT_MAX_XSLT_DEPTH",
     "XmlParseError",
     "XmlWellFormednessError",
     "XmlNamespaceError",
