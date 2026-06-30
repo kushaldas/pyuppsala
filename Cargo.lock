@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "pyuppsala"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "pyo3",
  "uppsala",
@@ -134,6 +134,6 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "uppsala"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "067e5fe3bed83641d342f45a15547fc90728653b9b708fea8c0ca40c2a81071f"
+checksum = "d8fc9dac676c376f7ef570a4fca8cdad3f1d2ece4ac81211c489ef7d4b58a61c"
