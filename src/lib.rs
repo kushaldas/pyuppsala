@@ -459,6 +459,29 @@ impl Node {
             .map(|el| QName::from_uqname(&el.name)))
     }
 
+    /// The element's tag in Clark `{uri}local` notation, built natively, or
+    /// None for non-element nodes.
+    ///
+    /// The etree `.tag` property is extremely hot (pyFF reads it per element
+    /// while scanning the tree). Returning the Clark string directly avoids
+    /// allocating an intermediate `QName` Python object and rebuilding the
+    /// string in Python on every access; a `None` result lets the caller fall
+    /// back to the comment/PI handling. An absent or empty namespace yields a
+    /// bare local name, matching lxml's no-namespace convention.
+    fn clark_tag(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.doc.element(self.id).map(|el| {
+            let q = &el.name;
+            match &q.namespace_uri {
+                Some(ns) if !ns.is_empty() => format!("{{{}}}{}", ns, q.local_name),
+                _ => q.local_name.to_string(),
+            }
+        }))
+    }
+
     /// The text content for text/comment/cdata nodes, or None.
     #[getter]
     fn text(&self) -> PyResult<Option<String>> {

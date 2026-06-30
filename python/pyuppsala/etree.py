@@ -687,15 +687,18 @@ class _Element:
         :func:`Comment` / :func:`ProcessingInstruction` factory, matching lxml
         (so ``elem.tag is Comment`` identifies a comment).
         """
+        # Common case (an element) is a single native call returning the Clark
+        # string directly, with no intermediate QName object. Only fall back to
+        # the kind check for non-elements (comments/PIs return their factory).
+        clark = self._node.clark_tag()
+        if clark is not None:
+            return clark
         kind = self._node.kind
         if kind == "comment":
             return Comment
         if kind == "processing_instruction":
             return ProcessingInstruction
-        q = self._node.tag
-        if q is None:
-            return None
-        return _make_clark(q.namespace_uri, q.local_name)
+        return None
 
     @tag.setter
     def tag(self, value):
