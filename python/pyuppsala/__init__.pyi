@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Iterator, Optional, Union
 
 # Exceptions
 
@@ -98,6 +98,15 @@ class Node:
     @property
     def node_id(self) -> int:
         """A stable integer identity for this node within its Document."""
+        ...
+    def iter_descendants(self, tag: Optional[str] = None) -> Iterator[Node]:
+        """Lazy pre-order descendant iterator over this node and its subtree.
+
+        The tree walk and tag matching run natively. ``tag`` follows lxml:
+        ``None`` yields elements/comments/PIs, ``"*"`` yields elements only, and
+        a Clark-notation name (``"{ns}local"`` or ``"local"``) yields matching
+        elements. The node itself is included when it qualifies.
+        """
         ...
     @property
     def first_child(self) -> Optional[Node]:
@@ -341,6 +350,11 @@ class Document:
         ...
     def append_child(self, parent: Node, child: Node) -> None:
         """Append a child node to a parent node."""
+        ...
+    def import_subtree(self, source: Node) -> Node:
+        """Deep-copy ``source`` (a node from a different Document) and its whole
+        subtree into this document in one native pass, returning the new detached
+        node. Raises ValueError if ``source`` belongs to this same Document."""
         ...
     def set_namespace_declaration(
         self, node: Node, prefix: Optional[str], uri: str

@@ -457,38 +457,23 @@ def _content_children(node):
 
 
 def _clone_node(dst, snode):
-    """Deep-copy ``snode`` (from any document) into ``dst`` (a ``_DocHolder``).
+    """Deep-copy ``snode`` (from another document) into ``dst`` (a ``_DocHolder``).
 
     Recreates the node and its whole subtree in the destination document and
     returns the new root node. Used to move elements between trees, since
     uppsala ``NodeId``s are scoped to a single document and cannot be reparented
     across documents directly.
+
+    Delegates to the native ``Document.import_subtree``, which clones the entire
+    subtree (qualified name, the element's own namespace declarations,
+    attributes, text/CDATA/comment/PI and all descendants) in a single native
+    pass. The previous pure-Python recursion made one FFI call per node and was
+    the top cost of pyFF's aggregation step once traversal went native (see
+    pyFF/performance.md); doing the whole copy natively removes that per-node
+    Python+FFI overhead. Namespaces inherited from ancestors outside the moved
+    subtree are added separately by :func:`_copy_inherited_ns`.
     """
-    ddoc = dst.doc
-    kind = snode.kind
-    if kind == "element":
-        # Recreate the element with its qualified name, namespace declarations,
-        # and attributes, then recurse into its children below.
-        q = snode.tag
-        dn = ddoc.create_element(q.local_name, q.namespace_uri, q.prefix)
-        for pfx, uri in snode.namespace_declarations:
-            ddoc.set_namespace_declaration(dn, pfx, uri)
-        for a in snode.attributes:
-            an = a.name
-            dn.set_attribute(an.local_name, a.value, an.namespace_uri, an.prefix)
-    elif kind == "text":
-        dn = ddoc.create_text(snode.text or "")
-    elif kind == "cdata":
-        dn = ddoc.create_cdata(snode.text or "")
-    elif kind == "comment":
-        dn = ddoc.create_comment(snode.comment_text or "")
-    elif kind == "processing_instruction":
-        dn = ddoc.create_processing_instruction(snode.pi_target, snode.pi_data)
-    else:
-        raise TypeError("Cannot clone node of kind %r" % kind)
-    for child in snode.children:
-        ddoc.append_child(dn, _clone_node(dst, child))
-    return dn
+    return dst.doc.import_subtree(snode)
 
 
 def _copy_inherited_ns(dst, snode, dnode):
@@ -523,6 +508,14 @@ def _repoint_subtree(src_holder, dst, snode, dnode):
     references to a moved element (and its descendants) remain valid afterward -
     mirroring lxml's in-place move semantics.
     """
+    # Fast path: once the source holder has no live proxies left, there is
+    # nothing in the (possibly large) subtree to repoint, so skip the walk
+    # entirely. This is the common case for pyFF's ``deepcopy(entity)`` +
+    # ``append`` aggregation: the freshly deep-copied source holds exactly one
+    # live proxy (its root), so after repointing it the whole descendant walk
+    # (hundreds of nodes per entity) is avoided.
+    if not src_holder._proxies:
+        return
     proxy = src_holder._proxies.get(snode.node_id)
     if proxy is not None:
         src_holder._proxies.pop(snode.node_id, None)
@@ -530,6 +523,8 @@ def _repoint_subtree(src_holder, dst, snode, dnode):
         proxy._node = dnode
         proxy._id = dnode.node_id
         dst._proxies[dnode.node_id] = proxy
+        if not src_holder._proxies:
+            return
     # Children are cloned in the same order, so a positional zip pairs them up.
     for sc, dc in zip(snode.children, dnode.children):
         _repoint_subtree(src_holder, dst, sc, dc)
@@ -1130,77 +1125,22 @@ class _Element:
         * ``tag="*"`` is an element-only wildcard (comments/PIs excluded);
         * a specific tag yields only matching elements.
 
-        Implementation note: this is a performance-critical path. Callers (and
-        ElementPath, which routes through here) walk large subtrees repeatedly,
-        so the traversal is hand-tuned to minimise per-node cost:
-
-        * an **explicit stack** instead of a recursive ``yield from`` generator,
-          which avoids the O(tree-depth)-per-yielded-value cost of bubbling each
-          value up through a chain of nested generators;
-        * for a specific tag, the requested Clark-notation name is split into its
-          ``(namespace, local)`` parts **once** up front, and each visited element
-          is matched by comparing those parts directly, instead of rebuilding a
-          ``"{ns}local"`` string for every node (the old per-node ``_make_clark``
-          allocation was a top profile cost under heavy iteration);
-        * the three matching modes are specialised into separate loops so the hot
-          loop carries no per-node ``tag is None`` / wildcard branching.
-
-        Children are pushed onto the stack in reverse so they pop in document
-        order, preserving lxml's pre-order semantics.
+        Implementation note: this is the hottest path in the layer (callers and
+        ElementPath walk large subtrees repeatedly). The pre-order tree walk and
+        tag matching run **natively** in ``Node.iter_descendants`` (one mutex
+        acquisition per step, not per visited node, with no per-node Python
+        attribute access or Clark-string building), so the only Python-level
+        cost here is wrapping the nodes that actually match in their identity
+        proxies. For a find-first pattern (``next(el.iter(tag))``) the native
+        iterator stops as soon as the first match is found.
         """
         proxy = self._holder.proxy
-        start = self._node
-
-        if tag is None:
-            # Everything: elements, comments and PIs (text/CDATA excluded).
-            def walk(node0):
-                stack = [node0]
-                while stack:
-                    node = stack.pop()
-                    if node.kind in _CONTENT_KINDS:
-                        yield proxy(node)
-                    children = node.children
-                    for i in range(len(children) - 1, -1, -1):
-                        stack.append(children[i])
-            return walk(start)
-
-        if tag == "*":
-            # Element-only wildcard (comments/PIs excluded).
-            def walk(node0):
-                stack = [node0]
-                while stack:
-                    node = stack.pop()
-                    if node.kind == "element":
-                        yield proxy(node)
-                    children = node.children
-                    for i in range(len(children) - 1, -1, -1):
-                        stack.append(children[i])
-            return walk(start)
-
-        # Specific name test: pre-split the Clark-notation tag once. A node
-        # matches when its local name equals ``want_local`` and its namespace
-        # (normalised to "" when absent) equals ``want_ns``; this reproduces the
-        # old ``_make_clark(...) == tag`` comparison without the per-node alloc.
-        name = tag.text if isinstance(tag, QName) else tag
-        if name and name[0] == "{":
-            want_ns, _, want_local = name[1:].partition("}")
-        else:
-            want_ns, want_local = "", name
-
-        def walk(node0):
-            stack = [node0]
-            while stack:
-                node = stack.pop()
-                if node.kind == "element":
-                    q = node.tag
-                    if (q is not None
-                            and q.local_name == want_local
-                            and (q.namespace_uri or "") == want_ns):
-                        yield proxy(node)
-                children = node.children
-                for i in range(len(children) - 1, -1, -1):
-                    stack.append(children[i])
-        return walk(start)
+        # Normalise a QName argument to its Clark-notation string; the native
+        # filter understands None, "*", "{ns}local" and bare local names.
+        if isinstance(tag, QName):
+            tag = tag.text
+        for node in self._node.iter_descendants(tag):
+            yield proxy(node)
 
     def itertext(self):
         """Yield all text and tail content in this subtree, in document order."""

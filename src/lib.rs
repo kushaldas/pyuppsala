@@ -639,6 +639,34 @@ impl Node {
         self.id.index()
     }
 
+    /// Return a lazy pre-order descendant iterator over this node and its
+    /// subtree, optionally filtered by tag, matching lxml's ``Element.iter``.
+    ///
+    /// The whole pre-order tree walk and tag matching run natively (one mutex
+    /// acquisition per ``__next__``, not per visited node), so the Python etree
+    /// layer only pays a proxy-wrap cost for the nodes that actually match
+    /// rather than walking every node in Python. This is the hot path that
+    /// dominated pyFF (see pyFF/performance.md): the aggregate has tens of
+    /// thousands of nodes and pyFF iterates it repeatedly.
+    ///
+    /// ``tag`` semantics follow lxml / ElementTree:
+    ///
+    /// * ``None`` yields elements, comments and processing instructions;
+    /// * ``"*"`` yields elements only;
+    /// * a Clark-notation name (``"{ns}local"`` or ``"local"``) yields only
+    ///   matching elements. An empty namespace (``"{}local"``) and a bare local
+    ///   name both match elements that have no namespace.
+    ///
+    /// The starting node itself is included when it qualifies (lxml includes
+    /// the context element in ``iter``).
+    fn iter_descendants(&self, tag: Option<&str>) -> DescendantIterator {
+        DescendantIterator {
+            doc: Arc::clone(&self.doc),
+            stack: vec![self.id],
+            filter: DescFilter::parse(tag),
+        }
+    }
+
     /// The first child node, or None.
     #[getter]
     fn first_child(&self) -> PyResult<Option<Node>> {
@@ -1138,6 +1166,117 @@ impl NodeIterator {
 }
 
 // ---------------------------------------------------------------------------
+// DescendantIterator
+// ---------------------------------------------------------------------------
+
+/// The tag filter applied while walking a subtree (parsed once when the
+/// iterator is created so the hot `__next__` loop does no string work).
+enum DescFilter {
+    /// `tag=None`: elements, comments and processing instructions.
+    All,
+    /// `tag="*"`: elements only.
+    Elements,
+    /// A specific element name. `ns` is `None` for the no-namespace case (a
+    /// bare local name or an empty `{}` namespace), matching lxml.
+    Named { ns: Option<String>, local: String },
+}
+
+impl DescFilter {
+    /// Parse an lxml-style tag argument into a filter. `None` -> `All`,
+    /// `"*"` -> `Elements`, `"{ns}local"`/`"local"` -> `Named`.
+    fn parse(tag: Option<&str>) -> DescFilter {
+        match tag {
+            None => DescFilter::All,
+            Some("*") => DescFilter::Elements,
+            Some(t) => {
+                if let Some(rest) = t.strip_prefix('{') {
+                    if let Some(idx) = rest.find('}') {
+                        let ns = &rest[..idx];
+                        let local = &rest[idx + 1..];
+                        return DescFilter::Named {
+                            // An empty namespace ("{}local") is the no-namespace
+                            // case in lxml, so normalise "" to None.
+                            ns: if ns.is_empty() {
+                                None
+                            } else {
+                                Some(ns.to_string())
+                            },
+                            local: local.to_string(),
+                        };
+                    }
+                }
+                DescFilter::Named {
+                    ns: None,
+                    local: t.to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// A lazy, native pre-order descendant iterator (see `Node::iter_descendants`).
+///
+/// Holds an explicit stack of node ids. Each `__next__` acquires the document
+/// lock once, then advances through the tree (pushing children, skipping
+/// non-matching nodes) until it finds the next match or the stack empties.
+/// Children are pushed in reverse so they pop in document order, giving the
+/// pre-order (parent before children) sequence lxml produces.
+#[pyclass]
+struct DescendantIterator {
+    doc: SharedDoc,
+    stack: Vec<NodeId>,
+    filter: DescFilter,
+}
+
+#[pymethods]
+impl DescendantIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> PyResult<Option<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        while let Some(id) = self.stack.pop() {
+            // Push this node's children in reverse document order so the first
+            // child is popped next (pre-order). Done before the match check so
+            // we descend into matching nodes too.
+            let start = self.stack.len();
+            let mut child = guard.doc.first_child(id);
+            while let Some(cid) = child {
+                self.stack.push(cid);
+                child = guard.doc.next_sibling(cid);
+            }
+            self.stack[start..].reverse();
+
+            let matched = match &self.filter {
+                DescFilter::All => matches!(
+                    guard.doc.node_kind(id),
+                    Some(NodeKind::Element(_))
+                        | Some(NodeKind::Comment(_))
+                        | Some(NodeKind::ProcessingInstruction(_))
+                ),
+                DescFilter::Elements => {
+                    matches!(guard.doc.node_kind(id), Some(NodeKind::Element(_)))
+                }
+                DescFilter::Named { ns, local } => {
+                    matches!(guard.doc.element(id), Some(e) if e.name.matches(ns.as_deref(), local))
+                }
+            };
+            if matched {
+                return Ok(Some(Node {
+                    doc: Arc::clone(&self.doc),
+                    id,
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Document - Python wrapper
 // ---------------------------------------------------------------------------
 
@@ -1429,6 +1568,45 @@ impl Document {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         guard.doc.append_child(parent.id, child.id);
         Ok(())
+    }
+
+    /// Deep-copy ``source`` (a node from a *different* Document) and its whole
+    /// subtree into this document, returning the new detached node.
+    ///
+    /// `NodeId`s are document-scoped, so cross-document `append`/`deepcopy` in the
+    /// etree layer must clone rather than reparent. This does the entire subtree
+    /// copy in one native pass (uppsala `Document::import_subtree`) instead of one
+    /// FFI call per node, which was the dominant cost of pyFF's aggregation step.
+    /// The element's own namespace declarations are copied; namespaces inherited
+    /// from ancestors outside the subtree remain the caller's responsibility.
+    ///
+    /// Locks the source document first, then this one. The source must be a
+    /// different `Document`; importing from the same document raises ValueError
+    /// (use the move/detach path instead).
+    fn import_subtree(&self, source: &Node) -> PyResult<Node> {
+        if Arc::ptr_eq(&self.inner, &source.doc) {
+            return Err(PyValueError::new_err(
+                "import_subtree requires a node from a different Document",
+            ));
+        }
+        let src_guard = source
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut dst_guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let new_id = dst_guard
+            .doc
+            .import_subtree(&src_guard.doc, source.id)
+            .ok_or_else(|| {
+                PyValueError::new_err("cannot import this node (document root or attribute node)")
+            })?;
+        Ok(Node {
+            doc: Arc::clone(&self.inner),
+            id: new_id,
+        })
     }
 
     /// Add or replace an `xmlns` declaration on an element node.
