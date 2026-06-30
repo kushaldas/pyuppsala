@@ -446,9 +446,10 @@ def _content_children(node):
     """Return the children lxml treats as element content: elements, comments, PIs.
 
     Text and CDATA nodes are excluded because lxml exposes them via ``.text`` and
-    ``.tail`` rather than as indexable children.
+    ``.tail`` rather than as indexable children. Filtered natively in a single
+    lock (see ``Node.content_children``); this is hot under whole-tree visits.
     """
-    return [c for c in node.children if c.kind in _CONTENT_KINDS]
+    return node.content_children()
 
 
 # ---------------------------------------------------------------------------
@@ -1234,18 +1235,10 @@ class _Element:
     @property
     def nsmap(self):
         """Mapping of in-scope prefixes to URIs (None key = default namespace)."""
-        result = {}
-        # Collect declarations from the root down so that inner declarations
-        # override outer ones for the same prefix.
-        chain = []
-        n = self._node
-        while n is not None and n.kind == "element":
-            chain.append(n)
-            n = n.parent
-        for node in reversed(chain):
-            for pfx, uri in node.namespace_declarations:
-                result[pfx] = uri
-        return result
+        # The ancestor walk and declaration collection run natively in a single
+        # lock; the returned pairs are outermost-first, so ``dict`` keeps the
+        # innermost binding per prefix (inner overrides outer), matching lxml.
+        return dict(self._node.nsmap())
 
     @property
     def prefix(self):

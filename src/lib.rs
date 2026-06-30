@@ -630,6 +630,39 @@ impl Node {
             .collect())
     }
 
+    /// The children lxml treats as element content: elements, comments and
+    /// processing instructions, in document order. Text and CDATA children are
+    /// excluded because lxml exposes those via `.text`/`.tail` rather than as
+    /// indexable children.
+    ///
+    /// Filtered natively under a single lock (walking the sibling chain), versus
+    /// the etree layer otherwise materialising every child and querying each
+    /// one's kind over FFI. This is hot: pyFF's whole-tree visits (`list(elt)`
+    /// recursion) hit it once per element.
+    fn content_children(&self) -> PyResult<Vec<Node>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut out = Vec::new();
+        let mut child = guard.doc.first_child(self.id);
+        while let Some(cid) = child {
+            if matches!(
+                guard.doc.node_kind(cid),
+                Some(NodeKind::Element(_))
+                    | Some(NodeKind::Comment(_))
+                    | Some(NodeKind::ProcessingInstruction(_))
+            ) {
+                out.push(Node {
+                    doc: Arc::clone(&self.doc),
+                    id: cid,
+                });
+            }
+            child = guard.doc.next_sibling(cid);
+        }
+        Ok(out)
+    }
+
     /// A stable integer identity for this node within its Document.
     ///
     /// Two `Node` handles referring to the same underlying node return the same
@@ -746,6 +779,49 @@ impl Node {
                 .collect()),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// In-scope namespace declarations for this element, as `(prefix, uri)`
+    /// pairs ordered outermost (root) first, so `dict(...)` of the result yields
+    /// inner declarations overriding outer ones. `prefix` is `None` for the
+    /// default namespace, matching lxml's `Element.nsmap` key convention.
+    ///
+    /// Walks this element and its ancestors in a single native pass (one lock)
+    /// rather than one FFI call per ancestor per declaration, which the etree
+    /// layer's `nsmap` property otherwise pays once per element when pyFF scans
+    /// the whole tree.
+    fn nsmap(&self) -> PyResult<Vec<(Option<String>, String)>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Collect this element and its ancestor elements, innermost first.
+        let mut chain: Vec<NodeId> = Vec::new();
+        let mut cur = Some(self.id);
+        while let Some(id) = cur {
+            match guard.doc.node_kind(id) {
+                Some(NodeKind::Element(_)) => {
+                    chain.push(id);
+                    cur = guard.doc.parent(id);
+                }
+                _ => break,
+            }
+        }
+        // Emit outermost first so a later (inner) entry wins under `dict(...)`.
+        let mut pairs = Vec::new();
+        for &id in chain.iter().rev() {
+            if let Some(NodeKind::Element(e)) = guard.doc.node_kind(id) {
+                for (p, u) in &e.namespace_declarations {
+                    let prefix = if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.to_string())
+                    };
+                    pairs.push((prefix, u.to_string()));
+                }
+            }
+        }
+        Ok(pairs)
     }
 
     /// Set the content of a Text, CDATA, or Comment node in place.
