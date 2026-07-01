@@ -1,6 +1,6 @@
 [package]
 name = "pyuppsala"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Python bindings for the Uppsala XML library"
 license = "BSD-2-Clause"
@@ -12,7 +12,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py310"] }
-uppsala = "0.6.0"
+# crates.io version requirement. 0.7.0 adds the XSLT 1.0 engine consumed by the
+# etree.XSLT facade.
+uppsala = "0.7.0"
 
 # The cdylib is the final artifact, so a max-optimization release profile pays off
 # here: fat LTO lets uppsala's SIMD/lookup-table scanning hot loops inline across

@@ -1035,6 +1035,28 @@ XsdValidator
          print(validator.is_valid_str("<name><bad/></name>"))  # False
          print(validator.is_valid_str("<unclosed"))  # False (malformed)
 
+   .. method:: set_lenient(lenient: bool) -> None
+
+      Enable **lenient**, libxml2-compatible validation of built-in datatypes.
+      Off by default (strict).
+
+      Strict mode applies a few built-in datatype checks that are tighter than
+      libxml2/lxml. The most common one to hit in practice: an ``anyURI`` value
+      that contains a **space** is rejected in strict mode but accepted by
+      libxml2 (and therefore by ``lxml``). Real-world documents rely on this
+      leniency -- for example SAML metadata whose ``anyURI`` fields hold a value
+      with an embedded space. Enable lenient mode when you want validation
+      results that match ``lxml.etree.XMLSchema``:
+
+      .. code-block:: python
+
+         validator = XsdValidator.from_file(schema_xml, schema_dir)
+         validator.set_lenient(True)   # match libxml2/lxml leniency
+         errors = validator.validate_str(metadata_xml)
+
+      Lenient mode only relaxes the known-stricter built-in checks; genuinely
+      invalid documents still report errors.
+
    .. method:: set_enforce_qname_length_facets(enforce: bool) -> None
 
       Configure whether length facets on QName/NOTATION types are enforced.

@@ -415,6 +415,33 @@ class TestSchemaDifferential:
             schema_p.assertValid(bad)
 
 
+class TestSchemaStandalone:
+    """XMLSchema behaviors that do not require a reference lxml install."""
+
+    ANYURI_SCHEMA = (
+        "<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'>"
+        "<xs:element name='u' type='xs:anyURI'/>"
+        "</xs:schema>"
+    )
+
+    def test_lenient_accepts_anyuri_with_space(self):
+        # anyURI with a space is invalid under strict XSD but accepted by
+        # libxml2/lxml; lenient=True wires the native set_lenient toggle to match.
+        doc = P.fromstring("<u>http://example.com/a b</u>")
+        strict = P.XMLSchema(P.fromstring(self.ANYURI_SCHEMA))
+        lenient = P.XMLSchema(P.fromstring(self.ANYURI_SCHEMA), lenient=True)
+        assert strict.validate(doc) is False
+        assert lenient.validate(doc) is True
+
+    def test_documentinvalid_error_log_is_per_instance(self):
+        # A class-level list would leak appends across instances.
+        a = P.DocumentInvalid("a")
+        b = P.DocumentInvalid("b")
+        a.error_log.append("x")
+        assert a.error_log == ["x"]
+        assert b.error_log == []
+
+
 @requires_lxml
 class TestExtendedDifferential:
     def test_slicing(self):
@@ -1017,3 +1044,266 @@ class TestDoctypeStandalone:
         tree = P.ElementTree(P.fromstring(DOCTYPE_DOC))
         out = P.tostring(tree, encoding="unicode", doctype="<!DOCTYPE other>")
         assert out == "<!DOCTYPE other>\n<root><a/></root>"
+
+
+# ---------------------------------------------------------------------------
+# XSLT 1.0 transformation
+# ---------------------------------------------------------------------------
+
+# An identity-ish stylesheet that strips ds:Signature and drops empty-text
+# whitespace nodes -- the shape pyFF's tidy.xsl relies on.
+TIDY_XSLT = (
+    '<xsl:stylesheet version="1.0"'
+    ' xmlns:xsl="http://www.w3.org/1999/XSL/Transform"'
+    ' xmlns:ds="http://www.w3.org/2000/09/xmldsig#">'
+    '<xsl:output method="xml" omit-xml-declaration="yes"/>'
+    '<xsl:template match="@*|node()">'
+    '<xsl:copy><xsl:apply-templates select="@*|node()"/></xsl:copy>'
+    "</xsl:template>"
+    '<xsl:template match="ds:Signature"/>'
+    "</xsl:stylesheet>"
+)
+
+XSLT_DOC = (
+    '<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">'
+    "<a>keep</a><ds:Signature>drop</ds:Signature><b>also</b>"
+    "</root>"
+)
+
+
+class TestXSLT:
+    @requires_lxml
+    def test_tidy_matches_lxml(self):
+        pres = P.XSLT(P.fromstring(TIDY_XSLT))(P.fromstring(XSLT_DOC)).getroot()
+        lres = L.XSLT(L.fromstring(TIDY_XSLT.encode()))(L.fromstring(XSLT_DOC.encode())).getroot()
+        assert L.canonicalize(P.tostring(pres, encoding="unicode")) == L.canonicalize(
+            L.tostring(lres).decode()
+        )
+
+    @requires_lxml
+    def test_value_of_matches_lxml(self):
+        ss = (
+            '<xsl:stylesheet version="1.0"'
+            ' xmlns:xsl="http://www.w3.org/1999/XSL/Transform">'
+            '<xsl:output method="xml" omit-xml-declaration="yes"/>'
+            '<xsl:template match="/"><out><xsl:value-of select="/a"/></out></xsl:template>'
+            "</xsl:stylesheet>"
+        )
+        p = str(P.XSLT(P.fromstring(ss))(P.fromstring("<a>hi</a>")))
+        assert "<out>hi</out>" in p
+
+    def test_result_getroot_and_str(self):
+        result = P.XSLT(P.fromstring(TIDY_XSLT))(P.fromstring(XSLT_DOC))
+        # Signature stripped, two element children remain.
+        root = result.getroot()
+        kids = [c.tag for c in root]
+        assert kids == ["a", "b"]
+        assert isinstance(str(result), str)
+        assert isinstance(bytes(result), bytes)
+
+    def test_error_log_empty_on_success(self):
+        t = P.XSLT(P.fromstring(TIDY_XSLT))
+        t(P.fromstring(XSLT_DOC))
+        assert t.error_log == []
+
+    def test_bad_stylesheet_raises_parse_error(self):
+        with pytest.raises(P.XSLTParseError):
+            P.XSLT(P.fromstring("<notxsl/>"))
+
+    def test_params_not_supported(self):
+        t = P.XSLT(P.fromstring(TIDY_XSLT))
+        with pytest.raises(NotImplementedError):
+            t(P.fromstring(XSLT_DOC), some_param="x")
+
+    def test_regexp_false_rejected(self):
+        # EXSLT regexp is always on; an explicit request to disable it must not
+        # be silently ignored.
+        with pytest.raises(NotImplementedError):
+            P.XSLT(P.fromstring(TIDY_XSLT), regexp=False)
+
+    def test_profile_run_rejected(self):
+        # There is no profiler; profile_run=True must not silently no-op.
+        t = P.XSLT(P.fromstring(TIDY_XSLT))
+        with pytest.raises(NotImplementedError):
+            t(P.fromstring(XSLT_DOC), profile_run=True)
+
+    def test_xslt_exception_hierarchy(self):
+        assert issubclass(P.XSLTParseError, P.XSLTError)
+        assert issubclass(P.XSLTApplyError, P.XSLTError)
+        assert issubclass(P.XSLTError, P.LxmlError)
+
+
+class TestSmartStringsCompat:
+    """lxml's smart_strings kwarg is accepted and ignored (pyFF passes it)."""
+
+    NS = {"md": "urn:oasis:names:tc:SAML:2.0:metadata"}
+    DOC = (
+        '<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">'
+        '<md:EntityDescriptor entityID="https://a"/>'
+        '<md:EntityDescriptor entityID="https://b"/>'
+        "</md:EntitiesDescriptor>"
+    )
+
+    def test_element_xpath_accepts_smart_strings(self):
+        root = P.fromstring(self.DOC)
+        res = root.xpath("//md:EntityDescriptor", namespaces=self.NS, smart_strings=False)
+        assert len(res) == 2
+
+    def test_attribute_xpath_returns_plain_str(self):
+        root = P.fromstring(self.DOC)
+        ids = root.xpath(
+            "//md:EntityDescriptor/@entityID", namespaces=self.NS, smart_strings=False
+        )
+        assert ids == ["https://a", "https://b"]
+        assert all(type(x) is str for x in ids)
+
+    def test_tree_xpath_accepts_smart_strings(self):
+        tree = P.ElementTree(P.fromstring(self.DOC))
+        res = tree.xpath("//md:EntityDescriptor", namespaces=self.NS, smart_strings=False)
+        assert len(res) == 2
+
+    def test_variables_still_rejected(self):
+        root = P.fromstring(self.DOC)
+        with pytest.raises(NotImplementedError):
+            root.xpath("//md:EntityDescriptor[@entityID=$e]", namespaces=self.NS, e="https://a")
+
+
+# ---------------------------------------------------------------------------
+# XInclude 1.0
+# ---------------------------------------------------------------------------
+
+
+def _write(p, name, content):
+    f = p / name
+    f.write_text(content, encoding="utf-8")
+    return f
+
+
+class TestXInclude:
+    def _setup(self, tmp_path):
+        _write(tmp_path, "inc1.xml", '<item id="1"><name>FR</name></item>')
+        _write(tmp_path, "inc2.xml", '<item id="2"><name>GR</name></item>')
+        _write(tmp_path, "note.txt", "plain text")
+        main = (
+            '<list xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="inc1.xml"/>tail1'
+            '<xi:include href="inc2.xml"/>'
+            '<xi:include href="note.txt" parse="text"/>'
+            '<xi:include href="missing.xml"><xi:fallback><item id="fb"/></xi:fallback></xi:include>'
+            "</list>"
+        )
+        return _write(tmp_path, "main.xml", main)
+
+    @requires_lxml
+    def test_xinclude_matches_lxml(self, tmp_path):
+        main = str(self._setup(tmp_path))
+        pt = P.parse(main)
+        pt.xinclude()
+        lt = L.parse(main)
+        lt.xinclude()
+        assert L.canonicalize(P.tostring(pt.getroot(), encoding="unicode")) == L.canonicalize(
+            L.tostring(lt.getroot()).decode()
+        )
+
+    def test_xinclude_xml_and_text_and_fallback(self, tmp_path):
+        main = str(self._setup(tmp_path))
+        tree = P.parse(main)
+        tree.xinclude()
+        root = tree.getroot()
+        ids = [c.get("id") for c in root]
+        assert ids == ["1", "2", "fb"]  # two xml includes + fallback element
+        assert "plain text" in P.tostring(root, encoding="unicode")
+        # no xi:include elements remain
+        assert root.find("{http://www.w3.org/2001/XInclude}include") is None
+
+    def test_xinclude_missing_without_fallback_raises(self, tmp_path):
+        main = _write(
+            tmp_path,
+            "bad.xml",
+            '<list xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="nope.xml"/></list>',
+        )
+        tree = P.parse(str(main))
+        with pytest.raises(P.XIncludeError):
+            tree.xinclude()
+
+    def test_xinclude_nested(self, tmp_path):
+        _write(tmp_path, "leaf.xml", "<leaf/>")
+        _write(
+            tmp_path,
+            "mid.xml",
+            '<mid xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="leaf.xml"/></mid>',
+        )
+        main = _write(
+            tmp_path,
+            "top.xml",
+            '<top xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="mid.xml"/></top>',
+        )
+        tree = P.parse(str(main))
+        tree.xinclude()
+        assert tree.getroot().find(".//leaf") is not None
+
+    def test_xinclude_network_blocked_by_default(self):
+        # Remote fetches are opt-in (anti-SSRF): a bare remote include with no
+        # fallback raises rather than performing the network request.
+        root = P.fromstring(
+            '<r xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="http://169.254.169.254/x"/></r>'
+        )
+        with pytest.raises(P.XIncludeError):
+            root.xinclude()
+
+    def test_xinclude_network_blocked_uses_fallback(self):
+        # A blocked remote target behaves like any other load failure, so its
+        # xi:fallback content is spliced in instead.
+        root = P.fromstring(
+            '<r xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="http://169.254.169.254/x">'
+            "<xi:fallback>SAFE</xi:fallback></xi:include></r>"
+        )
+        root.xinclude()
+        assert root.text == "SAFE"
+
+
+class TestNamespaceSerializationAndCopy:
+    """Sub-element serialization keeps inherited namespaces; deepcopy works."""
+
+    DOC = (
+        '<md:R xmlns:md="urn:md" xmlns:shibmd="urn:shib">'
+        '<md:E entityID="x"><md:X><shibmd:Scope>a</shibmd:Scope></md:X></md:E>'
+        "</md:R>"
+    )
+
+    def test_subelement_serialization_round_trips(self):
+        sub = P.fromstring(self.DOC)[0]  # md:E using inherited shibmd prefix
+        s = P.tostring(sub, encoding="unicode")
+        assert "xmlns:shibmd" in s
+        # must reparse standalone (the bug that broke pyFF)
+        P.fromstring(s)
+
+    @requires_lxml
+    def test_subelement_serialization_matches_lxml(self):
+        ps = P.tostring(P.fromstring(self.DOC)[0], encoding="unicode")
+        ls = L.tostring(L.fromstring(self.DOC.encode())[0]).decode()
+        assert L.canonicalize(ps) == L.canonicalize(ls)
+
+    def test_root_serialization_no_duplicate_ns(self):
+        root = P.fromstring('<r xmlns:p="urn:p"><p:c/></r>')
+        assert P.tostring(root, encoding="unicode") == '<r xmlns:p="urn:p"><p:c/></r>'
+
+    def test_deepcopy_is_detached_clone(self):
+        import copy
+
+        root = P.fromstring(self.DOC)
+        ent = root[0]
+        clone = copy.deepcopy(ent)
+        assert clone.get("entityID") == "x"
+        assert clone.getparent() is None  # detached
+        # mutating the clone does not touch the original
+        clone.set("entityID", "y")
+        assert ent.get("entityID") == "x"
+        # clone serializes standalone (inherited ns preserved)
+        P.fromstring(P.tostring(clone, encoding="unicode"))
+
+    def test_document_invalid_has_error_log(self):
+        assert P.DocumentInvalid("x").error_log == []

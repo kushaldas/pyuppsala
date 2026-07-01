@@ -1,6 +1,28 @@
 # Changelog
 
 
+## 0.7.0
+
+Built against uppsala 0.7.0, which adds an XSLT 1.0 engine. Highlights:
+
+### Added
+
+- `etree.XSLT` / `_XSLTResultTree` -- XSLT 1.0 transforms via uppsala's engine.
+- XInclude processing (`xi:include`, `parse="xml"`/`"text"`, `encoding`,
+  `fallback`), with a bounded remote-fetch timeout. Remote `http(s)`/`ftp`
+  fetches are opt-in via `xinclude(network_access=True)` (off by default, like
+  lxml's `no_network`).
+- Native `_ElementBase` fast paths (tag/text/tail/nsmap/len/iter), a native
+  descendant iterator, and `import_subtree` for faster cross-document copies.
+- `XsdValidator.set_lenient` for libxml2/lxml-compatible built-in datatype
+  validation, also exposed as `etree.XMLSchema(..., lenient=True)`.
+
+### Fixed
+
+- `DocumentInvalid.error_log` is now per-instance instead of a shared
+  class-level list.
+
+
 ## 0.6.0
 
 Built against uppsala 0.6.0, which brings the SIMD / lookup-table byte-scanning

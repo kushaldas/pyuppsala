@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Iterator, Optional, Union
 
 # Exceptions
 
@@ -84,6 +84,13 @@ class Node:
         """
         ...
     @property
+    def attribute_value(self) -> Optional[str]:
+        """For an attribute node (e.g. from an XPath ``@name`` / attribute-axis
+        selection), the attribute's string value; ``None`` for every other node
+        kind.
+        """
+        ...
+    @property
     def attributes(self) -> list[Attribute]:
         """The list of attributes for element nodes."""
         ...
@@ -98,6 +105,18 @@ class Node:
     @property
     def node_id(self) -> int:
         """A stable integer identity for this node within its Document."""
+        ...
+    def content_child_count(self) -> int:
+        """Number of element/comment/PI children, counted without materialising them."""
+        ...
+    def iter_descendants(self, tag: Optional[str] = None) -> Iterator[Node]:
+        """Lazy pre-order descendant iterator over this node and its subtree.
+
+        The tree walk and tag matching run natively. ``tag`` follows lxml:
+        ``None`` yields elements/comments/PIs, ``"*"`` yields elements only, and
+        a Clark-notation name (``"{ns}local"`` or ``"local"``) yields matching
+        elements. The node itself is included when it qualifies.
+        """
         ...
     @property
     def first_child(self) -> Optional[Node]:
@@ -237,6 +256,63 @@ class NodeIterator:
     def __iter__(self) -> NodeIterator: ...
     def __next__(self) -> Node: ...
 
+class _ElementBase:
+    """Native, subclassable base for ``pyuppsala.etree._Element``.
+
+    Owns the ``(_holder, _node, _id)`` state and the hot element methods that
+    have been ported to Rust. Internal: the etree layer subclasses this; it is
+    not part of the public native API.
+    """
+
+    def __init__(self, holder: object, node: Node, node_id: int) -> None: ...
+    @property
+    def _holder(self) -> object: ...
+    @_holder.setter
+    def _holder(self, value: object) -> None: ...
+    @property
+    def _node(self) -> Node: ...
+    @_node.setter
+    def _node(self, value: Node) -> None: ...
+    @property
+    def _id(self) -> int: ...
+    @_id.setter
+    def _id(self, value: int) -> None: ...
+    def __len__(self) -> int: ...
+    @property
+    def tag(self) -> object:
+        """Clark-notation tag for elements; Comment/PI factory for those nodes."""
+    @tag.setter
+    def tag(self, value: object) -> None: ...
+    @property
+    def text(self) -> Optional[str]:
+        """Leading text run (or comment/PI body); None if absent."""
+    @text.setter
+    def text(self, value: Optional[str]) -> None: ...
+    @property
+    def tail(self) -> Optional[str]:
+        """Trailing text run before the next sibling; None if absent."""
+    @tail.setter
+    def tail(self, value: Optional[str]) -> None: ...
+    @property
+    def nsmap(self) -> dict[Optional[str], str]:
+        """In-scope prefix->URI map (None key = default namespace)."""
+    @property
+    def prefix(self) -> Optional[str]:
+        """The namespace prefix of this element's tag, or None."""
+    @property
+    def sourceline(self) -> Optional[int]:
+        """The 1-based source line of this element."""
+
+def _register_element_helpers(
+    comment: object,
+    processing_instruction: object,
+    set_tag: object,
+    set_text: object,
+    set_tail: object,
+) -> None:
+    """Internal: hand the native _ElementBase its etree-layer callables."""
+    ...
+
 class Document:
     """An XML document.
 
@@ -341,6 +417,11 @@ class Document:
         ...
     def append_child(self, parent: Node, child: Node) -> None:
         """Append a child node to a parent node."""
+        ...
+    def import_subtree(self, source: Node) -> Node:
+        """Deep-copy ``source`` (a node from a different Document) and its whole
+        subtree into this document in one native pass, returning the new detached
+        node. Raises ValueError if ``source`` belongs to this same Document."""
         ...
     def set_namespace_declaration(
         self, node: Node, prefix: Optional[str], uri: str
@@ -458,6 +539,14 @@ class XsdValidator:
     def set_enforce_qname_length_facets(self, enforce: bool) -> None:
         """Configure whether QName/NOTATION length facets are enforced."""
         ...
+    def set_lenient(self, lenient: bool) -> None:
+        """Enable lenient (libxml2-compatible) built-in datatype validation.
+
+        Off by default (strict). When enabled, checks stricter than libxml2 are
+        relaxed to match it (notably: ``anyURI`` values containing a space are
+        accepted). Use for lxml-compatible validation of real-world documents.
+        """
+        ...
     def validate(self, doc: Document) -> list[ValidationError]:
         """Validate an XML document. Returns a list of errors (empty = valid)."""
         ...
@@ -559,6 +648,28 @@ class XsdRegex:
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
 
+class Xslt:
+    """A compiled XSLT 1.0 stylesheet.
+
+    Compile once and transform many documents to avoid re-parsing and
+    re-compiling the stylesheet on every call.
+    """
+
+    def __init__(
+        self, stylesheet_xml: str, *, exslt: bool = True, max_depth: Optional[int] = None
+    ) -> None:
+        """Compile an XSLT 1.0 stylesheet from its XML source text.
+
+        ``exslt`` enables the opt-in EXSLT extension-function library
+        (``str:``/``math:``/``set:``/``exsl:``); ``date:date-time()`` is always
+        available. ``max_depth`` overrides the template-activation recursion cap
+        (see ``DEFAULT_MAX_XSLT_DEPTH``).
+        """
+        ...
+    def transform(self, source_xml: str) -> str:
+        """Apply the stylesheet to a source XML string, returning the result."""
+        ...
+
 # Module-level functions
 
 def parse(
@@ -615,3 +726,6 @@ DEFAULT_MAX_REGEX_GROUP_DEPTH: int
 
 DEFAULT_MAX_REGEX_STEPS: int
 """Default maximum backtracking steps when matching an XSD regex (from uppsala's xsd_regex::DEFAULT_MAX_REGEX_STEPS)."""
+
+DEFAULT_MAX_XSLT_DEPTH: int
+"""Default maximum XSLT template-activation recursion depth (from uppsala's xslt::DEFAULT_MAX_XSLT_DEPTH)."""
