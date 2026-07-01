@@ -415,6 +415,33 @@ class TestSchemaDifferential:
             schema_p.assertValid(bad)
 
 
+class TestSchemaStandalone:
+    """XMLSchema behaviors that do not require a reference lxml install."""
+
+    ANYURI_SCHEMA = (
+        "<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'>"
+        "<xs:element name='u' type='xs:anyURI'/>"
+        "</xs:schema>"
+    )
+
+    def test_lenient_accepts_anyuri_with_space(self):
+        # anyURI with a space is invalid under strict XSD but accepted by
+        # libxml2/lxml; lenient=True wires the native set_lenient toggle to match.
+        doc = P.fromstring("<u>http://example.com/a b</u>")
+        strict = P.XMLSchema(P.fromstring(self.ANYURI_SCHEMA))
+        lenient = P.XMLSchema(P.fromstring(self.ANYURI_SCHEMA), lenient=True)
+        assert strict.validate(doc) is False
+        assert lenient.validate(doc) is True
+
+    def test_documentinvalid_error_log_is_per_instance(self):
+        # A class-level list would leak appends across instances.
+        a = P.DocumentInvalid("a")
+        b = P.DocumentInvalid("b")
+        a.error_log.append("x")
+        assert a.error_log == ["x"]
+        assert b.error_log == []
+
+
 @requires_lxml
 class TestExtendedDifferential:
     def test_slicing(self):
@@ -1088,6 +1115,18 @@ class TestXSLT:
         with pytest.raises(NotImplementedError):
             t(P.fromstring(XSLT_DOC), some_param="x")
 
+    def test_regexp_false_rejected(self):
+        # EXSLT regexp is always on; an explicit request to disable it must not
+        # be silently ignored.
+        with pytest.raises(NotImplementedError):
+            P.XSLT(P.fromstring(TIDY_XSLT), regexp=False)
+
+    def test_profile_run_rejected(self):
+        # There is no profiler; profile_run=True must not silently no-op.
+        t = P.XSLT(P.fromstring(TIDY_XSLT))
+        with pytest.raises(NotImplementedError):
+            t(P.fromstring(XSLT_DOC), profile_run=True)
+
     def test_xslt_exception_hierarchy(self):
         assert issubclass(P.XSLTParseError, P.XSLTError)
         assert issubclass(P.XSLTApplyError, P.XSLTError)
@@ -1203,6 +1242,27 @@ class TestXInclude:
         tree = P.parse(str(main))
         tree.xinclude()
         assert tree.getroot().find(".//leaf") is not None
+
+    def test_xinclude_network_blocked_by_default(self):
+        # Remote fetches are opt-in (anti-SSRF): a bare remote include with no
+        # fallback raises rather than performing the network request.
+        root = P.fromstring(
+            '<r xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="http://169.254.169.254/x"/></r>'
+        )
+        with pytest.raises(P.XIncludeError):
+            root.xinclude()
+
+    def test_xinclude_network_blocked_uses_fallback(self):
+        # A blocked remote target behaves like any other load failure, so its
+        # xi:fallback content is spliced in instead.
+        root = P.fromstring(
+            '<r xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="http://169.254.169.254/x">'
+            "<xi:fallback>SAFE</xi:fallback></xi:include></r>"
+        )
+        root.xinclude()
+        assert root.text == "SAFE"
 
 
 class TestNamespaceSerializationAndCopy:

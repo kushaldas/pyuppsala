@@ -72,6 +72,16 @@ __all__ = [
 ]
 
 
+# Per-evaluation node-visit budget applied by :meth:`_Element.xpath`. lxml's
+# ``.xpath()`` has no such cap, so the default is effectively unbounded to match
+# it (and to allow XPath over large *trusted* documents, e.g. a SAML aggregate
+# with thousands of entities, which would otherwise exceed the native
+# evaluator's much lower default). Applications that evaluate XPath over
+# UNTRUSTED input can lower this module attribute to restore an anti-DoS bound,
+# e.g. ``etree.MAX_XPATH_NODE_VISITS = _pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS``.
+MAX_XPATH_NODE_VISITS = sys.maxsize
+
+
 # ---------------------------------------------------------------------------
 # Exceptions (lxml-named hierarchy, mapping pyuppsala exceptions underneath)
 # ---------------------------------------------------------------------------
@@ -1248,9 +1258,10 @@ class _Element(_u._ElementBase):
             )
         # lxml's .xpath() has no per-evaluation node-visit cap; the native
         # evaluator defaults to one (anti-DoS) that is far too low for large
-        # trusted documents (e.g. a SAML aggregate with thousands of entities),
-        # so lift it to effectively unbounded here to match lxml semantics.
-        ev = _u.XPathEvaluator(max_node_visits=sys.maxsize)
+        # trusted documents (e.g. a SAML aggregate with thousands of entities).
+        # The budget is the module-level ``MAX_XPATH_NODE_VISITS`` (unbounded by
+        # default to match lxml), which applications can lower for untrusted input.
+        ev = _u.XPathEvaluator(max_node_visits=MAX_XPATH_NODE_VISITS)
         if namespaces:
             for pfx, uri in namespaces.items():
                 if pfx:
@@ -1266,7 +1277,7 @@ class _Element(_u._ElementBase):
             raise XPathEvalError(str(e)) from e
         return _wrap_xpath_result(self._holder, result)
 
-    def xinclude(self):
+    def xinclude(self, *, network_access=False):
         """Process W3C XInclude ``xi:include`` directives in this subtree.
 
         Replaces each ``{http://www.w3.org/2001/XInclude}include`` element with
@@ -1274,10 +1285,19 @@ class _Element(_u._ElementBase):
         included document's root element; ``parse="text"`` inserts its text. A
         child ``xi:fallback`` provides content if the resource cannot be loaded.
         Relative ``href`` values resolve against the document's ``base_url``
-        (set by :func:`parse`); ``http(s)``/``file`` URLs and filesystem paths
-        are supported. Processing is recursive (included XML is itself scanned).
+        (set by :func:`parse`); ``file`` URLs and filesystem paths are always
+        supported. Processing is recursive (included XML is itself scanned).
+
+        Remote ``http(s)``/``ftp`` targets are only fetched when
+        ``network_access=True``. The default is off (matching lxml parsers'
+        ``no_network=True`` default) so that running XInclude over untrusted XML
+        cannot be turned into an SSRF / data-exfiltration vector; a blocked
+        network target behaves like any other load failure (its ``xi:fallback``
+        is used if present, otherwise :class:`XIncludeError` is raised).
         """
-        _process_xincludes(self, self._holder.base_url)
+        _process_xincludes(
+            self, self._holder.base_url, allow_network=network_access
+        )
 
     # -- misc properties --------------------------------------------------
 
@@ -1488,15 +1508,16 @@ class _ElementTree:
         self._root = el._node
         return el
 
-    def xinclude(self):
+    def xinclude(self, *, network_access=False):
         """Process W3C XInclude ``xi:include`` directives in place.
 
         Relative ``href`` references resolve against the tree's ``base_url``
-        (set by :func:`parse`). See :meth:`_Element.xinclude`.
+        (set by :func:`parse`). See :meth:`_Element.xinclude` (including the
+        ``network_access`` opt-in for remote targets).
         """
         root = self.getroot()
         if root is not None:
-            root.xinclude()
+            root.xinclude(network_access=network_access)
 
     def write(
         self,
@@ -2133,9 +2154,15 @@ class XMLSchema:
     Build from a parsed schema element (``XMLSchema(schema_root)``) or a schema
     file (``XMLSchema(file=...)``). As with the native validator, the schema must
     not include an ``<?xml ...?>`` declaration.
+
+    Pass ``lenient=True`` to enable libxml2/lxml-compatible built-in datatype
+    validation (wraps the native :meth:`pyuppsala.XsdValidator.set_lenient`).
+    This is off by default (strict); turning it on notably makes ``anyURI``
+    values containing a space valid, as libxml2/lxml accept them, which is
+    needed to match lxml on real-world documents such as SAML metadata.
     """
 
-    def __init__(self, etree=None, *, file=None, base_path=None):
+    def __init__(self, etree=None, *, file=None, base_path=None, lenient=False):
         # ``base_path`` (a directory) lets the native validator resolve
         # ``xsd:import``/``xsd:include`` ``schemaLocation`` references. When a
         # filesystem ``file`` is given it defaults to that file's directory,
@@ -2161,6 +2188,8 @@ class XMLSchema:
                 self._validator = _u.XsdValidator(schema_xml)
         except _u.XsdValidationError as e:
             raise XMLSchemaParseError(str(e)) from e
+        if lenient:
+            self._validator.set_lenient(True)
         # Populated by validate(); mirrors lxml's ``.error_log`` (best effort).
         self.error_log = []
 
@@ -2287,6 +2316,11 @@ class XSLT:
             raise NotImplementedError("XSLT extension functions are not supported")
         if access_control is not None:
             raise NotImplementedError("XSLT access control is not supported")
+        # EXSLT regexp support is always enabled in the engine (lxml's default is
+        # regexp=True). We cannot turn it off, so reject regexp=False rather than
+        # silently ignoring a caller's explicit request to disable it.
+        if not regexp:
+            raise NotImplementedError("disabling EXSLT regexp support is not supported")
         stylesheet_xml = tostring(xslt_input, encoding="unicode")
         try:
             self._native = _u.Xslt(stylesheet_xml)
@@ -2297,6 +2331,11 @@ class XSLT:
 
     def __call__(self, _input, profile_run=False, **kwargs):
         """Apply the stylesheet to ``_input`` (an element or tree)."""
+        # lxml exposes ``profile_run=True`` to attach a profiling tree to the
+        # result; the native engine has no profiler, so reject it rather than
+        # silently returning an unprofiled result.
+        if profile_run:
+            raise NotImplementedError("XSLT profile_run is not supported")
         if kwargs:
             names = ", ".join(sorted(kwargs))
             raise NotImplementedError(
@@ -2357,13 +2396,21 @@ def _xinclude_resolve(href, base_url):
     return href  # relative to the current working directory
 
 
-def _xinclude_read_bytes(resolved):
+def _xinclude_read_bytes(resolved, allow_network=False):
     """Fetch the bytes for a resolved XInclude target (http(s)/ftp/file/path)."""
     import urllib.parse
     import urllib.request
 
     parts = urllib.parse.urlparse(resolved)
     if parts.scheme in ("http", "https", "ftp"):
+        # Remote fetches are opt-in (see _Element.xinclude): refusing them by
+        # default prevents SSRF / data exfiltration when XInclude is applied to
+        # untrusted XML. Raising here lets any xi:fallback take over.
+        if not allow_network:
+            raise XIncludeError(
+                "remote XInclude fetch of %r requires network_access=True"
+                % resolved
+            )
         # Bound the fetch so a slow/unresponsive remote target cannot hang
         # processing indefinitely (important for batch/service use).
         with urllib.request.urlopen(  # noqa: S310
@@ -2389,7 +2436,7 @@ def _xinclude_insert_text(parent, idx, text):
         prev.tail = (prev.tail or "") + text
 
 
-def _process_xincludes(elem, base_url, _depth=0):
+def _process_xincludes(elem, base_url, _depth=0, *, allow_network=False):
     """Recursively expand ``xi:include`` directives within ``elem`` in place."""
     if _depth > _XINCLUDE_MAX_DEPTH:
         raise XIncludeError("XInclude recursion limit exceeded")
@@ -2410,12 +2457,14 @@ def _process_xincludes(elem, base_url, _depth=0):
         if not isinstance(child.tag, str):
             continue  # comment / processing instruction
         if child.tag == _XI_INCLUDE:
-            _expand_include(elem, child, base_url, _depth)
+            _expand_include(elem, child, base_url, _depth, allow_network)
         else:
-            _process_xincludes(child, base_url, _depth)
+            _process_xincludes(
+                child, base_url, _depth, allow_network=allow_network
+            )
 
 
-def _expand_include(parent, include, base_url, depth):
+def _expand_include(parent, include, base_url, depth, allow_network=False):
     """Replace a single ``xi:include`` element with its referenced content."""
     href = include.get("href")
     parse_kind = include.get("parse", "xml")
@@ -2429,7 +2478,7 @@ def _expand_include(parent, include, base_url, depth):
         if href is None:
             raise XIncludeError("xi:include without href is not supported")
         resolved = _xinclude_resolve(href, base_url)
-        data = _xinclude_read_bytes(resolved)
+        data = _xinclude_read_bytes(resolved, allow_network)
     except (OSError, ValueError, XIncludeError) as exc:
         load_error = exc
 
@@ -2443,7 +2492,9 @@ def _expand_include(parent, include, base_url, depth):
                 "could not load XInclude href %r: %s" % (href, load_error)
             )
         # Expand any includes nested in the fallback, then splice its content in.
-        _process_xincludes(fallback, base_url, depth + 1)
+        _process_xincludes(
+            fallback, base_url, depth + 1, allow_network=allow_network
+        )
         _xinclude_insert_text(parent, idx, fallback.text)
         kids = list(fallback)
         for offset, kid in enumerate(kids):
@@ -2474,6 +2525,8 @@ def _expand_include(parent, include, base_url, depth):
     # recursively expanding any includes it contains (resolved against its own
     # location). insert() deep-copies the cross-document subtree into this tree.
     included = fromstring(data)
-    _process_xincludes(included, resolved, depth + 1)
+    _process_xincludes(
+        included, resolved, depth + 1, allow_network=allow_network
+    )
     included.tail = tail
     parent.insert(idx, included)

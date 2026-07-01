@@ -84,6 +84,13 @@ class Node:
         """
         ...
     @property
+    def attribute_value(self) -> Optional[str]:
+        """For an attribute node (e.g. from an XPath ``@name`` / attribute-axis
+        selection), the attribute's string value; ``None`` for every other node
+        kind.
+        """
+        ...
+    @property
     def attributes(self) -> list[Attribute]:
         """The list of attributes for element nodes."""
         ...

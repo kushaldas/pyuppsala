@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Iterator, Optional, Union
 
+# Per-evaluation node-visit budget applied by ``_Element.xpath`` (unbounded by
+# default to match lxml; lower it to restore an anti-DoS bound on untrusted input).
+MAX_XPATH_NODE_VISITS: int
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -129,7 +133,7 @@ class _Element:
         smart_strings: bool = True,
         **variables: Any,
     ) -> Any: ...
-    def xinclude(self) -> None: ...
+    def xinclude(self, *, network_access: bool = False) -> None: ...
 
 class _Attrib:
     def __getitem__(self, key: _TagName) -> str: ...
@@ -183,7 +187,7 @@ class _ElementTree:
     def parse(
         self, source: Any, parser: Optional[XMLParser] = None, base_url: Optional[str] = None
     ) -> _Element: ...
-    def xinclude(self) -> None: ...
+    def xinclude(self, *, network_access: bool = False) -> None: ...
     def write(
         self,
         file: Any,
@@ -310,6 +314,7 @@ class XMLSchema:
         *,
         file: Any = None,
         base_path: Optional[str] = None,
+        lenient: bool = False,
     ) -> None: ...
     def validate(self, tree: Union[_Element, _ElementTree]) -> bool: ...
     def assertValid(self, tree: Union[_Element, _ElementTree]) -> None: ...
