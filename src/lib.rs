@@ -2000,23 +2000,41 @@ impl Document {
     /// The element's own namespace declarations are copied; namespaces inherited
     /// from ancestors outside the subtree remain the caller's responsibility.
     ///
-    /// Locks the source document first, then this one. The source must be a
-    /// different `Document`; importing from the same document raises ValueError
-    /// (use the move/detach path instead).
+    /// Locks both documents, in a fixed global order (by `Arc` address) so
+    /// concurrent imports in opposite directions cannot deadlock. The source
+    /// must be a different `Document`; importing from the same document raises
+    /// ValueError (use the move/detach path instead).
     fn import_subtree(&self, source: &Node) -> PyResult<Node> {
         if Arc::ptr_eq(&self.inner, &source.doc) {
             return Err(PyValueError::new_err(
                 "import_subtree requires a node from a different Document",
             ));
         }
-        let src_guard = source
-            .doc
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mut dst_guard = self
-            .inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Acquire both document mutexes in a fixed global order (by Arc address)
+        // so two threads importing in opposite directions (A<-B and B<-A) cannot
+        // deadlock. Only the lock order differs between branches; the tuple is
+        // always (source guard, dest guard).
+        let (src_guard, mut dst_guard) = if Arc::as_ptr(&self.inner) < Arc::as_ptr(&source.doc) {
+            let dst_guard = self
+                .inner
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let src_guard = source
+                .doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            (src_guard, dst_guard)
+        } else {
+            let src_guard = source
+                .doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let dst_guard = self
+                .inner
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            (src_guard, dst_guard)
+        };
         let new_id = dst_guard
             .doc
             .import_subtree(&src_guard.doc, source.id)

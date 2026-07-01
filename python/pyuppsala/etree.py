@@ -2437,7 +2437,13 @@ def _xinclude_insert_text(parent, idx, text):
 
 
 def _process_xincludes(elem, base_url, _depth=0, *, allow_network=False):
-    """Recursively expand ``xi:include`` directives within ``elem`` in place."""
+    """Recursively expand ``xi:include`` directives within ``elem`` in place.
+
+    ``_depth`` tracks the Python recursion depth (it increments on every
+    tree descent, not just at ``xi:include`` boundaries) so that a pathological
+    deeply nested document is rejected with :class:`XIncludeError` before it can
+    exhaust Python's own recursion limit.
+    """
     if _depth > _XINCLUDE_MAX_DEPTH:
         raise XIncludeError("XInclude recursion limit exceeded")
     if _depth == 0:
@@ -2456,11 +2462,13 @@ def _process_xincludes(elem, base_url, _depth=0, *, allow_network=False):
     for child in list(elem):
         if not isinstance(child.tag, str):
             continue  # comment / processing instruction
+        # Descending to a child is one level deeper regardless of whether it is
+        # an xi:include, so bump _depth on both branches to bound recursion.
         if child.tag == _XI_INCLUDE:
-            _expand_include(elem, child, base_url, _depth, allow_network)
+            _expand_include(elem, child, base_url, _depth + 1, allow_network)
         else:
             _process_xincludes(
-                child, base_url, _depth, allow_network=allow_network
+                child, base_url, _depth + 1, allow_network=allow_network
             )
 
 
