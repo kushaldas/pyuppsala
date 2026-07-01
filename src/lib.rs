@@ -1,6 +1,8 @@
 use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
+use pyo3::types::PyDict;
 
 use std::sync::{Arc, Mutex};
 use uppsala::dom::{Attribute as UAttribute, NodeId, NodeKind, QName as UQName, XmlWriteOptions};
@@ -686,6 +688,88 @@ impl Node {
         Ok(out)
     }
 
+    /// The number of content children (elements, comments and processing
+    /// instructions), counted natively without materialising any `Node`.
+    ///
+    /// Backs the etree layer's `_Element.__len__`. `list(elt)` asks for the
+    /// length as a sizing hint *and* then iterates, so a plain
+    /// `len(content_children())` built and threw away a whole `Vec<Node>` on the
+    /// length call alone; counting in place avoids that allocation on the hot
+    /// whole-tree-visit path.
+    fn content_child_count(&self) -> PyResult<usize> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut n = 0usize;
+        let mut child = guard.doc.first_child(self.id);
+        while let Some(cid) = child {
+            if matches!(
+                guard.doc.node_kind(cid),
+                Some(NodeKind::Element(_))
+                    | Some(NodeKind::Comment(_))
+                    | Some(NodeKind::ProcessingInstruction(_))
+            ) {
+                n += 1;
+            }
+            child = guard.doc.next_sibling(cid);
+        }
+        Ok(n)
+    }
+
+    /// The element's leading text/CDATA run as a single string (etree `.text`).
+    ///
+    /// ElementTree exposes `.text` as the contiguous run of Text/CDATA nodes that
+    /// starts at the first child; with `strip_cdata=False` that run can mix Text
+    /// and CDATA nodes, which the public string concatenates. Returns `None` when
+    /// the first child is not a text node (no leading text), matching lxml.
+    /// Walks the whole run under a single lock, versus the Python layer's per-node
+    /// `first_child`/`kind`/`text`/`next_sibling` FFI calls.
+    fn leading_text_run(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut out: Option<String> = None;
+        let mut child = guard.doc.first_child(self.id);
+        while let Some(cid) = child {
+            match guard.doc.node_kind(cid) {
+                Some(NodeKind::Text(_)) | Some(NodeKind::CData(_)) => {
+                    let s = guard.doc.text_content(cid).unwrap_or("");
+                    out.get_or_insert_with(String::new).push_str(s);
+                    child = guard.doc.next_sibling(cid);
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// The element's trailing text/CDATA run as a single string (etree `.tail`).
+    ///
+    /// The contiguous run of Text/CDATA nodes that starts at this node's next
+    /// sibling, concatenated; `None` when the next sibling is not a text node.
+    /// Single-lock equivalent of the Python `_following_text_run` + `_run_text`.
+    fn tail_text_run(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut out: Option<String> = None;
+        let mut sib = guard.doc.next_sibling(self.id);
+        while let Some(sid) = sib {
+            match guard.doc.node_kind(sid) {
+                Some(NodeKind::Text(_)) | Some(NodeKind::CData(_)) => {
+                    let s = guard.doc.text_content(sid).unwrap_or("");
+                    out.get_or_insert_with(String::new).push_str(s);
+                    sib = guard.doc.next_sibling(sid);
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// A stable integer identity for this node within its Document.
     ///
     /// Two `Node` handles referring to the same underlying node return the same
@@ -1230,6 +1314,243 @@ impl Node {
 
     fn __bool__(&self) -> bool {
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ElementBase -- native base class for the etree `_Element`
+// ---------------------------------------------------------------------------
+
+/// The etree `Comment` / `ProcessingInstruction` factory callables and the
+/// Python tag-setter helper, registered once from `etree.py` at import time via
+/// `_register_element_helpers`. The native `.tag` getter must return the *exact*
+/// `Comment` / `ProcessingInstruction` objects for comment/PI nodes so that
+/// `elem.tag is Comment` holds (lxml compatibility), and the `.tag` setter
+/// delegates the (cold) namespace-finalisation logic back to Python rather than
+/// re-implementing `_finalize_element_ns` / `_prefix_for_ns` in Rust.
+static COMMENT_FACTORY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static PI_FACTORY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SET_TAG_CB: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SET_TEXT_CB: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SET_TAIL_CB: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// Register the etree helper callables the native `ElementBase` needs. Called
+/// once from `pyuppsala.etree` at import; subsequent calls are ignored. The
+/// `set_*` callbacks carry the cold, mutation-heavy property setters (renaming,
+/// text/tail replacement) that stay in Python; the matching getters are native.
+#[pyfunction]
+fn _register_element_helpers(
+    py: Python<'_>,
+    comment: Py<PyAny>,
+    processing_instruction: Py<PyAny>,
+    set_tag: Py<PyAny>,
+    set_text: Py<PyAny>,
+    set_tail: Py<PyAny>,
+) -> PyResult<()> {
+    let _ = COMMENT_FACTORY.set(py, comment);
+    let _ = PI_FACTORY.set(py, processing_instruction);
+    let _ = SET_TAG_CB.set(py, set_tag);
+    let _ = SET_TEXT_CB.set(py, set_text);
+    let _ = SET_TAIL_CB.set(py, set_tail);
+    Ok(())
+}
+
+/// Invoke a registered Python setter callback `cb(self, value)`; used by the
+/// native text/tail/tag setters to delegate the cold mutation logic to Python.
+fn call_setter(
+    cell: &PyOnceLock<Py<PyAny>>,
+    slf: Bound<'_, ElementBase>,
+    value: Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let py = slf.py();
+    let cb = cell
+        .get(py)
+        .ok_or_else(|| PyRuntimeError::new_err("etree element helpers not registered"))?;
+    cb.call1(py, (slf, value))?;
+    Ok(())
+}
+
+/// Subclassable native base for `pyuppsala.etree._Element`.
+///
+/// The etree layer's `_Element` is a live, identity-stable view over a node in
+/// a native `Document`. Historically it was a pure-Python class holding three
+/// slots (`_holder`, `_node`, `_id`); this base lets the hot methods move into
+/// Rust one area at a time while the Python `_Element` subclass keeps the colder
+/// methods (mutation, serialization, find, xinclude). Because every proxy is the
+/// same type and shares one per-document cache, the move must be all-or-nothing
+/// at the *type* level, hence a subclassable base rather than a parallel class.
+///
+/// State mirrors the old slots and is exposed under the same names (`_holder`,
+/// `_node`, `_id`) as read/write properties, so the existing Python methods and
+/// the cross-tree `_repoint_subtree` keep working unchanged: the cache still
+/// refreshes `_node` after mutations and repoint still re-points `_holder`/
+/// `_node`/`_id`. `weakref` is enabled so the per-document proxy cache can hold
+/// callback-free `weakref.ref`s to these instances.
+#[pyclass(subclass, weakref, name = "_ElementBase")]
+struct ElementBase {
+    /// The Python `_DocHolder` that owns the document and the proxy cache.
+    holder: Py<PyAny>,
+    /// The native `Node` handle this proxy currently points at.
+    node: Py<Node>,
+    /// The node's stable per-document id (mirrors `Node.node_id`).
+    node_id: usize,
+}
+
+#[pymethods]
+impl ElementBase {
+    #[new]
+    fn new(holder: Py<PyAny>, node: Py<Node>, node_id: usize) -> Self {
+        ElementBase {
+            holder,
+            node,
+            node_id,
+        }
+    }
+
+    #[getter(_holder)]
+    fn get_holder(&self, py: Python<'_>) -> Py<PyAny> {
+        self.holder.clone_ref(py)
+    }
+
+    #[setter(_holder)]
+    fn set_holder(&mut self, value: Py<PyAny>) {
+        self.holder = value;
+    }
+
+    #[getter(_node)]
+    fn get_node(&self, py: Python<'_>) -> Py<Node> {
+        self.node.clone_ref(py)
+    }
+
+    #[setter(_node)]
+    fn set_node(&mut self, value: Py<Node>) {
+        self.node = value;
+    }
+
+    #[getter(_id)]
+    fn get_id(&self) -> usize {
+        self.node_id
+    }
+
+    #[setter(_id)]
+    fn set_id(&mut self, value: usize) {
+        self.node_id = value;
+    }
+
+    /// The number of child elements (and comments/PIs) -- etree `__len__`.
+    ///
+    /// Counts natively without materialising the child list (see
+    /// `Node.content_child_count`), since `list(elt)` asks for the length as a
+    /// sizing hint before iterating.
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        self.node.bind(py).borrow().content_child_count()
+    }
+
+    /// The element's tag in Clark `{uri}local` notation.
+    ///
+    /// This is the single hottest getter in the etree layer (read once per node
+    /// on every whole-tree walk), so the element case is a single native call
+    /// returning the Clark string directly, with no Python frame and no
+    /// intermediate `QName`. Comment and processing-instruction nodes return the
+    /// `Comment` / `ProcessingInstruction` factory (so `elem.tag is Comment`
+    /// identifies a comment, matching lxml); any other kind returns `None`.
+    #[getter(tag)]
+    fn get_tag(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let node_ref = self.node.bind(py).borrow();
+        if let Some(clark) = node_ref.clark_tag()? {
+            return Ok(clark.into_pyobject(py)?.into_any().unbind());
+        }
+        let kind = node_ref.kind()?;
+        match kind.as_str() {
+            "comment" => Ok(COMMENT_FACTORY
+                .get(py)
+                .map(|f| f.clone_ref(py))
+                .unwrap_or_else(|| py.None())),
+            "processing_instruction" => Ok(PI_FACTORY
+                .get(py)
+                .map(|f| f.clone_ref(py))
+                .unwrap_or_else(|| py.None())),
+            _ => Ok(py.None()),
+        }
+    }
+
+    /// Rename the element, keeping its namespace declared/in scope.
+    ///
+    /// The namespace-finalisation logic (reuse an in-scope binding for the new
+    /// URI, else declare/generate a prefix) is cold and intricate, so it is left
+    /// in Python: this setter forwards the live element and the new value to the
+    /// registered `_set_element_tag` callback.
+    #[setter(tag)]
+    fn set_tag(slf: Bound<'_, Self>, value: Bound<'_, PyAny>) -> PyResult<()> {
+        call_setter(&SET_TAG_CB, slf, value)
+    }
+
+    /// The text directly inside this element, before its first child, or `None`.
+    ///
+    /// For comment / processing-instruction nodes this is the comment / PI body
+    /// instead, matching lxml. For elements it is the leading Text/CDATA run (see
+    /// `Node.leading_text_run`).
+    #[getter(text)]
+    fn get_text(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let node_ref = self.node.bind(py).borrow();
+        match node_ref.kind()?.as_str() {
+            "comment" => node_ref.comment_text(),
+            "processing_instruction" => node_ref.pi_data(),
+            _ => node_ref.leading_text_run(),
+        }
+    }
+
+    /// Set leading text (or the comment/PI body), replacing the existing run.
+    /// The mutation logic is cold and intricate, so it stays in Python.
+    #[setter(text)]
+    fn set_text(slf: Bound<'_, Self>, value: Bound<'_, PyAny>) -> PyResult<()> {
+        call_setter(&SET_TEXT_CB, slf, value)
+    }
+
+    /// The text following this element's end tag, before the next sibling, or
+    /// `None` -- the trailing Text/CDATA run (see `Node.tail_text_run`).
+    #[getter(tail)]
+    fn get_tail(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.node.bind(py).borrow().tail_text_run()
+    }
+
+    /// Set trailing text, replacing the existing run. Cold; stays in Python.
+    #[setter(tail)]
+    fn set_tail(slf: Bound<'_, Self>, value: Bound<'_, PyAny>) -> PyResult<()> {
+        call_setter(&SET_TAIL_CB, slf, value)
+    }
+
+    /// Mapping of in-scope prefixes to URIs (None key = default namespace).
+    ///
+    /// The ancestor walk and declaration collection run natively in a single lock
+    /// (`Node.nsmap`), returning pairs outermost-first; building the dict here in
+    /// Rust keeps the inner (later) binding per prefix, matching lxml, and avoids
+    /// the Python property frame plus the `dict(...)` call.
+    #[getter(nsmap)]
+    fn get_nsmap(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let pairs = self.node.bind(py).borrow().nsmap()?;
+        let d = PyDict::new(py);
+        for (prefix, uri) in pairs {
+            d.set_item(prefix, uri)?;
+        }
+        Ok(d.unbind())
+    }
+
+    /// The namespace prefix of this element's tag, or None.
+    #[getter(prefix)]
+    fn get_prefix(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let q = self.node.bind(py).borrow().tag()?;
+        Ok(q.and_then(|qn| qn.prefix().map(|s| s.to_string())))
+    }
+
+    /// The 1-based source line of this element, or None for built nodes.
+    #[getter(sourceline)]
+    fn get_sourceline(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        match self.node.bind(py).borrow().line() {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Ok(None),
+        }
     }
 }
 
@@ -2101,6 +2422,17 @@ impl XsdValidator {
         self.inner.set_enforce_qname_length_facets(enforce);
     }
 
+    /// Configure lenient validation of built-in datatypes.
+    ///
+    /// Off by default (strict). When enabled, a handful of built-in datatype
+    /// checks that are stricter than libxml2 are relaxed to match it -- notably
+    /// ``anyURI`` values containing a space are accepted (libxml2/lxml also
+    /// accept them). Turn this on for lxml-compatible validation of real-world
+    /// documents (e.g. SAML metadata whose ``anyURI`` values contain spaces).
+    fn set_lenient(&mut self, lenient: bool) {
+        self.inner.set_lenient(lenient);
+    }
+
     /// Validate an XML document against this schema.
     ///
     /// Returns a list of ValidationError objects. An empty list means valid.
@@ -2599,6 +2931,7 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Classes
     m.add_class::<Document>()?;
     m.add_class::<Node>()?;
+    m.add_class::<ElementBase>()?;
     m.add_class::<QName>()?;
     m.add_class::<Attribute>()?;
     m.add_class::<XPathEvaluator>()?;
@@ -2611,6 +2944,7 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Functions
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(parse_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_element_helpers, m)?)?;
 
     // Default resource-limit constants (uppsala 0.4.0 / 0.5.0 hardening)
     m.add("DEFAULT_MAX_DEPTH", DEFAULT_MAX_DEPTH)?;

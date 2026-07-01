@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from weakref import WeakValueDictionary
+from weakref import ref as _weakref
 
 from . import _elementpath as ElementPath
 from . import _pyuppsala as _u
@@ -340,12 +340,26 @@ _TEXT_KINDS = ("text", "cdata")
 class _DocHolder:
     """Owns one native Document and an identity-stable proxy cache."""
 
-    __slots__ = ("doc", "_proxies", "_ns_counter", "base_url", "__weakref__")
+    __slots__ = ("doc", "_proxies", "_ns_counter", "base_url", "_sweep_at", "__weakref__")
 
     def __init__(self, doc):
         self.doc = doc
-        self._proxies = WeakValueDictionary()
+        # node_id -> weakref.ref(_Element), *without* a death callback. A plain
+        # dict of callback-free weakrefs is markedly cheaper than
+        # WeakValueDictionary on the hot tree-walk path: pyFF's iter()/with_tree
+        # walks create a proxy per node and drop it immediately (no re-access),
+        # so WeakValueDictionary paid, per node, both a KeyedRef-with-callback
+        # creation *and* the callback firing on the proxy's near-instant death
+        # (~25% of with_tree wall time was this churn). Callback-free refs skip
+        # the death callback entirely; dead entries are reclaimed by the bounded
+        # lazy sweep below instead.
+        self._proxies = {}
         self._ns_counter = 0
+        # Size at which proxy() next sweeps dead refs. Re-armed after each sweep
+        # to a small multiple of the live count, so during a transient walk the
+        # cache holds at most ~this many tombstones (bounded memory) and the
+        # total sweep work stays O(nodes visited).
+        self._sweep_at = 256
         # Base URL/path for resolving relative XInclude hrefs (set by parse()).
         self.base_url = None
 
@@ -355,27 +369,42 @@ class _DocHolder:
         Looks the node up by its stable ``node_id`` in the per-document cache so
         that repeated lookups of the same underlying node return the *same*
         Python object (``root[0] is root[0]``), matching lxml. ``node_id`` values
-        are never reused by uppsala's arena, so cached entries stay valid for the
-        life of the document; the ``WeakValueDictionary`` drops entries once no
-        Python code holds the wrapper.
+        are never reused by uppsala's arena, so a cached wrapper stays valid for
+        the life of the document; entries are weak, so the wrapper is collected
+        once no Python code holds it and the slot is later swept.
         """
         if node is None:
             return None
         nid = node.node_id
-        el = self._proxies.get(nid)
-        if el is None:
-            # Build the wrapper directly (bypassing __init__, which _Element
-            # does not define) and register it in the cache.
-            el = _Element.__new__(_Element)
-            el._holder = self
-            el._node = node
-            el._id = nid
-            self._proxies[nid] = el
-        else:
-            # Refresh the live native handle: the cached wrapper's stored Node
-            # may be stale after tree mutations, but its node_id is unchanged.
-            el._node = node
+        proxies = self._proxies
+        r = proxies.get(nid)
+        if r is not None:
+            el = r()
+            if el is not None:
+                # Refresh the live native handle: the cached wrapper's stored
+                # Node may be stale after tree mutations, but its id is unchanged.
+                el._node = node
+                return el
+            # Dead weakref (proxy was collected): fall through and recreate.
+        # Build the wrapper via the native base constructor (holder, node, id)
+        # and register a callback-free weakref to it in the cache.
+        el = _Element(self, node, nid)
+        proxies[nid] = _weakref(el)
+        # Opportunistically reclaim tombstones. Without WeakValueDictionary's
+        # death callback nothing removes a dead entry on its own, so sweep here
+        # once the cache crosses the armed threshold.
+        if len(proxies) >= self._sweep_at:
+            self._sweep()
         return el
+
+    def _sweep(self):
+        """Drop cache entries whose weakref has died, then re-arm the threshold."""
+        proxies = self._proxies
+        for k in [k for k, r in proxies.items() if r() is None]:
+            del proxies[k]
+        # Re-arm to a multiple of the surviving live count so steady-state walks
+        # amortise the sweep and memory stays bounded near the live set size.
+        self._sweep_at = max(256, len(proxies) * 2)
 
     def new_prefix(self, node):
         """Generate a fresh ``ns<N>`` prefix not already in scope on ``node``.
@@ -517,13 +546,17 @@ def _repoint_subtree(src_holder, dst, snode, dnode):
     # (hundreds of nodes per entity) is avoided.
     if not src_holder._proxies:
         return
-    proxy = src_holder._proxies.get(snode.node_id)
-    if proxy is not None:
+    r = src_holder._proxies.get(snode.node_id)
+    proxy = r() if r is not None else None
+    if r is not None:
+        # Drop the source entry (a live proxy is moved below; a dead tombstone
+        # is simply reclaimed here).
         src_holder._proxies.pop(snode.node_id, None)
+    if proxy is not None:
         proxy._holder = dst
         proxy._node = dnode
         proxy._id = dnode.node_id
-        dst._proxies[dnode.node_id] = proxy
+        dst._proxies[dnode.node_id] = _weakref(proxy)
         if not src_holder._proxies:
             return
     # Children are cloned in the same order, so a positional zip pairs them up.
@@ -655,16 +688,106 @@ def ProcessingInstruction(target, text=None):
 PI = ProcessingInstruction
 
 
+def _set_element_tag(el, value):
+    """Rename ``el`` (the cold ``_Element.tag`` setter), keeping its namespace
+    declared/in scope.
+
+    Invoked by the native ``_ElementBase.tag`` setter, which keeps the hot getter
+    in Rust but forwards the intricate namespace-finalisation here rather than
+    re-implementing it natively.
+    """
+    ns, local = _split_key(value)
+    prefix = _prefix_for_ns(ns, el.nsmap) if ns else None
+    el._node.set_qname(local, ns, prefix)
+    if ns:
+        # Reuse an in-scope binding for ``ns`` when one exists - including an
+        # inherited default namespace - and only declare or generate a prefix
+        # when none is in scope, rather than always forcing a prefix.
+        _finalize_element_ns(el._holder, el._node)
+
+
+def _set_element_text(el, value):
+    """Set ``el``'s leading text (cold ``_Element.text`` setter), replacing the
+    full existing text/CDATA run. For comment/PI nodes sets the body instead."""
+    node = el._node
+    kind = node.kind
+    if kind == "comment":
+        node.set_text("" if value is None else value)
+        return
+    if kind == "processing_instruction":
+        node.set_pi_data(value)
+        return
+    doc = el._holder.doc
+    fc = node.first_child
+    run = _text_run_from(fc)
+    if value is None:
+        _remove_text_run(el._holder, node, run)
+        return
+    if run:
+        # Reuse the first native text-like node, then remove the rest so the
+        # public single-string assignment replaces the whole logical run.
+        run[0].set_text(value)
+        _remove_text_run(el._holder, node, run[1:])
+    else:
+        # No leading text node yet: create one and make it the first child.
+        tn = doc.create_text(value)
+        if fc is None:
+            doc.append_child(node, tn)
+        else:
+            doc.insert_before(node, tn, fc)
+
+
+def _set_element_tail(el, value):
+    """Set ``el``'s trailing text (cold ``_Element.tail`` setter), replacing the
+    full existing text/CDATA run."""
+    node = el._node
+    doc = el._holder.doc
+    parent = node.parent
+    if value is None:
+        if parent is not None:
+            _remove_text_run(el._holder, parent, _following_text_run(node))
+        return
+    run = _following_text_run(node)
+    if run:
+        run[0].set_text(value)
+        if parent is not None:
+            _remove_text_run(el._holder, parent, run[1:])
+    elif parent is not None:
+        # A tail can only exist where there is a parent to host the text node.
+        tn = doc.create_text(value)
+        doc.insert_after(parent, tn, node)
+
+
+# Hand the native ElementBase the etree-layer callables it needs: the
+# Comment/ProcessingInstruction tag sentinels (returned by the native .tag
+# getter for comment/PI nodes) and the cold property-setter helpers above.
+_u._register_element_helpers(
+    Comment,
+    ProcessingInstruction,
+    _set_element_tag,
+    _set_element_text,
+    _set_element_tail,
+)
+
+
 # ---------------------------------------------------------------------------
 # _Element
 # ---------------------------------------------------------------------------
 
 
-class _Element:
+class _Element(_u._ElementBase):
     """A live view over a node in a native Document. Compatible with lxml's
-    ``_Element``."""
+    ``_Element``.
 
-    __slots__ = ("_holder", "_node", "_id", "__weakref__")
+    Subclasses the native ``_ElementBase``, which owns the ``(_holder, _node,
+    _id)`` state (exposed as read/write properties) and the hot methods that
+    have been ported to Rust; the methods below are the remaining Python layer.
+    ``__slots__ = ()`` keeps instances dict-free -- all state lives in the native
+    base, and ``__weakref__`` is provided by the base's ``weakref`` support so
+    the per-document proxy cache can hold callback-free weakrefs.
+    """
+
+    __slots__ = ()
 
     # -- identity / repr --------------------------------------------------
 
@@ -678,113 +801,23 @@ class _Element:
         return "<Element %s at 0x%x>" % (self.tag, id(self))
 
     # -- tag --------------------------------------------------------------
-
-    @property
-    def tag(self):
-        """The element's tag in Clark ``{uri}local`` notation.
-
-        For comment and processing-instruction nodes this returns the
-        :func:`Comment` / :func:`ProcessingInstruction` factory, matching lxml
-        (so ``elem.tag is Comment`` identifies a comment).
-        """
-        # Common case (an element) is a single native call returning the Clark
-        # string directly, with no intermediate QName object. Only fall back to
-        # the kind check for non-elements (comments/PIs return their factory).
-        clark = self._node.clark_tag()
-        if clark is not None:
-            return clark
-        kind = self._node.kind
-        if kind == "comment":
-            return Comment
-        if kind == "processing_instruction":
-            return ProcessingInstruction
-        return None
-
-    @tag.setter
-    def tag(self, value):
-        """Rename the element, ensuring its namespace stays declared/in scope."""
-        ns, local = _split_key(value)
-        prefix = _prefix_for_ns(ns, self.nsmap) if ns else None
-        self._node.set_qname(local, ns, prefix)
-        if ns:
-            # Reuse an in-scope binding for ``ns`` when one exists - including an
-            # inherited default namespace - and only declare or generate a prefix
-            # when none is in scope, rather than always forcing a prefix.
-            _finalize_element_ns(self._holder, self._node)
+    # The `tag` property (Clark-notation getter + rename setter) is provided
+    # natively by _ElementBase. The getter returns the Clark string directly for
+    # elements (the hot path) and the Comment/ProcessingInstruction factory for
+    # comment/PI nodes; the setter delegates the cold namespace-finalisation back
+    # to `_set_element_tag` below (registered via _register_element_helpers).
 
     # -- text / tail ------------------------------------------------------
     # ElementTree's .text/.tail are virtual views over real sibling text nodes
     # in uppsala's DOM: .text is the element's leading text-node child, and
     # .tail is the text node immediately following the element. Storing them as
     # real nodes means serialization needs no special handling.
-
-    @property
-    def text(self):
-        """The text directly inside this element, before its first child, or None.
-
-        For comments/PIs this returns the comment/PI body instead.
-        """
-        kind = self._node.kind
-        if kind == "comment":
-            return self._node.comment_text
-        if kind == "processing_instruction":
-            return self._node.pi_data
-        return _run_text(_text_run_from(self._node.first_child))
-
-    @text.setter
-    def text(self, value):
-        """Set leading text and replace the full existing text/CDATA run."""
-        kind = self._node.kind
-        if kind == "comment":
-            self._node.set_text("" if value is None else value)
-            return
-        if kind == "processing_instruction":
-            self._node.set_pi_data(value)
-            return
-        doc = self._holder.doc
-        node = self._node
-        fc = node.first_child
-        run = _text_run_from(fc)
-        if value is None:
-            _remove_text_run(self._holder, node, run)
-            return
-        if run:
-            # Reuse the first native text-like node, then remove the rest so the
-            # public single-string assignment replaces the whole logical run.
-            run[0].set_text(value)
-            _remove_text_run(self._holder, node, run[1:])
-        else:
-            # No leading text node yet: create one and make it the first child.
-            tn = doc.create_text(value)
-            if fc is None:
-                doc.append_child(node, tn)
-            else:
-                doc.insert_before(node, tn, fc)
-
-    @property
-    def tail(self):
-        """The text following this element's end tag, before the next sibling, or None."""
-        return _run_text(_following_text_run(self._node))
-
-    @tail.setter
-    def tail(self, value):
-        """Set trailing text and replace the full existing text/CDATA run."""
-        doc = self._holder.doc
-        node = self._node
-        parent = node.parent
-        if value is None:
-            if parent is not None:
-                _remove_text_run(self._holder, parent, _following_text_run(node))
-            return
-        run = _following_text_run(node)
-        if run:
-            run[0].set_text(value)
-            if parent is not None:
-                _remove_text_run(self._holder, parent, run[1:])
-        elif parent is not None:
-            # A tail can only exist where there is a parent to host the text node.
-            tn = doc.create_text(value)
-            doc.insert_after(parent, tn, node)
+    #
+    # Both properties are provided natively by _ElementBase: the getters collect
+    # the leading/trailing Text+CDATA run under one lock (and return the
+    # comment/PI body for those node kinds), while the cold, mutation-heavy
+    # setters delegate to `_set_element_text` / `_set_element_tail` below
+    # (registered via _register_element_helpers).
 
     # -- attributes -------------------------------------------------------
 
@@ -865,9 +898,8 @@ class _Element:
     # Only element/comment/PI children participate; text/CDATA are surfaced via
     # .text/.tail instead (see _content_children).
 
-    def __len__(self):
-        """The number of child elements (and comments/PIs)."""
-        return len(_content_children(self._node))
+    # __len__ is provided natively by _ElementBase (counts content children
+    # without materialising the child list).
 
     def __iter__(self):
         """Iterate over child elements (and comments/PIs) as proxies."""
@@ -1235,28 +1267,11 @@ class _Element:
 
     # -- misc properties --------------------------------------------------
 
-    @property
-    def nsmap(self):
-        """Mapping of in-scope prefixes to URIs (None key = default namespace)."""
-        # The ancestor walk and declaration collection run natively in a single
-        # lock; the returned pairs are outermost-first, so ``dict`` keeps the
-        # innermost binding per prefix (inner overrides outer), matching lxml.
-        return dict(self._node.nsmap())
-
-    @property
-    def prefix(self):
-        """The namespace prefix of this element's tag, or None."""
-        q = self._node.tag
-        return q.prefix if q is not None else None
-
-    @property
-    def sourceline(self):
-        """The 1-based source line of this element, or None for built nodes."""
-        try:
-            line = self._node.line
-        except Exception:
-            return None
-        return line or None
+    # nsmap / prefix / sourceline are provided natively by _ElementBase:
+    #   * nsmap   -- in-scope prefix->URI dict, built in Rust from the native
+    #                ancestor walk (inner binding wins, None key = default ns);
+    #   * prefix  -- the element tag's namespace prefix, or None;
+    #   * sourceline -- the 1-based source line, or None for built nodes.
 
     @property
     def base(self):
@@ -2344,6 +2359,18 @@ def _process_xincludes(elem, base_url, _depth=0):
     """Recursively expand ``xi:include`` directives within ``elem`` in place."""
     if _depth > _XINCLUDE_MAX_DEPTH:
         raise XIncludeError("XInclude recursion limit exceeded")
+    if _depth == 0:
+        # Fast pre-check at the top level: if the subtree contains no
+        # ``xi:include`` element at all, there is nothing to expand, so skip the
+        # whole Python recursion. The native descendant search is far cheaper
+        # than walking every element in Python, and callers (e.g. pyFF) run
+        # ``.xinclude()`` on every parsed document even though most documents
+        # (such as SAML metadata) contain no XInclude directives.
+        has_include = bool(
+            elem._node.get_elements_by_tag_name_ns(XINCLUDE_NS, "include")
+        )
+        if not has_include and elem.tag != _XI_INCLUDE:
+            return
     # Snapshot children: the list is mutated as includes are expanded.
     for child in list(elem):
         if not isinstance(child.tag, str):
