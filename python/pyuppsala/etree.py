@@ -2392,7 +2392,11 @@ def _xinclude_resolve(href, base_url):
     if os.path.isabs(href):
         return href
     if base_url:
-        return os.path.join(os.path.dirname(base_url), href)
+        # ``base_url`` is normally the including document's file path, so relatives
+        # resolve against its directory. If a caller passes an actual directory,
+        # resolve against it directly rather than its parent.
+        base_dir = base_url if os.path.isdir(base_url) else os.path.dirname(base_url)
+        return os.path.join(base_dir, href)
     return href  # relative to the current working directory
 
 
@@ -2449,14 +2453,12 @@ def _process_xincludes(elem, base_url, _depth=0, *, allow_network=False):
     if _depth == 0:
         # Fast pre-check at the top level: if the subtree contains no
         # ``xi:include`` element at all, there is nothing to expand, so skip the
-        # whole Python recursion. The native descendant search is far cheaper
-        # than walking every element in Python, and callers (e.g. pyFF) run
-        # ``.xinclude()`` on every parsed document even though most documents
-        # (such as SAML metadata) contain no XInclude directives.
-        has_include = bool(
-            elem._node.get_elements_by_tag_name_ns(XINCLUDE_NS, "include")
-        )
-        if not has_include and elem.tag != _XI_INCLUDE:
+        # whole Python recursion. Callers (e.g. pyFF) run ``.xinclude()`` on every
+        # parsed document even though most (such as SAML metadata) contain no
+        # XInclude directives. ``iter`` walks natively and ``next(..., None)``
+        # short-circuits on the first match (and includes ``elem`` itself), so
+        # this avoids materializing a full descendant list just to test existence.
+        if next(elem.iter(_XI_INCLUDE), None) is None:
             return
     # Snapshot children: the list is mutated as includes are expanded.
     for child in list(elem):

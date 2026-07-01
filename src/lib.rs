@@ -1370,6 +1370,16 @@ fn call_setter(
     Ok(())
 }
 
+/// Return an owned clone of a registered factory object (the `Comment` /
+/// `ProcessingInstruction` callables). Fails fast with the same error as
+/// `call_setter` if the etree helpers were never registered, rather than
+/// silently returning `None` and masking an import/initialization bug.
+fn registered_factory(py: Python<'_>, cell: &PyOnceLock<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    cell.get(py)
+        .map(|f| f.clone_ref(py))
+        .ok_or_else(|| PyRuntimeError::new_err("etree element helpers not registered"))
+}
+
 /// Subclassable native base for `pyuppsala.etree._Element`.
 ///
 /// The etree layer's `_Element` is a live, identity-stable view over a node in
@@ -1462,14 +1472,8 @@ impl ElementBase {
         }
         let kind = node_ref.kind()?;
         match kind.as_str() {
-            "comment" => Ok(COMMENT_FACTORY
-                .get(py)
-                .map(|f| f.clone_ref(py))
-                .unwrap_or_else(|| py.None())),
-            "processing_instruction" => Ok(PI_FACTORY
-                .get(py)
-                .map(|f| f.clone_ref(py))
-                .unwrap_or_else(|| py.None())),
+            "comment" => registered_factory(py, &COMMENT_FACTORY),
+            "processing_instruction" => registered_factory(py, &PI_FACTORY),
             _ => Ok(py.None()),
         }
     }
