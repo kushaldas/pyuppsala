@@ -78,7 +78,7 @@ __all__ = [
 # with thousands of entities, which would otherwise exceed the native
 # evaluator's much lower default). Applications that evaluate XPath over
 # UNTRUSTED input can lower this module attribute to restore an anti-DoS bound,
-# e.g. ``etree.MAX_XPATH_NODE_VISITS = _pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS``.
+# e.g. ``etree.MAX_XPATH_NODE_VISITS = pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS``.
 MAX_XPATH_NODE_VISITS = sys.maxsize
 
 

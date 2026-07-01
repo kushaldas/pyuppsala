@@ -354,6 +354,16 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    # DEFAULT_AGGREGATE points at a sibling pyFF checkout that this repository
+    # does not ship, so fail with a clear message (rather than a bare
+    # FileNotFoundError) when the aggregate is missing.
+    if not os.path.isfile(args.aggregate):
+        parser.error(
+            "aggregate file not found: %s\n"
+            "Pass the path to a SAML metadata aggregate as the positional "
+            "argument." % args.aggregate
+        )
+
     with open(args.aggregate, "rb") as fh:
         blob = fh.read()
     print("aggregate: %s (%d bytes)" % (args.aggregate, len(blob)))

@@ -107,8 +107,8 @@ Schema validation with detailed errors
    pyuppsala validates built-in datatypes a bit more strictly than libxml2/lxml
    by default. If you validate real-world documents and get spurious errors like
    ``'... ...' is not a valid anyURI`` (an ``anyURI`` value containing a space,
-   which libxml2/lxml accept), call :meth:`XsdValidator.set_lenient(True)
-   <pyuppsala.XsdValidator.set_lenient>` for lxml-compatible results::
+   which libxml2/lxml accept), enable lenient validation with
+   :meth:`~pyuppsala.XsdValidator.set_lenient` for lxml-compatible results::
 
        validator = XsdValidator.from_file(schema_xml, schema_dir)
        validator.set_lenient(True)
