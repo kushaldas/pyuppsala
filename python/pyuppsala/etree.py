@@ -2318,12 +2318,26 @@ _XINCLUDE_MAX_DEPTH = 250
 
 def _xinclude_resolve(href, base_url):
     """Resolve an XInclude ``href`` against ``base_url`` (URL or filesystem)."""
+    import os
     import urllib.parse
 
-    if urllib.parse.urlparse(href).scheme:
-        return href  # already absolute (has a scheme)
-    if base_url:
+    # Only a real network/file URL scheme counts as "absolute". A single-letter
+    # "scheme" reported by urlparse is a Windows drive letter (e.g. ``C:``), not
+    # a URL scheme, so it must not be treated as one.
+    url_schemes = ("http", "https", "ftp", "file")
+    if urllib.parse.urlparse(href).scheme in url_schemes:
+        return href  # already an absolute URL
+    if base_url and urllib.parse.urlparse(base_url).scheme in url_schemes:
+        # The base is a URL: resolve with URL join semantics.
         return urllib.parse.urljoin(base_url, href)
+    # Filesystem paths (the common case, and the Windows case). urljoin must not
+    # be used here: on Windows it misreads the drive letter as a URL scheme and
+    # does not treat ``\`` as a separator, so it would drop the base directory
+    # and return ``href`` unchanged. Resolve with os.path instead.
+    if os.path.isabs(href):
+        return href
+    if base_url:
+        return os.path.join(os.path.dirname(base_url), href)
     return href  # relative to the current working directory
 
 
