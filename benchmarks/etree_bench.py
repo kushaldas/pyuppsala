@@ -354,7 +354,8 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    blob = open(args.aggregate, "rb").read()
+    with open(args.aggregate, "rb") as fh:
+        blob = fh.read()
     print("aggregate: %s (%d bytes)" % (args.aggregate, len(blob)))
 
     # Build per-entity byte blobs once (with lxml when available, else

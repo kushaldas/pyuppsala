@@ -111,7 +111,11 @@ class DocumentInvalid(LxmlError):
     populated by ``assertValid`` and otherwise an empty list.
     """
 
-    error_log = []
+    def __init__(self, *args):
+        super().__init__(*args)
+        # Per-instance so appends by one caller never leak onto other
+        # DocumentInvalid objects (a class-level list would be shared).
+        self.error_log = []
 
 
 class XMLSchemaParseError(LxmlError):
@@ -544,7 +548,17 @@ def _repoint_subtree(src_holder, dst, snode, dnode):
     # ``append`` aggregation: the freshly deep-copied source holds exactly one
     # live proxy (its root), so after repointing it the whole descendant walk
     # (hundreds of nodes per entity) is avoided.
-    if not src_holder._proxies:
+    #
+    # The weakrefs are callback-free (no cache eviction on collection), so the
+    # dict can hold dead tombstones and stay non-empty after every proxy has
+    # been garbage-collected. Sweep them first so a subtree with only dead
+    # entries still takes the fast path instead of walking the whole thing.
+    proxies = src_holder._proxies
+    if proxies:
+        dead = [nid for nid, ref in proxies.items() if ref() is None]
+        for nid in dead:
+            proxies.pop(nid, None)
+    if not proxies:
         return
     r = src_holder._proxies.get(snode.node_id)
     proxy = r() if r is not None else None
@@ -2314,6 +2328,8 @@ XINCLUDE_NS = "http://www.w3.org/2001/XInclude"
 _XI_INCLUDE = "{%s}include" % XINCLUDE_NS
 _XI_FALLBACK = "{%s}fallback" % XINCLUDE_NS
 _XINCLUDE_MAX_DEPTH = 250
+# Seconds to wait on a remote XInclude fetch before giving up (anti-hang).
+_XINCLUDE_NETWORK_TIMEOUT = 30
 
 
 def _xinclude_resolve(href, base_url):
@@ -2348,7 +2364,11 @@ def _xinclude_read_bytes(resolved):
 
     parts = urllib.parse.urlparse(resolved)
     if parts.scheme in ("http", "https", "ftp"):
-        with urllib.request.urlopen(resolved) as response:  # noqa: S310
+        # Bound the fetch so a slow/unresponsive remote target cannot hang
+        # processing indefinitely (important for batch/service use).
+        with urllib.request.urlopen(  # noqa: S310
+            resolved, timeout=_XINCLUDE_NETWORK_TIMEOUT
+        ) as response:
             return response.read()
     if parts.scheme == "file":
         path = urllib.request.url2pathname(parts.path)
@@ -2435,7 +2455,15 @@ def _expand_include(parent, include, base_url, depth):
         return
 
     if parse_kind == "text":
-        text = data.decode(encoding or "utf-8")
+        # Surface decode failures (bad bytes) and unknown-codec errors as
+        # XIncludeError with href context, rather than leaking a raw
+        # UnicodeDecodeError/LookupError to the caller.
+        try:
+            text = data.decode(encoding or "utf-8")
+        except (UnicodeDecodeError, LookupError) as exc:
+            raise XIncludeError(
+                "could not decode XInclude text href %r: %s" % (href, exc)
+            ) from exc
         _xinclude_insert_text(parent, idx, text + (tail or ""))
         return
 

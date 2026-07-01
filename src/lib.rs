@@ -2969,7 +2969,10 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
         uppsala::xsd_regex::DEFAULT_MAX_REGEX_STEPS,
     )?;
     // XSLT template-activation recursion cap (uppsala XSLT 1.0 engine).
-    m.add("DEFAULT_MAX_XSLT_DEPTH", uppsala::xslt::DEFAULT_MAX_XSLT_DEPTH)?;
+    m.add(
+        "DEFAULT_MAX_XSLT_DEPTH",
+        uppsala::xslt::DEFAULT_MAX_XSLT_DEPTH,
+    )?;
 
     // Exceptions
     m.add("XmlParseError", m.py().get_type::<XmlParseError>())?;
