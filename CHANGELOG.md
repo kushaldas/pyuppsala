@@ -1,6 +1,33 @@
 # Changelog
 
 
+## 0.7.2
+
+Bugfix + small-feature release (still built against uppsala 0.7.1).
+
+### Added
+
+- **`etree` slice assignment** (`el[i:j] = iterable`, `el[:] = iterable`,
+  extended slices). Matches lxml/ElementTree: the selected children are removed
+  and the new elements spliced in, with elements already in the tree *moved*
+  (so `el[:] = sorted(el, key=...)` reorders in place, which pyFF's `sort` pipe
+  relies on) and elements from another document deep-copied in. Each element
+  keeps its own tail. Previously slice assignment raised `NotImplementedError`.
+
+### Fixed
+
+- **Performance regression in cross-document `append`/`deepcopy`.** The
+  dead-weakref sweep added to `etree._repoint_subtree` in 0.7.0 ran on every
+  recursive step of the lock-step subtree walk, making it
+  O(proxies x subtree-size). When the source document held many live element
+  proxies (e.g. pyFF aggregation, which walks the whole input tree before
+  moving entities into the aggregate), repeated `append`/`deepcopy` degraded to
+  an effectively-hung quadratic walk. The sweep now runs once at entry and the
+  recursive walk is back to O(subtree) with an O(1) fast-path per node. Node
+  identity across moves is unchanged (still gated by the lxml-differential
+  tests).
+
+
 ## 0.7.1
 
 Built against uppsala 0.7.1, a security/hardening release. All of its changes

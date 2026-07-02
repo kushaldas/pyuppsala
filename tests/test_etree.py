@@ -465,6 +465,73 @@ class TestExtendedDifferential:
 
         assert run(P) == run(L)
 
+    def _canon_setslice(self, xml, op):
+        rp, rl = P.fromstring(xml), L.fromstring(xml.encode())
+        op(P, rp)
+        op(L, rl)
+        return (
+            L.canonicalize(P.tostring(rp, encoding="unicode")),
+            L.canonicalize(L.tostring(rl).decode()),
+        )
+
+    def test_setslice_reorder_full(self):
+        # ``el[:] = sorted(el, key=...)`` -- pyFF's sort pipe (in-place reorder).
+        p, l = self._canon_setslice(
+            '<r><c id="3"/><a id="1"/><b id="2"/></r>',
+            lambda m, r: r.__setitem__(
+                slice(None), sorted(list(r), key=lambda e: e.get("id"))
+            ),
+        )
+        assert p == l
+
+    def test_setslice_reorder_preserves_tails(self):
+        p, l = self._canon_setslice(
+            '<r>\n  <a id="2">A</a>\n  <b id="1">B</b>\n</r>',
+            lambda m, r: r.__setitem__(
+                slice(None), sorted(list(r), key=lambda e: e.get("id"))
+            ),
+        )
+        assert p == l
+
+    def test_setslice_partial_replace(self):
+        def op(m, r):
+            r[1:3] = [m.Element("x"), m.Element("y")]
+
+        p, l = self._canon_setslice("<r><a/><b/><c/><d/></r>", op)
+        assert p == l
+
+    def test_setslice_shrink_and_grow(self):
+        def shrink(m, r):
+            r[0:3] = [m.Element("x")]
+
+        def grow(m, r):
+            r[1:2] = [m.Element("x"), m.Element("y"), m.Element("z")]
+
+        assert self._canon_setslice("<r><a/><b/><c/><d/></r>", shrink)[0] == \
+            self._canon_setslice("<r><a/><b/><c/><d/></r>", shrink)[1]
+        assert self._canon_setslice("<r><a/><b/><c/></r>", grow)[0] == \
+            self._canon_setslice("<r><a/><b/><c/></r>", grow)[1]
+
+    def test_setslice_extended(self):
+        def op(m, r):
+            r[0:4:2] = [m.Element("x"), m.Element("y")]
+
+        p, l = self._canon_setslice("<r><a/><b/><c/><d/></r>", op)
+        assert p == l
+
+    def test_setslice_extended_size_mismatch_raises(self):
+        r = P.fromstring("<r><a/><b/><c/><d/></r>")
+        with pytest.raises(ValueError):
+            r[0:4:2] = [P.Element("x")]
+
+    def test_setslice_foreign_elements_moved_in(self):
+        def op(m, r):
+            src = m.fromstring("<s><p/><q/></s>")
+            r[:] = list(src)
+
+        p, l = self._canon_setslice("<r><a/></r>", op)
+        assert p == l
+
     def test_processing_instruction(self):
         def run(m):
             r = m.Element("r")

@@ -552,23 +552,35 @@ def _repoint_subtree(src_holder, dst, snode, dnode):
     references to a moved element (and its descendants) remain valid afterward -
     mirroring lxml's in-place move semantics.
     """
+    # The weakrefs are callback-free (no cache eviction on collection), so the
+    # dict can hold dead tombstones and stay non-empty after every proxy has
+    # been garbage-collected. Sweep them ONCE up front so a holder whose proxies
+    # are all dead still takes the fast path in the walk below. This sweep is
+    # O(proxies); it must NOT run inside the recursive walk, or the cost becomes
+    # O(proxies * subtree-size) and cross-tree ``append`` of a large source
+    # (e.g. pyFF aggregation, where the source document holds thousands of live
+    # proxies) degrades to an effectively-hung quadratic walk.
+    proxies = src_holder._proxies
+    if proxies:
+        dead = [nid for nid, ref in proxies.items() if ref() is None]
+        for nid in dead:
+            proxies.pop(nid, None)
+    _repoint_subtree_walk(src_holder, dst, snode, dnode)
+
+
+def _repoint_subtree_walk(src_holder, dst, snode, dnode):
+    """Recursive lock-step walk for :func:`_repoint_subtree` (no dead sweep).
+
+    The one-time dead-weakref sweep lives in the entry point; this inner walk
+    stays O(subtree) with an O(1) fast-path check per node.
+    """
     # Fast path: once the source holder has no live proxies left, there is
     # nothing in the (possibly large) subtree to repoint, so skip the walk
     # entirely. This is the common case for pyFF's ``deepcopy(entity)`` +
     # ``append`` aggregation: the freshly deep-copied source holds exactly one
     # live proxy (its root), so after repointing it the whole descendant walk
     # (hundreds of nodes per entity) is avoided.
-    #
-    # The weakrefs are callback-free (no cache eviction on collection), so the
-    # dict can hold dead tombstones and stay non-empty after every proxy has
-    # been garbage-collected. Sweep them first so a subtree with only dead
-    # entries still takes the fast path instead of walking the whole thing.
-    proxies = src_holder._proxies
-    if proxies:
-        dead = [nid for nid, ref in proxies.items() if ref() is None]
-        for nid in dead:
-            proxies.pop(nid, None)
-    if not proxies:
+    if not src_holder._proxies:
         return
     r = src_holder._proxies.get(snode.node_id)
     proxy = r() if r is not None else None
@@ -585,7 +597,7 @@ def _repoint_subtree(src_holder, dst, snode, dnode):
             return
     # Children are cloned in the same order, so a positional zip pairs them up.
     for sc, dc in zip(snode.children, dnode.children):
-        _repoint_subtree(src_holder, dst, sc, dc)
+        _repoint_subtree_walk(src_holder, dst, sc, dc)
 
 
 def _extract(holder, node):
@@ -939,9 +951,18 @@ class _Element(_u._ElementBase):
         return proxy(kids[index])
 
     def __setitem__(self, index, element):
-        """Replace the child at ``index`` with ``element``."""
+        """Replace the child at ``index``, or splice a slice of children.
+
+        Scalar assignment (``el[i] = child``) replaces one child. Slice
+        assignment (``el[i:j] = iterable`` / ``el[:] = iterable``) matches
+        lxml/ElementTree: the selected children are removed and the new elements
+        spliced in at ``start``. Elements already in this tree are *moved*
+        (so ``el[:] = sorted(el, key=...)`` reorders in place, as pyFF's sort
+        pipe relies on); elements from another document are deep-copied in.
+        """
         if isinstance(index, slice):
-            raise NotImplementedError("slice assignment is not supported in v1")
+            self._setslice(index, element)
+            return
         kids = _content_children(self._node)
         old = kids[index]
         # Insert the new child in place, then remove the old one (with its tail).
@@ -949,6 +970,54 @@ class _Element(_u._ElementBase):
         self._holder.doc.insert_before(self._node, node, old)
         _extract(self._holder, old)
         _attach_tail(self._holder, self._node, tail, node)
+
+    def _setslice(self, index, value):
+        """Back ``el[start:stop:step] = value`` (see :meth:`__setitem__`)."""
+        kids = _content_children(self._node)
+        start, stop, step = index.indices(len(kids))
+        new_els = list(value)
+
+        if step != 1:
+            # Extended slice: element-wise replacement, lengths must match
+            # (same rule as list / lxml). Positions are fixed, so capturing the
+            # target handles up front is safe.
+            positions = range(start, stop, step)
+            targets = [kids[p] for p in positions]
+            if len(targets) != len(new_els):
+                raise ValueError(
+                    "attempt to assign sequence of size %d to extended slice of size %d"
+                    % (len(new_els), len(targets))
+                )
+            for old, el in zip(targets, new_els):
+                node, tail = self._adopt(el)
+                self._holder.doc.insert_before(self._node, node, old)
+                _extract(self._holder, old)
+                _attach_tail(self._holder, self._node, tail, node)
+            return
+
+        # Simple slice (step == 1): splice ``[start:stop)`` -> ``new_els``.
+        # Adopt every new element first so each keeps its own tail; adopting
+        # detaches elements that are already our children (the move / reorder
+        # case) and deep-copies foreign ones. Doing this before any removal
+        # means a reused child is never dropped.
+        adopted = [self._adopt(el) for el in new_els]
+        adopted_ids = {node.node_id for node, _tail in adopted}
+        # Remove the old slice children that the new sequence did not reuse.
+        for k in kids[start:stop]:
+            if k.node_id not in adopted_ids:
+                _extract(self._holder, k)
+        # Insertion anchor: the first child after the slice that is still ours
+        # (i.e. was not moved into the new block); None means append at the end.
+        anchor = None
+        for k in kids[stop:]:
+            if k.node_id in adopted_ids:
+                continue
+            p = k.parent
+            if p is not None and p.node_id == self._id:
+                anchor = k
+                break
+        for node, tail in adopted:
+            _attach(self._holder, self._node, node, tail, ref=anchor)
 
     def __delitem__(self, index):
         """Remove the child at ``index`` (or the children in a slice)."""
