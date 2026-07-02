@@ -1,6 +1,24 @@
 # Changelog
 
 
+## 0.7.1
+
+Built against uppsala 0.7.1, a security/hardening release. All of its changes
+are enforced transparently by uppsala's defaults, so there is no pyuppsala API
+change:
+
+- XSD validation fails closed for unresolved element references, compares
+  expanded names for namespace-sensitive attributes and strict wildcards, and
+  rejects `xs:unique`/`xs:key`/`xs:keyref` fields selecting more than one node.
+- Stricter XSD datatype/facet validation for hostile inputs (instant-based
+  date/time facet comparison, no date/time normalization of non-temporal
+  enumerations, rejection of malformed negative dates and invalid pattern
+  facets, `xs:QName` rejecting unbound prefixes).
+- DTD content-model parsing observes the parser nesting-depth limit.
+- XSLT-generated comments/PIs reject markup-breaking content, and opt-in EXSLT
+  `str:padding()` is capped against attacker-selected output allocation.
+
+
 ## 0.7.0
 
 Built against uppsala 0.7.0, which adds an XSLT 1.0 engine. Highlights:
