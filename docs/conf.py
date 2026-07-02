@@ -3,7 +3,7 @@
 project = "pyuppsala"
 copyright = "2026, Kushal Das"
 author = "Kushal Das"
-release = "0.7.0"
+release = "0.7.1"
 
 extensions = [
     "sphinx.ext.autodoc",

@@ -7,7 +7,7 @@ Python bindings for the [Uppsala](https://crates.io/crates/uppsala) XML library
 pyuppsala gives you a fast, correct, and memory-safe XML toolkit from Python
 with no C dependencies to compile and no transitive native libraries to audit.
 
-This release is against `0.7.0` of Uppsala library.
+This release is against `0.7.1` of Uppsala library.
 
 ## Features
 
