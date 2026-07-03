@@ -2041,6 +2041,11 @@ class TestParseMany:
 # ============================================================================
 
 
+@pytest.mark.skipif(
+    not pyuppsala._HAS_NET,
+    reason="native fetch APIs require the default-on 'net' feature "
+    "(absent in a --no-default-features build)",
+)
 class TestFetchMany:
     """Exercises the native fetch against a local in-process HTTP server."""
 

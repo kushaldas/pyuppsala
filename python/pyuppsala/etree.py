@@ -853,10 +853,14 @@ class _Element(_u._ElementBase):
 
     def __getitem__(self, index):
         """Index or slice into the child elements."""
-        kids = self._children_proxies()
         if isinstance(index, slice):
-            return kids[index]
-        return kids[index]
+            # A slice needs several proxies; fetch them in one native call.
+            return self._children_proxies()[index]
+        # Scalar index: materialise only the selected child's proxy rather than
+        # every child's. `_content_children` returns cheap native handles; the
+        # list index handles negative indices and out-of-range IndexError.
+        kids = _content_children(self._node)
+        return self._holder.proxy(kids[index])
 
     def __setitem__(self, index, element):
         """Replace the child at ``index``, or splice a slice of children.
