@@ -208,6 +208,33 @@ class TestSearchDifferential:
         assert names(pi) == names(li)
         assert next(pi, None) is None and next(li, None) is None
 
+    def test_xml_incompatible_strings_rejected(self):
+        # lxml parity: strings with XML-illegal characters (NUL, C0 controls
+        # other than tab/LF/CR, lone surrogates, U+FFFE/U+FFFF) raise
+        # ValueError at every DOM entry point instead of being stored raw.
+        # Regression for the dom_mutate_fuzzer round-trip crash: a namespace
+        # URI containing U+0005 was stored raw, its deep copy sanitized to
+        # U+FFFD, so a second set() declared a new prefix and serialization
+        # emitted two attributes that collide as duplicates on reparse.
+        cases = [
+            ("attr ns", lambda E: E.fromstring("<a/>").set("{\x05Q}k", "v")),
+            ("attr val", lambda E: E.fromstring("<a/>").set("k", "a\x00b")),
+            ("text", lambda E: setattr(E.fromstring("<a/>"), "text", "x\x08")),
+            ("tail", lambda E: setattr(E.fromstring("<a><b/></a>")[0], "tail", "\x0c")),
+            ("tag ns", lambda E: E.Element("{\x1fu}t")),
+            ("comment", lambda E: E.Comment("c\x01")),
+            ("nsmap", lambda E: E.Element("t", nsmap={"p": "u\x02"})),
+        ]
+        for name, fn in cases:
+            for mod in (P, L):
+                with pytest.raises(ValueError):
+                    fn(mod)
+        # Tab / newline / carriage return are legal XML chars and must pass.
+        e = P.fromstring("<a/>")
+        e.set("k", "a\tb\nc\rd")
+        e.text = "\t\n\r"
+        assert P.fromstring(P.tostring(e)) is not None
+
     def test_itertext(self):
         pr, lr = P.fromstring(SAMPLE), L.fromstring(SAMPLE)
         assert list(pr.itertext()) == list(lr.itertext())

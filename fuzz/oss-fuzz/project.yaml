@@ -1,0 +1,9 @@
+homepage: "https://github.com/kushaldas/pyuppsala"
+language: python
+main_repo: "https://github.com/kushaldas/pyuppsala.git"
+primary_contact: "mail@kushaldas.in"
+fuzzing_engines:
+  - libfuzzer
+sanitizers:
+  - address
+  - undefined

@@ -1,0 +1,2 @@
+substring(normalize-space('  a b  '),2)
+<r/>

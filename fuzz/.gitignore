@@ -1,0 +1,11 @@
+# Fuzzer working state -- keep the *_fuzzer.py harnesses, seeds/, dict/, scripts/
+# and oss-fuzz/ tracked; ignore everything the campaign generates.
+corpus/
+artifacts/
+coverage/
+.uppsala-*/
+*.min/
+crash-*
+timeout-*
+oom-*
+leak-*
