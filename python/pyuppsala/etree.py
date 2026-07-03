@@ -1872,9 +1872,11 @@ def fromstring_many(texts, parser=None, max_threads=None):
     """Parse many XML strings/bytes in parallel and return their root elements.
 
     Returns a list index-aligned with ``texts`` where each slot is either the
-    parsed document's root ``_Element`` or an :class:`XMLSyntaxError` instance
-    (not raised) describing that item's failure -- a batch never raises
-    wholesale; check ``isinstance(r, Exception)`` per item.
+    parsed document's root ``_Element`` or an exception instance (not raised)
+    describing that item's failure -- an :class:`XMLSyntaxError` for a parse
+    or decode failure, a :class:`TypeError` for an item that is not
+    str/bytes/bytearray. A batch never raises wholesale; check
+    ``isinstance(r, Exception)`` per item.
 
     The parsing itself is the native ``pyuppsala.parse_many``: the whole batch
     runs with the GIL released across ``max_threads`` native threads (default:
@@ -1891,7 +1893,17 @@ def fromstring_many(texts, parser=None, max_threads=None):
     kw = _parse_kwargs(opts)
     encoding = opts.get("encoding")
 
-    items = list(texts)
+    # Reject wrong-typed items per slot, up front: the native parse_many
+    # signature only converts str/bytes, so a stray int/None/Element in the
+    # list would otherwise raise TypeError during argument conversion and
+    # abort the whole batch, breaking the never-raises-wholesale contract.
+    # The message mirrors lxml's fromstring TypeError.
+    items = [
+        t
+        if isinstance(t, (str, bytes, bytearray))
+        else TypeError("cannot parse from '%s'" % type(t).__name__)
+        for t in texts
+    ]
     if encoding:
         # Decode byte items here so the parser-encoding override behaves
         # identically to fromstring; decode errors become per-item results.

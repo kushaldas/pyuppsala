@@ -1406,3 +1406,24 @@ class TestFromstringMany:
         p = ET.XMLParser(encoding="latin-1")
         (root,) = ET.fromstring_many(["<r>\xe9</r>".encode("latin-1")], parser=p)
         assert root.text == "é"
+
+    def test_wrong_typed_item_is_per_item_error(self):
+        # A non-str/bytes item must come back as an in-place TypeError, not
+        # raise for (and so discard) the whole batch.
+        from pyuppsala import etree as ET
+
+        results = ET.fromstring_many(["<a/>", 42, None, b"<b/>"])
+        assert results[0].tag == "a"
+        assert isinstance(results[1], TypeError) and "int" in str(results[1])
+        assert isinstance(results[2], TypeError) and "NoneType" in str(results[2])
+        assert results[3].tag == "b"
+
+    def test_wrong_typed_item_with_encoding_parser(self):
+        # The same per-item TypeError contract holds on the parser-encoding
+        # path, which decodes byte items in Python before the native batch.
+        from pyuppsala import etree as ET
+
+        p = ET.XMLParser(encoding="latin-1")
+        results = ET.fromstring_many([object(), "<r>\xe9</r>".encode("latin-1")], parser=p)
+        assert isinstance(results[0], TypeError)
+        assert results[1].text == "é"

@@ -268,8 +268,10 @@ def fromstring_many(
     texts: Iterable[str | bytes | bytearray],
     parser: Optional[XMLParser] = None,
     max_threads: Optional[int] = None,
-) -> list[_Element | XMLSyntaxError]:
-    """Parse many documents in parallel; index-aligned roots or per-item errors."""
+) -> list[_Element | XMLSyntaxError | TypeError]:
+    """Parse many documents in parallel; index-aligned roots or per-item
+    errors, never raised wholesale (XMLSyntaxError for parse/decode failures,
+    TypeError for a non-str/bytes item)."""
     ...
 
 def fromstringlist(
