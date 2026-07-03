@@ -3908,6 +3908,11 @@ fn fetch_batch<R: Send>(
 ) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let n_items = urls.len();
+    // Empty batch: nothing to fetch, so skip the agent build, the GIL detach
+    // and the thread::scope setup entirely.
+    if n_items == 0 {
+        return Vec::new();
+    }
     let n_threads = max_threads
         .filter(|&t| t > 0)
         .unwrap_or_else(|| {
@@ -3915,7 +3920,7 @@ fn fetch_batch<R: Send>(
                 .map(|n| n.get())
                 .unwrap_or(1)
         })
-        .min(n_items.max(1));
+        .min(n_items);
     let agent = build_agent(opts);
     let results: Vec<std::sync::Mutex<Option<R>>> =
         (0..n_items).map(|_| std::sync::Mutex::new(None)).collect();
@@ -4088,8 +4093,10 @@ fn fetch_and_parse_many(
             // Plain-string errors only in this detached worker: the GIL-free
             // decoder and XmlError's Display are pure Rust, so no PyErr is ever
             // constructed off the GIL (that would touch the Python C-API).
-            let input = decode_xml_bytes_raw(&o.body)
-                .map_err(|_| format!("{}: response is not valid UTF-8/UTF-16 XML text", o.url))?;
+            // Keep the decoder's detailed message (invalid UTF-8 vs
+            // odd-length UTF-16, etc.) -- per-item failures are much easier
+            // to debug with the real cause attached to the URL.
+            let input = decode_xml_bytes_raw(&o.body).map_err(|e| format!("{}: {}", o.url, e))?;
             let doc = parser
                 .parse(&input)
                 .map_err(|e| format!("{}: {}", o.url, e))?

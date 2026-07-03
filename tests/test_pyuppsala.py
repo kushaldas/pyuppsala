@@ -2120,3 +2120,21 @@ class TestFetchMany:
         assert res[0].status == 200 and res[0].body == b"<f/>"
         ((fr, doc),) = pyuppsala.fetch_and_parse_many([f"file://{p}"])
         assert doc.document_element.tag.local_name == "f"
+
+    def test_empty_batch(self):
+        # An empty URL list is a no-op: no threads, no results, no error.
+        assert pyuppsala.fetch_many([]) == []
+        assert pyuppsala.fetch_and_parse_many([]) == []
+
+    def test_decode_error_detail_preserved(self, tmp_path):
+        # A body that fails text decoding must surface the decoder's real
+        # message (not a generic "not valid XML text"), attached to the URL.
+        p = tmp_path / "bad.xml"
+        # UTF-16 LE BOM followed by an odd number of payload bytes: the
+        # decoder reports "Invalid UTF-16 LE: odd number of bytes".
+        p.write_bytes(b"\xff\xfe<\x00r")
+        (err,) = pyuppsala.fetch_and_parse_many([f"file://{p}"])
+        assert isinstance(err, Exception)
+        msg = str(err)
+        assert str(p) in msg
+        assert "odd number of bytes" in msg
