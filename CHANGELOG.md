@@ -20,7 +20,10 @@ was never published; its changes ship here.)
   errors. `fetch_and_parse_many` parses each response on the worker that
   fetched it, so the body bytes never cross the FFI boundary. Results come
   back as **`FetchResult`** objects (`url`, `status`, `reason`, `headers`,
-  `body`, `elapsed_ms`). Gated behind the default-on `net` cargo feature: a
+  `body`, `elapsed_ms`). Response bodies are buffered in memory and capped at
+  `max_body` bytes (default 128 MiB; larger bodies fail per item, pass a
+  bigger `max_body` to opt in). Gated behind the default-on `net` cargo
+  feature: a
   `maturin build --no-default-features` extension is network-free and lacks
   these symbols; check `pyuppsala._HAS_NET`.
 - **`etree` slice assignment** (`el[i:j] = iterable`, `el[:] = iterable`,

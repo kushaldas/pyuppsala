@@ -771,7 +771,7 @@ def fetch_many(
     retry_backoff: float = 0.5,
     user_agent: Optional[str] = None,
     extra_headers: Optional[dict[str, str]] = None,
-    max_body: int = 1_073_741_824,
+    max_body: int = 134_217_728,
 ) -> list[FetchResult | Exception]:
     """Fetch many URLs concurrently in native threads with the GIL released.
 
@@ -779,6 +779,10 @@ def fetch_many(
     ``FetchResult`` or an exception object (not raised) -- a batch never fails
     wholesale. Non-2xx HTTP responses are returned as results (check
     ``.status``), not errors; ``file://`` URLs read the local filesystem.
+
+    Response bodies are buffered fully in memory, capped at ``max_body``
+    bytes (default 128 MiB); a larger body fails that item with a per-item
+    error. Pass a larger ``max_body`` to opt in to bigger payloads.
     """
     ...
 
@@ -794,7 +798,7 @@ def fetch_and_parse_many(
     retry_backoff: float = 0.5,
     user_agent: Optional[str] = None,
     extra_headers: Optional[dict[str, str]] = None,
-    max_body: int = 1_073_741_824,
+    max_body: int = 134_217_728,
     max_depth: Optional[int] = None,
     max_entity_expansion: Optional[int] = None,
     namespace_aware: Optional[bool] = None,

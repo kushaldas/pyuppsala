@@ -3979,9 +3979,16 @@ fn fetch_batch<R: Send>(
 ///
 /// ``verify_tls=False`` disables TLS certificate verification (pyFF fetches
 /// federation metadata this way and verifies XML signatures instead).
+///
+/// Each HTTP response body is buffered fully in memory, capped at
+/// ``max_body`` bytes (default 128 MiB -- comfortably above the largest
+/// federation metadata aggregates while bounding what an untrusted or
+/// misbehaving URL can allocate). A larger body fails with a per-item
+/// error; callers who genuinely expect bigger payloads opt in via
+/// ``max_body=``.
 #[cfg(feature = "net")]
 #[pyfunction]
-#[pyo3(signature = (urls, *, max_threads=None, timeout=30.0, connect_timeout=10.0, verify_tls=true, follow_redirects=true, retries=0, retry_backoff=0.5, user_agent=None, extra_headers=None, max_body=1_073_741_824))]
+#[pyo3(signature = (urls, *, max_threads=None, timeout=30.0, connect_timeout=10.0, verify_tls=true, follow_redirects=true, retries=0, retry_backoff=0.5, user_agent=None, extra_headers=None, max_body=134_217_728))]
 #[allow(clippy::too_many_arguments)]
 fn fetch_many(
     py: Python<'_>,
@@ -4038,9 +4045,13 @@ fn fetch_many(
 /// Returns a list index-aligned with ``urls``: each slot is a
 /// ``(FetchResult, Document)`` tuple, or an exception object for a fetch,
 /// non-2xx status, or parse failure of that item.
+///
+/// Bodies are buffered fully in memory and capped at ``max_body`` bytes
+/// (default 128 MiB); see :func:`fetch_many` for the rationale and the
+/// opt-in for larger payloads.
 #[cfg(feature = "net")]
 #[pyfunction]
-#[pyo3(signature = (urls, *, max_threads=None, timeout=30.0, connect_timeout=10.0, verify_tls=true, follow_redirects=true, retries=0, retry_backoff=0.5, user_agent=None, extra_headers=None, max_body=1_073_741_824, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
+#[pyo3(signature = (urls, *, max_threads=None, timeout=30.0, connect_timeout=10.0, verify_tls=true, follow_redirects=true, retries=0, retry_backoff=0.5, user_agent=None, extra_headers=None, max_body=134_217_728, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
 #[allow(clippy::too_many_arguments)]
 fn fetch_and_parse_many(
     py: Python<'_>,

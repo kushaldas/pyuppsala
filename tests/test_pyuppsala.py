@@ -2126,6 +2126,26 @@ class TestFetchMany:
         assert pyuppsala.fetch_many([]) == []
         assert pyuppsala.fetch_and_parse_many([]) == []
 
+    def test_max_body_cap_is_per_item_error(self):
+        # A body over max_body fails only that item; smaller items succeed.
+        # (The default cap is 128 MiB; use a tiny override to exercise it.)
+        srv, base = self._server(
+            {
+                "/big.xml": (b"<r>" + b"x" * 4096 + b"</r>", 200, "application/xml"),
+                "/small.xml": (b"<s/>", 200, "application/xml"),
+            }
+        )
+        try:
+            res = pyuppsala.fetch_many(
+                [f"{base}/big.xml", f"{base}/small.xml"],
+                timeout=5.0,
+                max_body=1024,
+            )
+            assert isinstance(res[0], Exception)
+            assert res[1].status == 200 and res[1].body == b"<s/>"
+        finally:
+            srv.shutdown()
+
     def test_decode_error_detail_preserved(self, tmp_path):
         # A body that fails text decoding must surface the decoder's real
         # message (not a generic "not valid XML text"), attached to the URL.
