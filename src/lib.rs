@@ -3466,6 +3466,21 @@ enum BatchError {
     Decode(String),
     /// Parse failed; mapped through `xml_error_to_pyerr` for a faithful type.
     Parse(XmlError),
+    /// A worker panicked (a bug, not a normal failure); becomes `RuntimeError`.
+    Panic(String),
+}
+
+/// Best-effort text from a caught panic payload, for per-item error messages.
+/// `panic!("...")` payloads are `&str` or `String`; anything else gets a
+/// generic description.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        format!("worker thread panicked: {}", s)
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        format!("worker thread panicked: {}", s)
+    } else {
+        "worker thread panicked".to_string()
+    }
 }
 
 /// Parse many XML documents in parallel across native threads.
@@ -3542,20 +3557,36 @@ fn parse_many(
                         if i >= n_items {
                             break;
                         }
-                        let parsed: Result<DocWithInput, BatchError> = (|| {
-                            let input = match &items[i] {
-                                BatchInput::Text(s) => s.clone(),
-                                BatchInput::Bytes(b) => {
-                                    decode_xml_bytes_raw(b).map_err(BatchError::Decode)?
-                                }
-                            };
-                            let doc = parser
-                                .parse(&input)
-                                .map_err(BatchError::Parse)?
-                                .into_static();
-                            Ok(DocWithInput { doc, input })
-                        })();
-                        *results[i].lock().unwrap() = Some(parsed);
+                        // catch_unwind keeps a panicking item (a bug in the
+                        // decode/parse path) from unwinding through
+                        // thread::scope -- which would re-panic on join and
+                        // take the whole batch, and with it the calling
+                        // Python thread, down -- degrading it to a per-item
+                        // error instead. AssertUnwindSafe is fine: on a panic
+                        // the closure's only shared state (the result slot)
+                        // is overwritten wholesale below.
+                        let parsed: Result<DocWithInput, BatchError> =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let input = match &items[i] {
+                                    BatchInput::Text(s) => s.clone(),
+                                    BatchInput::Bytes(b) => {
+                                        decode_xml_bytes_raw(b).map_err(BatchError::Decode)?
+                                    }
+                                };
+                                let doc = parser
+                                    .parse(&input)
+                                    .map_err(BatchError::Parse)?
+                                    .into_static();
+                                Ok(DocWithInput { doc, input })
+                            }))
+                            .unwrap_or_else(|p| Err(BatchError::Panic(panic_message(p))));
+                        // Tolerate a poisoned slot rather than panicking:
+                        // poison only means some thread panicked while
+                        // holding this lock, and the Option is replaced
+                        // wholesale, so the stored value stays well-defined.
+                        *results[i]
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parsed);
                     }
                 });
             }
@@ -3563,15 +3594,23 @@ fn parse_many(
     });
 
     // Re-attached: wrap successes into Document pyclasses and failures into
-    // exception *objects* returned in place.
+    // exception *objects* returned in place. Never panic here (poisoned slot,
+    // slot a worker somehow left unfilled): a panic in extension code aborts
+    // or corrupts the interpreter, so both degrade to per-item errors.
     results
         .into_iter()
         .map(|slot| {
-            match slot
+            let outcome = slot
                 .into_inner()
-                .unwrap()
-                .expect("worker filled every slot")
-            {
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                // Unreachable now that workers catch panics, but kept as
+                // defense in depth: surface it as this item's error.
+                .unwrap_or_else(|| {
+                    Err(BatchError::Panic(
+                        "worker thread produced no result".to_string(),
+                    ))
+                });
+            match outcome {
                 Ok(dwi) => Ok(Py::new(
                     py,
                     Document {
@@ -3583,6 +3622,7 @@ fn parse_many(
                     let e = match be {
                         BatchError::Decode(msg) => XmlWellFormednessError::new_err(msg),
                         BatchError::Parse(xe) => xml_error_to_pyerr(xe),
+                        BatchError::Panic(msg) => PyRuntimeError::new_err(msg),
                     };
                     Ok(e.into_value(py).into_any())
                 }
@@ -3787,15 +3827,39 @@ fn fetch_batch<R: Send>(
                     if i >= n_items {
                         break;
                     }
-                    let out = fetch_one(&agent, &urls[i], opts);
-                    *results[i].lock().unwrap() = Some(per_item(out));
+                    // catch_unwind: a panic in the fetch or the caller's
+                    // per_item mapping (a bug, not an I/O failure) degrades
+                    // to that item's error via per_item's own Err arm instead
+                    // of unwinding through thread::scope and taking the whole
+                    // batch -- and the calling Python thread -- down.
+                    // AssertUnwindSafe is fine: the only shared state (the
+                    // result slot) is overwritten wholesale below.
+                    let val = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        per_item(fetch_one(&agent, &urls[i], opts))
+                    }))
+                    .unwrap_or_else(|p| per_item(Err(panic_message(p))));
+                    // Tolerate a poisoned slot rather than panicking: poison
+                    // only means some thread panicked while holding this
+                    // lock, and the Option is replaced wholesale.
+                    *results[i]
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(val);
                 });
             }
         });
     });
+    // Never panic in the wrap-up (this runs attached, on the calling Python
+    // thread): tolerate poison, and turn a slot a worker somehow left
+    // unfilled into that item's error through the caller's Err mapping.
+    // The unfilled case is unreachable now that workers catch panics, but
+    // kept as defense in depth.
     results
         .into_iter()
-        .map(|slot| slot.into_inner().unwrap().expect("worker filled slot"))
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|| per_item(Err("worker thread produced no result".to_string())))
+        })
         .collect()
 }
 
