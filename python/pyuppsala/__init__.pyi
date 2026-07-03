@@ -704,6 +704,117 @@ def parse_bytes(
     """
     ...
 
+def parse_many(
+    items: list[str | bytes | bytearray],
+    *,
+    max_threads: Optional[int] = None,
+    max_depth: Optional[int] = None,
+    max_entity_expansion: Optional[int] = None,
+    namespace_aware: Optional[bool] = None,
+    forbid_dtd: Optional[bool] = None,
+    forbid_entities: Optional[bool] = None,
+) -> list[Document | Exception]:
+    """Parse many XML documents in parallel across native threads.
+
+    Returns a list index-aligned with ``items``: each slot is either a
+    ``Document`` or an exception object (not raised) describing that item\'s
+    failure. The whole batch runs with the GIL released.
+    """
+    ...
+
+# Native fetch APIs (cargo feature "net", on by default). A network-free
+# build (``maturin build --no-default-features``) does not have these
+# symbols at runtime; gate any use on ``pyuppsala._HAS_NET``. They are
+# declared unconditionally here because stubs cannot express build features.
+
+_HAS_NET: bool
+"""True when the extension was built with the default-on ``net`` cargo
+feature, i.e. ``FetchResult`` / ``fetch_many`` / ``fetch_and_parse_many``
+exist at runtime."""
+
+class FetchResult:
+    """The result of one URL fetch from ``fetch_many`` / ``fetch_and_parse_many``."""
+
+    url: str
+    """The requested URL (as passed in)."""
+
+    status: int
+    """HTTP status code (200 for ``file://`` reads)."""
+
+    reason: str
+    """Canonical reason phrase for the status, e.g. ``"OK"``."""
+
+    elapsed_ms: float
+    """Wall-clock milliseconds spent on this fetch (including retries)."""
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """Response headers, keys lowercased. Empty for ``file://`` reads."""
+        ...
+
+    @property
+    def body(self) -> bytes:
+        """Raw response body bytes (transparently gunzipped by the client)."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+def fetch_many(
+    urls: list[str],
+    *,
+    max_threads: Optional[int] = None,
+    timeout: float = 30.0,
+    connect_timeout: float = 10.0,
+    verify_tls: bool = True,
+    follow_redirects: bool = True,
+    retries: int = 0,
+    retry_backoff: float = 0.5,
+    user_agent: Optional[str] = None,
+    extra_headers: Optional[dict[str, str]] = None,
+    max_body: int = 134_217_728,
+) -> list[FetchResult | Exception]:
+    """Fetch many URLs concurrently in native threads with the GIL released.
+
+    Returns a list index-aligned with ``urls`` where each slot is either a
+    ``FetchResult`` or an exception object (not raised) -- a batch never fails
+    wholesale. Non-2xx HTTP responses are returned as results (check
+    ``.status``), not errors; ``file://`` URLs read the local filesystem.
+
+    Response bodies are buffered fully in memory, capped at ``max_body``
+    bytes (default 128 MiB); a larger body fails that item with a per-item
+    error. Pass a larger ``max_body`` to opt in to bigger payloads.
+    """
+    ...
+
+def fetch_and_parse_many(
+    urls: list[str],
+    *,
+    max_threads: Optional[int] = None,
+    timeout: float = 30.0,
+    connect_timeout: float = 10.0,
+    verify_tls: bool = True,
+    follow_redirects: bool = True,
+    retries: int = 0,
+    retry_backoff: float = 0.5,
+    user_agent: Optional[str] = None,
+    extra_headers: Optional[dict[str, str]] = None,
+    max_body: int = 134_217_728,
+    max_depth: Optional[int] = None,
+    max_entity_expansion: Optional[int] = None,
+    namespace_aware: Optional[bool] = None,
+    forbid_dtd: Optional[bool] = None,
+    forbid_entities: Optional[bool] = None,
+) -> list[tuple[FetchResult, Document] | Exception]:
+    """Fetch many URLs and parse each response as XML, all in native threads.
+
+    Each response is parsed on the worker that fetched it, so the body bytes
+    never cross the FFI boundary. Returns a list index-aligned with ``urls``:
+    each slot is a ``(FetchResult, Document)`` tuple, or an exception object
+    for a fetch, non-2xx status, or parse failure of that item. The parser
+    keyword arguments match ``parse`` and apply to every item.
+    """
+    ...
+
 # Default resource-limit constants (uppsala 0.4.0 hardening)
 
 DEFAULT_MAX_DEPTH: int

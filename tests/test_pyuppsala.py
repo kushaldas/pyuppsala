@@ -1866,3 +1866,313 @@ class TestForbidDtd:
             ).document_element
             is not None
         )
+
+
+# ============================================================================
+# GIL release (Python::detach) on heavy native operations
+# ============================================================================
+
+
+class TestGilRelease:
+    """Smoke tests that parse/serialize release the GIL.
+
+    The native parse/XSLT/XSD/serialize paths run under ``Python::detach``,
+    so two Python threads doing that work should genuinely overlap on a
+    multi-core machine. Timing assertions use generous margins to stay
+    robust on loaded CI hosts; the functional assertions (correct results
+    from concurrent threads) are the hard gate.
+    """
+
+    @staticmethod
+    def _big_xml(n=4000):
+        # ~1.5 MB of namespaced elements, enough for a measurable parse.
+        items = "".join(
+            f'<item id="i{i}"><name>entry {i}</name><value>{i * 7}</value></item>'
+            for i in range(n)
+        )
+        return f'<root xmlns="urn:bench">{items}</root>'
+
+    def test_concurrent_parse_correctness(self):
+        # Hard gate: N threads parsing concurrently all produce valid docs.
+        import threading
+
+        xml = self._big_xml()
+        results = [None] * 4
+
+        def work(idx):
+            doc = parse(xml)
+            results[idx] = len(doc.document_element.children)
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [4000] * 4
+
+    def test_parse_releases_gil_wallclock_overlap(self):
+        # Soft gate: two threads parsing together should be faster than the
+        # same two parses run back-to-back. Skipped on single-core machines.
+        import os
+        import threading
+        import time
+
+        # Count CPUs actually available to this process (cgroups / affinity can
+        # constrain it below the host total); fall back to the host count.
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except AttributeError:  # sched_getaffinity is not on every platform
+            available_cpus = os.cpu_count() or 1
+        if available_cpus < 2:
+            pytest.skip("needs >= 2 CPUs to observe GIL-released overlap")
+
+        xml = self._big_xml(8000)
+        reps = 3
+
+        def one_parse():
+            parse(xml)
+
+        # Warm up (allocator, code paths).
+        one_parse()
+
+        serial = time.perf_counter()
+        for _ in range(2 * reps):
+            one_parse()
+        serial = time.perf_counter() - serial
+
+        def worker():
+            for _ in range(reps):
+                one_parse()
+
+        threaded = time.perf_counter()
+        a = threading.Thread(target=worker)
+        b = threading.Thread(target=worker)
+        a.start()
+        b.start()
+        a.join()
+        b.join()
+        threaded = time.perf_counter() - threaded
+
+        # With the GIL held during parse this ratio is ~1.0 (or worse); with
+        # it released it approaches 0.5 on an idle 2+ core machine. 0.9 keeps
+        # the check robust against noisy hosts while still catching a
+        # reintroduced GIL hold.
+        #
+        # Wall-clock gates are inherently non-deterministic on shared/loaded CI
+        # hosts, so this is NON-GATING by default: on a slow-overlap result it
+        # skips rather than fails. Set PYUPPSALA_TIMING_TESTS=1 to enforce it
+        # (e.g. on a dedicated perf box). The concurrency *correctness* tests
+        # in this class are the hard gate.
+        ratio = threaded / serial if serial else 1.0
+        msg = (
+            f"threaded parse showed no overlap: {threaded:.3f}s vs "
+            f"serial {serial:.3f}s (ratio {ratio:.2f})"
+        )
+        if os.environ.get("PYUPPSALA_TIMING_TESTS"):
+            assert threaded < serial * 0.9, msg
+        elif not threaded < serial * 0.9:
+            pytest.skip(msg + " -- set PYUPPSALA_TIMING_TESTS=1 to enforce")
+
+    def test_concurrent_serialize_correctness(self):
+        import threading
+
+        doc = parse(self._big_xml(2000))
+        outs = [None] * 4
+
+        def work(idx):
+            outs[idx] = doc.to_xml()
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert all(o == outs[0] for o in outs)
+        assert outs[0].count("<item") == 2000
+
+
+# ============================================================================
+# parse_many -- parallel batch parsing
+# ============================================================================
+
+
+class TestParseMany:
+    def test_empty_batch(self):
+        assert pyuppsala.parse_many([]) == []
+
+    def test_mixed_str_and_bytes(self):
+        docs = pyuppsala.parse_many(["<a/>", b"<b/>", "<c>x</c>"])
+        assert [d.document_element.tag.local_name for d in docs] == ["a", "b", "c"]
+
+    def test_errors_returned_in_place_not_raised(self):
+        results = pyuppsala.parse_many(["<ok/>", "<broken", "<ok2/>"])
+        assert results[0].document_element.tag.local_name == "ok"
+        assert isinstance(results[1], Exception)
+        assert results[2].document_element.tag.local_name == "ok2"
+
+    def test_order_is_input_order(self):
+        # Mix sizes so work-stealing would reorder completion; results must
+        # still align with the inputs.
+        big = "<r>" + "<x/>" * 5000 + "</r>"
+        results = pyuppsala.parse_many([big, "<a/>", big, "<b/>"], max_threads=4)
+        assert results[1].document_element.tag.local_name == "a"
+        assert results[3].document_element.tag.local_name == "b"
+        assert len(results[0].document_element.children) == 5000
+
+    def test_parse_kwargs_apply_to_every_item(self):
+        dt = '<!DOCTYPE r><r/>'
+        results = pyuppsala.parse_many([dt, dt], forbid_dtd=True)
+        assert all(isinstance(r, Exception) for r in results)
+
+    def test_utf16_bytes_auto_detected(self):
+        data = '<r>héllo</r>'.encode("utf-16")
+        (doc,) = pyuppsala.parse_many([data])
+        assert doc.document_element.text_content == "héllo"
+
+    def test_single_thread_matches_default(self):
+        xmls = [f"<n{i}/>" for i in range(20)]
+        a = pyuppsala.parse_many(xmls, max_threads=1)
+        b = pyuppsala.parse_many(xmls)
+        assert [d.to_xml() for d in a] == [d.to_xml() for d in b]
+
+
+# ============================================================================
+# fetch_many / fetch_and_parse_many (feature "net")
+# ============================================================================
+
+
+@pytest.mark.skipif(
+    not pyuppsala._HAS_NET,
+    reason="native fetch APIs require the default-on 'net' feature "
+    "(absent in a --no-default-features build)",
+)
+class TestFetchMany:
+    """Exercises the native fetch against a local in-process HTTP server."""
+
+    @staticmethod
+    def _server(handler_map):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body, status, ctype = handler_map.get(
+                    self.path, (b"not found", 404, "text/plain")
+                )
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def test_fetch_many_basics(self):
+        srv, base = self._server(
+            {
+                "/a.xml": (b"<a/>", 200, "application/xml"),
+                "/missing": (b"nope", 404, "text/plain"),
+            }
+        )
+        try:
+            res = pyuppsala.fetch_many(
+                [f"{base}/a.xml", f"{base}/missing", "http://127.0.0.1:1/refused"],
+                max_threads=3,
+                timeout=5.0,
+            )
+            assert res[0].status == 200 and res[0].body == b"<a/>"
+            assert "application/xml" in res[0].headers["content-type"]
+            assert res[0].elapsed_ms >= 0
+            # Non-2xx is a result, not an error (pyFF checks statuses itself).
+            assert res[1].status == 404
+            # Connection failure is an in-place exception object.
+            assert isinstance(res[2], Exception)
+        finally:
+            srv.shutdown()
+
+    def test_fetch_and_parse_many(self):
+        srv, base = self._server(
+            {
+                "/ok.xml": (b"<r><c/></r>", 200, "application/xml"),
+                "/bad.xml": (b"<broken", 200, "application/xml"),
+            }
+        )
+        try:
+            res = pyuppsala.fetch_and_parse_many(
+                [f"{base}/ok.xml", f"{base}/bad.xml"], timeout=5.0
+            )
+            fr, doc = res[0]
+            assert fr.status == 200
+            assert doc.document_element.tag.local_name == "r"
+            assert isinstance(res[1], Exception)  # parse failure, in place
+        finally:
+            srv.shutdown()
+
+    def test_file_url(self, tmp_path):
+        p = tmp_path / "f.xml"
+        p.write_bytes(b"<f/>")
+        res = pyuppsala.fetch_many([f"file://{p}"])
+        assert res[0].status == 200 and res[0].body == b"<f/>"
+        ((fr, doc),) = pyuppsala.fetch_and_parse_many([f"file://{p}"])
+        assert doc.document_element.tag.local_name == "f"
+
+    def test_empty_batch(self):
+        # An empty URL list is a no-op: no threads, no results, no error.
+        assert pyuppsala.fetch_many([]) == []
+        assert pyuppsala.fetch_and_parse_many([]) == []
+
+    def test_bad_float_knobs_raise_valueerror(self):
+        # Negative / NaN / inf / absurd timeout values would panic inside
+        # Duration::from_secs_f64; they must surface as ValueError instead,
+        # from both entrypoints.
+        import math
+
+        for kw in (
+            {"timeout": -1.0},
+            {"timeout": math.nan},
+            {"connect_timeout": math.inf},
+            {"retry_backoff": -0.5},
+            {"timeout": 1e30},
+        ):
+            with pytest.raises(ValueError):
+                pyuppsala.fetch_many(["http://127.0.0.1:1/x"], **kw)
+            with pytest.raises(ValueError):
+                pyuppsala.fetch_and_parse_many(["http://127.0.0.1:1/x"], **kw)
+
+    def test_max_body_cap_is_per_item_error(self):
+        # A body over max_body fails only that item; smaller items succeed.
+        # (The default cap is 128 MiB; use a tiny override to exercise it.)
+        srv, base = self._server(
+            {
+                "/big.xml": (b"<r>" + b"x" * 4096 + b"</r>", 200, "application/xml"),
+                "/small.xml": (b"<s/>", 200, "application/xml"),
+            }
+        )
+        try:
+            res = pyuppsala.fetch_many(
+                [f"{base}/big.xml", f"{base}/small.xml"],
+                timeout=5.0,
+                max_body=1024,
+            )
+            assert isinstance(res[0], Exception)
+            assert res[1].status == 200 and res[1].body == b"<s/>"
+        finally:
+            srv.shutdown()
+
+    def test_decode_error_detail_preserved(self, tmp_path):
+        # A body that fails text decoding must surface the decoder's real
+        # message (not a generic "not valid XML text"), attached to the URL.
+        p = tmp_path / "bad.xml"
+        # UTF-16 LE BOM followed by an odd number of payload bytes: the
+        # decoder reports "Invalid UTF-16 LE: odd number of bytes".
+        p.write_bytes(b"\xff\xfe<\x00r")
+        (err,) = pyuppsala.fetch_and_parse_many([f"file://{p}"])
+        assert isinstance(err, Exception)
+        msg = str(err)
+        assert str(p) in msg
+        assert "odd number of bytes" in msg

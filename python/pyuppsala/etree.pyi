@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable, Iterator, Optional, Union
+from typing import Any, Callable, Iterable, Iterator, Optional, Union, overload
 
 # Per-evaluation node-visit budget applied by ``_Element.xpath`` (unbounded by
 # default to match lxml; lower it to restore an anti-DoS bound on untrusted input).
@@ -77,7 +77,10 @@ class _Element:
     def __len__(self) -> int: ...
     def __iter__(self) -> Iterator[_Element]: ...
     def __getitem__(self, index: Union[int, slice]) -> Any: ...
+    @overload
     def __setitem__(self, index: int, element: _Element) -> None: ...
+    @overload
+    def __setitem__(self, index: slice, element: Iterable[_Element]) -> None: ...
     def __delitem__(self, index: Union[int, slice]) -> None: ...
     def __contains__(self, element: object) -> bool: ...
     def index(
@@ -261,6 +264,16 @@ class XMLParser:
 def fromstring(
     text: Union[str, bytes], parser: Optional[XMLParser] = None
 ) -> _Element: ...
+def fromstring_many(
+    texts: Iterable[str | bytes | bytearray],
+    parser: Optional[XMLParser] = None,
+    max_threads: Optional[int] = None,
+) -> list[_Element | XMLSyntaxError | TypeError]:
+    """Parse many documents in parallel; index-aligned roots or per-item
+    errors, never raised wholesale (XMLSyntaxError for parse/decode failures,
+    TypeError for a non-str/bytes item)."""
+    ...
+
 def fromstringlist(
     strings: Iterable[Union[str, bytes]], parser: Optional[XMLParser] = None
 ) -> _Element: ...

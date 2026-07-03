@@ -1,6 +1,64 @@
 # Changelog
 
 
+## 0.8.0
+
+Performance + feature release, built against uppsala 0.8. (An interim 0.7.2
+was never published; its changes ship here.)
+
+### Added
+
+- **`parse_many(items, *, max_threads=None, ...)`** and
+  **`etree.fromstring_many(texts, ...)`**: parse a batch of documents in
+  parallel across native threads, the whole batch under one GIL release. The
+  result list is index-aligned with the input; a failed item comes back as an
+  exception *object* in its slot (not raised), so one bad document never
+  discards the rest of the batch.
+- **`fetch_many(urls, ...)`** and **`fetch_and_parse_many(urls, ...)`**:
+  concurrent native HTTP(S) / `file://` fetching (ureq + rustls) with retries
+  and exponential backoff; non-2xx responses are returned as results, not
+  errors. `fetch_and_parse_many` parses each response on the worker that
+  fetched it, so the body bytes never cross the FFI boundary. Results come
+  back as **`FetchResult`** objects (`url`, `status`, `reason`, `headers`,
+  `body`, `elapsed_ms`). Response bodies are buffered in memory and capped at
+  `max_body` bytes (default 128 MiB; larger bodies fail per item, pass a
+  bigger `max_body` to opt in). Gated behind the default-on `net` cargo
+  feature: a
+  `maturin build --no-default-features` extension is network-free and lacks
+  these symbols; check `pyuppsala._HAS_NET`.
+- **`etree` slice assignment** (`el[i:j] = iterable`, `el[:] = iterable`,
+  extended slices). Matches lxml/ElementTree: the selected children are removed
+  and the new elements spliced in, with elements already in the tree *moved*
+  (so `el[:] = sorted(el, key=...)` reorders in place, which pyFF's `sort` pipe
+  relies on) and elements from another document deep-copied in. Each element
+  keeps its own tail. Previously slice assignment raised `NotImplementedError`.
+
+### Changed
+
+- **The GIL is released during heavy native operations** -- parsing (`parse`,
+  `parse_bytes`, `Document(...)`, `Document.from_bytes`), whole-document
+  serialization, XSD validation, and XSLT application -- so other Python
+  threads make real progress while Rust works.
+- **The `etree` object model moved into Rust.** Elements are identity-stable
+  proxies served from a native per-document cache, traversal (`iter`,
+  `getparent`, child access) and `.tag` reads run without a Python frame, and
+  tag strings are interned per document (equal tags compare by pointer
+  identity). See PERFORMANCE.md for per-operation numbers vs lxml.
+
+### Fixed
+
+- **Performance regression in cross-document `append`/`deepcopy`.** The
+  dead-weakref sweep added to `etree._repoint_subtree` in 0.7.0 ran on every
+  recursive step of the lock-step subtree walk, making it
+  O(proxies x subtree-size). When the source document held many live element
+  proxies (e.g. pyFF aggregation, which walks the whole input tree before
+  moving entities into the aggregate), repeated `append`/`deepcopy` degraded to
+  an effectively-hung quadratic walk. The sweep now runs once at entry and the
+  recursive walk is back to O(subtree) with an O(1) fast-path per node. Node
+  identity across moves is unchanged (still gated by the lxml-differential
+  tests).
+
+
 ## 0.7.1
 
 Built against uppsala 0.7.1, a security/hardening release. All of its changes

@@ -23,6 +23,7 @@ from ._pyuppsala import (
     # Functions
     parse,
     parse_bytes,
+    parse_many,
     # Resource-limit constants
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_ENTITY_EXPANSION,
@@ -40,6 +41,16 @@ from ._pyuppsala import (
     XsdValidationError,
 )
 
+# Native fetch APIs exist only when the extension was built with the
+# default-on "net" cargo feature; a network-free build (maturin
+# --no-default-features, e.g. for distro packaging) simply lacks them.
+try:
+    from ._pyuppsala import FetchResult, fetch_and_parse_many, fetch_many  # noqa: F401
+
+    _HAS_NET = True
+except ImportError:
+    _HAS_NET = False
+
 from . import etree  # noqa: F401  (registers the submodule on import)
 
 __all__ = [
@@ -55,6 +66,7 @@ __all__ = [
     "Xslt",
     "parse",
     "parse_bytes",
+    "parse_many",
     "DEFAULT_MAX_DEPTH",
     "DEFAULT_MAX_ENTITY_EXPANSION",
     "DEFAULT_MAX_ENTITY_DEPTH",
@@ -70,3 +82,6 @@ __all__ = [
     "XsdValidationError",
     "etree",
 ]
+
+if _HAS_NET:
+    __all__ += ["FetchResult", "fetch_many", "fetch_and_parse_many"]

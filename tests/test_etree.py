@@ -188,6 +188,26 @@ class TestSearchDifferential:
         assert names(pr.iter("*")) == names(lr.iter("*"))
         assert names(pr.iter()) == names(lr.iter())
 
+    def test_child_iteration_lazy_matches_lxml(self):
+        # __iter__ is a lazy native child iterator; behavior must match
+        # lxml's equally-lazy ElementChildIterator.
+        doc = "<r>t<a/><!--c-->x<?pi d?><b/>tail</r>"
+        pr, lr = P.fromstring(doc), L.fromstring(doc)
+
+        def names(it):
+            return ["#" if not isinstance(c.tag, str) else c.tag for c in it]
+
+        assert names(pr) == names(lr)  # elements, comments, PIs in order
+        assert next(iter(pr)).tag == next(iter(lr)).tag  # early termination
+        assert names(iter(P.fromstring("<r>text only</r>"))) == []
+        # Live-chain semantics: a child appended mid-iteration is reached by
+        # the ongoing walk, and an exhausted iterator stays exhausted.
+        pi, li = iter(pr), iter(lr)
+        next(pi), next(li)
+        P.SubElement(pr, "new"), L.SubElement(lr, "new")
+        assert names(pi) == names(li)
+        assert next(pi, None) is None and next(li, None) is None
+
     def test_itertext(self):
         pr, lr = P.fromstring(SAMPLE), L.fromstring(SAMPLE)
         assert list(pr.itertext()) == list(lr.itertext())
@@ -464,6 +484,73 @@ class TestExtendedDifferential:
             return [e.tag for e in r]
 
         assert run(P) == run(L)
+
+    def _canon_setslice(self, xml, op):
+        rp, rl = P.fromstring(xml), L.fromstring(xml.encode())
+        op(P, rp)
+        op(L, rl)
+        return (
+            L.canonicalize(P.tostring(rp, encoding="unicode")),
+            L.canonicalize(L.tostring(rl).decode()),
+        )
+
+    def test_setslice_reorder_full(self):
+        # ``el[:] = sorted(el, key=...)`` -- pyFF's sort pipe (in-place reorder).
+        p, l = self._canon_setslice(
+            '<r><c id="3"/><a id="1"/><b id="2"/></r>',
+            lambda m, r: r.__setitem__(
+                slice(None), sorted(list(r), key=lambda e: e.get("id"))
+            ),
+        )
+        assert p == l
+
+    def test_setslice_reorder_preserves_tails(self):
+        p, l = self._canon_setslice(
+            '<r>\n  <a id="2">A</a>\n  <b id="1">B</b>\n</r>',
+            lambda m, r: r.__setitem__(
+                slice(None), sorted(list(r), key=lambda e: e.get("id"))
+            ),
+        )
+        assert p == l
+
+    def test_setslice_partial_replace(self):
+        def op(m, r):
+            r[1:3] = [m.Element("x"), m.Element("y")]
+
+        p, l = self._canon_setslice("<r><a/><b/><c/><d/></r>", op)
+        assert p == l
+
+    def test_setslice_shrink_and_grow(self):
+        def shrink(m, r):
+            r[0:3] = [m.Element("x")]
+
+        def grow(m, r):
+            r[1:2] = [m.Element("x"), m.Element("y"), m.Element("z")]
+
+        assert self._canon_setslice("<r><a/><b/><c/><d/></r>", shrink)[0] == \
+            self._canon_setslice("<r><a/><b/><c/><d/></r>", shrink)[1]
+        assert self._canon_setslice("<r><a/><b/><c/></r>", grow)[0] == \
+            self._canon_setslice("<r><a/><b/><c/></r>", grow)[1]
+
+    def test_setslice_extended(self):
+        def op(m, r):
+            r[0:4:2] = [m.Element("x"), m.Element("y")]
+
+        p, l = self._canon_setslice("<r><a/><b/><c/><d/></r>", op)
+        assert p == l
+
+    def test_setslice_extended_size_mismatch_raises(self):
+        r = P.fromstring("<r><a/><b/><c/><d/></r>")
+        with pytest.raises(ValueError):
+            r[0:4:2] = [P.Element("x")]
+
+    def test_setslice_foreign_elements_moved_in(self):
+        def op(m, r):
+            src = m.fromstring("<s><p/><q/></s>")
+            r[:] = list(src)
+
+        p, l = self._canon_setslice("<r><a/></r>", op)
+        assert p == l
 
     def test_processing_instruction(self):
         def run(m):
@@ -1307,3 +1394,56 @@ class TestNamespaceSerializationAndCopy:
 
     def test_document_invalid_has_error_log(self):
         assert P.DocumentInvalid("x").error_log == []
+
+
+class TestFromstringMany:
+    def test_roots_and_errors_aligned(self):
+        from pyuppsala import etree as ET
+
+        results = ET.fromstring_many(["<a x='1'/>", "<broken", b"<b>t</b>"])
+        assert results[0].tag == "a" and results[0].get("x") == "1"
+        assert isinstance(results[1], ET.XMLSyntaxError)
+        assert results[2].tag == "b" and results[2].text == "t"
+
+    def test_identity_and_full_api_on_results(self):
+        from pyuppsala import etree as ET
+
+        (root,) = ET.fromstring_many(["<r><c/><c/></r>"])
+        assert root[0] is root[0]
+        assert [c.tag for c in root.iter("c")] == ["c", "c"]
+        assert ET.tostring(root, encoding="unicode") == "<r><c/><c/></r>"
+
+    def test_parser_options_apply(self):
+        from pyuppsala import etree as ET
+
+        p = ET.XMLParser(remove_comments=True)
+        (root,) = ET.fromstring_many(["<r><!-- gone --><c/></r>"], parser=p)
+        assert len(root) == 1 and root[0].tag == "c"
+
+    def test_parser_encoding_override(self):
+        from pyuppsala import etree as ET
+
+        p = ET.XMLParser(encoding="latin-1")
+        (root,) = ET.fromstring_many(["<r>\xe9</r>".encode("latin-1")], parser=p)
+        assert root.text == "é"
+
+    def test_wrong_typed_item_is_per_item_error(self):
+        # A non-str/bytes item must come back as an in-place TypeError, not
+        # raise for (and so discard) the whole batch.
+        from pyuppsala import etree as ET
+
+        results = ET.fromstring_many(["<a/>", 42, None, b"<b/>"])
+        assert results[0].tag == "a"
+        assert isinstance(results[1], TypeError) and "int" in str(results[1])
+        assert isinstance(results[2], TypeError) and "NoneType" in str(results[2])
+        assert results[3].tag == "b"
+
+    def test_wrong_typed_item_with_encoding_parser(self):
+        # The same per-item TypeError contract holds on the parser-encoding
+        # path, which decodes byte items in Python before the native batch.
+        from pyuppsala import etree as ET
+
+        p = ET.XMLParser(encoding="latin-1")
+        results = ET.fromstring_many([object(), "<r>\xe9</r>".encode("latin-1")], parser=p)
+        assert isinstance(results[0], TypeError)
+        assert results[1].text == "é"
