@@ -53,9 +53,15 @@ def TestOneInput(data: bytes):
         # Names the main schema can reference via schemaLocation="a.xsd" etc.
         for fname, content in (("a.xsd", inc_a), ("b.xsd", inc_b)):
             try:
-                with open(os.path.join(base, fname), "w") as fh:
+                # utf-8 explicitly: the process locale's default encoding may
+                # not represent arbitrary fuzz-derived unicode at all.
+                with open(os.path.join(base, fname), "w", encoding="utf-8") as fh:
                     fh.write(content)
-            except (OSError, ValueError):
+            except (OSError, ValueError, UnicodeError):
+                # Harness/environment noise (unwritable file, unencodable
+                # text), not a library defect -- never a fuzz finding.
+                # UnicodeError is a ValueError subclass; listed explicitly
+                # for self-documentation.
                 pass
 
         validator = hc.guard(lambda: hc.pyuppsala.XsdValidator.from_file(main_schema, base))
