@@ -47,6 +47,16 @@ was never published; its changes ship here.)
 
 ### Fixed
 
+- **`etree` now rejects XML-incompatible strings at the API boundary**
+  (lxml parity): setting text/tails, attribute values, comment/PI content,
+  or namespace URIs (Clark keys, QNames, `nsmap`) containing NUL, C0 control
+  characters other than tab/newline/carriage return, lone surrogates, or
+  U+FFFE/U+FFFF raises `ValueError` with lxml's message. Previously such
+  strings were stored raw while the serializer (and the subtree-copy path)
+  sanitized them to U+FFFD, so the DOM and its own output disagreed; found
+  by `dom_mutate_fuzzer` as a round-trip break where a control character in
+  a namespace URI led to two prefixes for the "same" URI and a
+  duplicate-attribute parse error on reparse of pyuppsala's own output.
 - **Performance regression in cross-document `append`/`deepcopy`.** The
   dead-weakref sweep added to `etree._repoint_subtree` in 0.7.0 ran on every
   recursive step of the lock-step subtree walk, making it

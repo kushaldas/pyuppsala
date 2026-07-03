@@ -205,6 +205,37 @@ def _validate_prefix(prefix):
     return _validate_ncname(prefix, "namespace prefix")
 
 
+# Characters that can never appear in well-formed XML 1.0 output: NUL and the
+# other C0 controls (except tab / newline / carriage return), lone surrogates,
+# and the non-characters U+FFFE / U+FFFF. uppsala's serializer replaces them
+# with U+FFFD on output, so storing one would make the DOM and its own
+# serialization disagree about a value -- dom_mutate_fuzzer surfaced exactly
+# that as a round-trip break: a namespace URI containing U+0005 compared
+# unequal to its sanitized copy, so a second prefix was declared for the
+# "same" URI and the two attributes collided as duplicates on reparse.
+# lxml rejects such strings at the API boundary; we match it.
+_ILLEGAL_XML_CHARS_RE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]"
+)
+
+
+def _check_xml_string(value):
+    """Reject ``value`` if it contains characters illegal in XML 1.0.
+
+    Returns ``value`` unchanged so call sites can validate inline. ``None``
+    and non-``str`` values pass through: optional-text call sites use
+    ``None``, and wrong types keep raising their existing ``TypeError`` from
+    the native layer. The error message matches lxml's, so callers catching
+    lxml's ValueError behave identically.
+    """
+    if isinstance(value, str) and _ILLEGAL_XML_CHARS_RE.search(value):
+        raise ValueError(
+            "All strings must be XML compatible: Unicode or ASCII, "
+            "no NULL bytes or control characters"
+        )
+    return value
+
+
 def register_namespace(prefix, uri):
     """Register a prefix -> URI mapping used when serializing built trees."""
     if not isinstance(prefix, str) or not isinstance(uri, str):
@@ -233,6 +264,9 @@ def _tag_split(tag):
         uri, brace, local = tag[1:].partition("}")
         if not brace:
             raise ValueError("Invalid tag name %r" % tag)
+        # The local part is NCName-checked below; the URI part is free-form
+        # text and only needs the XML-compatibility check.
+        _check_xml_string(uri)
         return (uri or None), _validate_ncname(local, "tag")
     return None, _validate_ncname(tag, "tag")
 
@@ -252,7 +286,9 @@ def _clark_of(tag):
 def _split_key(key):
     """Split a tag/attribute key (str or QName) into ``(ns_or_None, local)``."""
     if isinstance(key, QName):
-        return key.namespace, key.localname
+        # A QName's namespace is user-supplied free-form text; hold it to the
+        # same XML-compatibility bar as Clark-notation string keys.
+        return _check_xml_string(key.namespace), key.localname
     return _tag_split(key)
 
 
@@ -269,7 +305,7 @@ def _validate_nsmap(nsmap):
     for pfx, uri in nsmap.items():
         if not isinstance(uri, str):
             raise TypeError("namespace URI must be a string")
-        normalized[_validate_prefix(pfx)] = uri
+        normalized[_validate_prefix(pfx)] = _check_xml_string(uri)
     return normalized
 
 
@@ -615,6 +651,7 @@ def SubElement(_parent, _tag, attrib=None, nsmap=None, **extra):
 
 def Comment(text=None):
     """Create a standalone comment node (its ``.tag`` is the ``Comment`` factory)."""
+    _check_xml_string(text)
     holder = _DocHolder(_u.Document.empty())
     node = holder.doc.create_comment("" if text is None else text)
     holder.doc.append_child(holder.doc.root, node)
@@ -623,6 +660,8 @@ def Comment(text=None):
 
 def ProcessingInstruction(target, text=None):
     """Create a standalone processing-instruction node."""
+    _check_xml_string(target)
+    _check_xml_string(text)
     holder = _DocHolder(_u.Document.empty())
     node = holder.doc.create_processing_instruction(target, text)
     holder.doc.append_child(holder.doc.root, node)
@@ -653,6 +692,7 @@ def _set_element_tag(el, value):
 def _set_element_text(el, value):
     """Set ``el``'s leading text (cold ``_Element.text`` setter), replacing the
     full existing text/CDATA run. For comment/PI nodes sets the body instead."""
+    _check_xml_string(value)
     node = el._node
     kind = node.kind
     if kind == "comment":
@@ -684,6 +724,7 @@ def _set_element_text(el, value):
 def _set_element_tail(el, value):
     """Set ``el``'s trailing text (cold ``_Element.tail`` setter), replacing the
     full existing text/CDATA run."""
+    _check_xml_string(value)
     node = el._node
     doc = el._holder.doc
     parent = node.parent
@@ -821,6 +862,7 @@ class _Element(_u._ElementBase):
         one if needed) so the attribute serializes correctly.
         """
         ns, local = _split_key(key)
+        _check_xml_string(value)
         prefix = None
         if ns:
             prefix = self._ensure_ns_prefix(ns)
