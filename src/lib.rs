@@ -3808,6 +3808,34 @@ struct FetchOpts {
     max_body: u64,
 }
 
+/// Upper bound for the user-supplied second-valued knobs (about 31 years):
+/// far beyond any sane timeout, but small enough that every downstream
+/// `Duration::from_secs_f64` stays well inside its panic-free range.
+#[cfg(feature = "net")]
+const MAX_FETCH_SECONDS: f64 = 1e9;
+
+/// Validate the user-controlled float knobs at the Python entrypoint, with
+/// the GIL held. `timeout` / `connect_timeout` / `retry_backoff` all flow
+/// into `Duration::from_secs_f64` (via `build_agent` / `fetch_one`), which
+/// panics on negative, NaN, infinite, or absurdly large values -- and a
+/// panic in extension code must never be reachable from Python arguments.
+#[cfg(feature = "net")]
+fn validate_fetch_floats(timeout: f64, connect_timeout: f64, retry_backoff: f64) -> PyResult<()> {
+    for (name, v) in [
+        ("timeout", timeout),
+        ("connect_timeout", connect_timeout),
+        ("retry_backoff", retry_backoff),
+    ] {
+        if !v.is_finite() || v < 0.0 || v > MAX_FETCH_SECONDS {
+            return Err(PyValueError::new_err(format!(
+                "{} must be a finite number of seconds in 0..={:e} (got {})",
+                name, MAX_FETCH_SECONDS, v
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build the shared ureq Agent for a batch (Send + Sync; shared by
 /// reference across the scoped worker threads).
 #[cfg(feature = "net")]
@@ -3885,10 +3913,16 @@ fn fetch_one(agent: &ureq::Agent, url: &str, opts: &FetchOpts) -> Result<FetchOu
             Ok(out) => return Ok(out),
             Err(e) if attempt < opts.retries => {
                 // Exponential backoff, matching the requests Retry(backoff)
-                // curve pyFF used: backoff * 2^attempt seconds.
-                std::thread::sleep(std::time::Duration::from_secs_f64(
-                    opts.retry_backoff * (1u64 << attempt) as f64,
-                ));
+                // curve pyFF used: backoff * 2^attempt seconds. The exponent
+                // is clamped and the sleep capped so a large `retries` value
+                // can neither overflow the exponentiation nor reach
+                // Duration::from_secs_f64 with a non-finite/oversized value
+                // (which panics). retry_backoff itself is validated finite
+                // and non-negative at the Python entrypoint.
+                const MAX_BACKOFF_SECS: f64 = 300.0;
+                let factor = 2f64.powi(attempt.min(32) as i32);
+                let sleep_secs = (opts.retry_backoff * factor).min(MAX_BACKOFF_SECS);
+                std::thread::sleep(std::time::Duration::from_secs_f64(sleep_secs));
                 attempt += 1;
                 let _ = e;
             }
@@ -4004,6 +4038,7 @@ fn fetch_many(
     extra_headers: Option<std::collections::HashMap<String, String>>,
     max_body: u64,
 ) -> PyResult<Vec<Py<PyAny>>> {
+    validate_fetch_floats(timeout, connect_timeout, retry_backoff)?;
     let opts = FetchOpts {
         timeout,
         connect_timeout,
@@ -4072,6 +4107,7 @@ fn fetch_and_parse_many(
     forbid_dtd: Option<bool>,
     forbid_entities: Option<bool>,
 ) -> PyResult<Vec<Py<PyAny>>> {
+    validate_fetch_floats(timeout, connect_timeout, retry_backoff)?;
     let opts = FetchOpts {
         timeout,
         connect_timeout,

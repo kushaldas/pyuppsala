@@ -2126,6 +2126,24 @@ class TestFetchMany:
         assert pyuppsala.fetch_many([]) == []
         assert pyuppsala.fetch_and_parse_many([]) == []
 
+    def test_bad_float_knobs_raise_valueerror(self):
+        # Negative / NaN / inf / absurd timeout values would panic inside
+        # Duration::from_secs_f64; they must surface as ValueError instead,
+        # from both entrypoints.
+        import math
+
+        for kw in (
+            {"timeout": -1.0},
+            {"timeout": math.nan},
+            {"connect_timeout": math.inf},
+            {"retry_backoff": -0.5},
+            {"timeout": 1e30},
+        ):
+            with pytest.raises(ValueError):
+                pyuppsala.fetch_many(["http://127.0.0.1:1/x"], **kw)
+            with pytest.raises(ValueError):
+                pyuppsala.fetch_and_parse_many(["http://127.0.0.1:1/x"], **kw)
+
     def test_max_body_cap_is_per_item_error(self):
         # A body over max_body fails only that item; smaller items succeed.
         # (The default cap is 128 MiB; use a tiny override to exercise it.)
