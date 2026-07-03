@@ -704,6 +704,24 @@ def parse_bytes(
     """
     ...
 
+def parse_many(
+    items: list[str | bytes],
+    *,
+    max_threads: Optional[int] = None,
+    max_depth: Optional[int] = None,
+    max_entity_expansion: Optional[int] = None,
+    namespace_aware: Optional[bool] = None,
+    forbid_dtd: Optional[bool] = None,
+    forbid_entities: Optional[bool] = None,
+) -> list[Document | Exception]:
+    """Parse many XML documents in parallel across native threads.
+
+    Returns a list index-aligned with ``items``: each slot is either a
+    ``Document`` or an exception object (not raised) describing that item\'s
+    failure. The whole batch runs with the GIL released.
+    """
+    ...
+
 # Default resource-limit constants (uppsala 0.4.0 hardening)
 
 DEFAULT_MAX_DEPTH: int

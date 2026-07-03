@@ -419,7 +419,11 @@ impl Attribute {
 ///
 /// Nodes are lightweight handles - the actual data lives inside the Document.
 /// Do not use a Node after its parent Document has been garbage collected.
-#[pyclass(name = "Node", from_py_object)]
+// freelist: Node shells are the churn object of the binding (every
+// navigation step creates a short-lived (Arc, NodeId) pair); pooling frees
+// them without malloc/free round-trips. Node is final (not subclassable), so
+// the freelist always applies. Bench-gated -- see benchmarks/etree_bench.py.
+#[pyclass(name = "Node", from_py_object, freelist = 2048)]
 #[derive(Clone)]
 struct Node {
     doc: SharedDoc,
@@ -1124,31 +1128,38 @@ impl Node {
     }
 
     /// Serialize this node and its subtree to XML.
-    fn to_xml(&self) -> PyResult<String> {
-        let guard = self
-            .doc
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.node_to_xml(self.id))
+    fn to_xml(&self, py: Python<'_>) -> PyResult<String> {
+        // Subtree serialization is pure Rust producing a String; run it
+        // detached (GIL released), locking the doc inside the closure.
+        let shared = Arc::clone(&self.doc);
+        let id = self.id;
+        py.detach(|| {
+            let guard = shared.lock().map_err(|e| e.to_string())?;
+            Ok::<_, String>(guard.doc.node_to_xml(id))
+        })
+        .map_err(PyRuntimeError::new_err)
     }
 
     /// Serialize this node and its subtree to XML with formatting options.
     #[pyo3(signature = (indent=None, expand_empty_elements=false))]
     fn to_xml_with_options(
         &self,
+        py: Python<'_>,
         indent: Option<&str>,
         expand_empty_elements: bool,
     ) -> PyResult<String> {
-        let guard = self
-            .doc
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         // Node-level (fragment) serialization never emits a DOCTYPE, so
         // `include_doctype` is fixed to false here. DOCTYPE round-tripping is
         // only meaningful for whole-document serialization (see
         // `Document.to_xml_with_options`).
         let opts = make_write_options(indent, expand_empty_elements, false);
-        Ok(guard.doc.node_to_xml_with_options(self.id, &opts))
+        let shared = Arc::clone(&self.doc);
+        let id = self.id;
+        py.detach(|| {
+            let guard = shared.lock().map_err(|e| e.to_string())?;
+            Ok::<_, String>(guard.doc.node_to_xml_with_options(id, &opts))
+        })
+        .map_err(PyRuntimeError::new_err)
     }
 
     /// Find descendant elements by local tag name.
@@ -1265,8 +1276,8 @@ impl Node {
         }
     }
 
-    fn __str__(&self) -> PyResult<String> {
-        self.to_xml()
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        self.to_xml(py)
     }
 
     /// Number of child nodes.
@@ -1380,6 +1391,23 @@ fn registered_factory(py: Python<'_>, cell: &PyOnceLock<Py<PyAny>>) -> PyResult<
         .ok_or_else(|| PyRuntimeError::new_err("etree element helpers not registered"))
 }
 
+/// The etree `_Element` type object, registered once from `etree.py` right
+/// after the class definition. The native proxy cache (`DocHolderBase`)
+/// constructs `_Element` instances directly through this type object on a
+/// cache miss -- `type.__call__` runs only the PyO3-generated `tp_new`
+/// (`ElementBase::new`), since `_Element` defines no `__init__`, so no Python
+/// frame executes on the miss path and none at all on a hit.
+static ELEMENT_TYPE: PyOnceLock<Py<pyo3::types::PyType>> = PyOnceLock::new();
+
+/// Register the concrete etree `_Element` class used by the native proxy
+/// cache. Called once from `pyuppsala.etree` at import; later calls are
+/// ignored (first registration wins, matching `_register_element_helpers`).
+#[pyfunction]
+fn _register_element_type(py: Python<'_>, element_type: Py<pyo3::types::PyType>) -> PyResult<()> {
+    let _ = ELEMENT_TYPE.set(py, element_type);
+    Ok(())
+}
+
 /// Subclassable native base for `pyuppsala.etree._Element`.
 ///
 /// The etree layer's `_Element` is a live, identity-stable view over a node in
@@ -1467,8 +1495,32 @@ impl ElementBase {
     #[getter(tag)]
     fn get_tag(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let node_ref = self.node.bind(py).borrow();
-        if let Some(clark) = node_ref.clark_tag()? {
-            return Ok(clark.into_pyobject(py)?.into_any().unbind());
+        // Element fast path: return the interned Clark string from the
+        // holder's tag table -- the same Py<PyString> for every element with
+        // this qualified name, so repeated .tag reads allocate nothing and
+        // equal tags compare by pointer identity first.
+        {
+            let guard = node_ref
+                .doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            if let Some(e) = guard.doc.element(node_ref.id) {
+                if let Ok(holder) = self.holder.bind(py).cast::<DocHolderBase>() {
+                    let interned = holder.borrow_mut().intern_tag(
+                        py,
+                        e.name.namespace_uri.as_deref(),
+                        &e.name.local_name,
+                    )?;
+                    return Ok(interned.into_any());
+                }
+                // Unusual holder (not a _DocHolder): fall back to building
+                // the Clark string fresh, preserving old behaviour.
+                let clark = match e.name.namespace_uri.as_deref() {
+                    Some(ns) => format!("{{{}}}{}", ns, e.name.local_name),
+                    None => e.name.local_name.to_string(),
+                };
+                return Ok(clark.into_pyobject(py)?.into_any().unbind());
+            }
         }
         let kind = node_ref.kind()?;
         match kind.as_str() {
@@ -1555,6 +1607,399 @@ impl ElementBase {
             Ok(n) => Ok(Some(n)),
             Err(_) => Ok(None),
         }
+    }
+
+    /// Native backing of `_Element.iter`: a pre-order descendant iterator
+    /// (including self) that yields identity-stable proxies straight from the
+    /// holder's cache. `tag` follows lxml semantics (`None` = everything,
+    /// `"*"` = elements only, Clark string / bare name = matching elements);
+    /// QName normalisation stays in the Python wrapper.
+    fn _iter_proxies(
+        &self,
+        py: Python<'_>,
+        tag: Option<&str>,
+    ) -> PyResult<ProxyDescendantIterator> {
+        let holder: Py<DocHolderBase> = self
+            .holder
+            .bind(py)
+            .cast::<DocHolderBase>()?
+            .clone()
+            .unbind();
+        let node = self.node.bind(py).borrow();
+        Ok(ProxyDescendantIterator {
+            holder,
+            doc: Arc::clone(&node.doc),
+            stack: vec![node.id],
+            filter: DescFilter::parse(tag),
+        })
+    }
+
+    /// The parent element proxy, or None at the tree root -- etree
+    /// `getparent()`, fully native (one lock for the parent lookup, then the
+    /// proxy cache).
+    fn getparent(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        let (holder, parent_id) = {
+            let cell = slf.borrow();
+            let node = cell.node.bind(py).borrow();
+            let guard = node
+                .doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let pid = match guard.doc.parent(node.id) {
+                // The document node is not an element; its children are roots.
+                Some(p) if !matches!(guard.doc.node_kind(p), Some(NodeKind::Document)) => Some(p),
+                _ => None,
+            };
+            drop(guard);
+            (cell.holder.clone_ref(py), pid)
+        };
+        match parent_id {
+            Some(pid) => {
+                let holder = holder.bind(py).cast::<DocHolderBase>()?.clone();
+                Ok(Some(DocHolderBase::proxy_for_id(
+                    &holder,
+                    pid.index(),
+                    None,
+                )?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The element's content children (elements, comments, PIs -- the ones
+    /// lxml exposes as indexable children) as a list of cached proxies; backs
+    /// `_Element.__iter__` / `__getitem__`. Collects the ids under one lock,
+    /// then materialises proxies through the cache.
+    fn _children_proxies(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let (holder, ids) = {
+            let cell = slf.borrow();
+            let node = cell.node.bind(py).borrow();
+            let guard = node
+                .doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let mut ids = Vec::new();
+            let mut child = guard.doc.first_child(node.id);
+            while let Some(cid) = child {
+                match guard.doc.node_kind(cid) {
+                    Some(NodeKind::Element(_))
+                    | Some(NodeKind::Comment(_))
+                    | Some(NodeKind::ProcessingInstruction(_)) => ids.push(cid.index()),
+                    _ => {}
+                }
+                child = guard.doc.next_sibling(cid);
+            }
+            drop(guard);
+            (cell.holder.clone_ref(py), ids)
+        };
+        let holder = holder.bind(py).cast::<DocHolderBase>()?.clone();
+        ids.into_iter()
+            .map(|nid| DocHolderBase::proxy_for_id(&holder, nid, None))
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DocHolderBase -- native per-document identity proxy cache
+// ---------------------------------------------------------------------------
+
+/// Subclassable native base for `pyuppsala.etree._DocHolder`.
+///
+/// Owns one native `Document` plus the identity-stable proxy cache mapping
+/// `node_id -> weakref(_Element)`, so repeated lookups of the same underlying
+/// node return the *same* Python wrapper (`root[0] is root[0]`, matching
+/// lxml). Runs the entire hit path (dict lookup + weakref upgrade) and the
+/// miss path (construct `_Element` via the registered type object, insert a
+/// callback-free weakref, opportunistic dead-entry sweep) in Rust; the pure
+/// Python version of this cache was ~0.5 s of the pyFF full-sign profile and
+/// its per-append dead sweep was quadratic during aggregation.
+///
+/// The Python `_DocHolder` subclass keeps only the cold, Python-flavoured
+/// state (`_ns_counter`, `base_url`, `new_prefix`).
+#[pyclass(subclass, weakref, name = "_DocHolderBase")]
+struct DocHolderBase {
+    /// The owned native document (a `Document` pyclass instance).
+    doc: Py<Document>,
+    /// node_id -> callback-free weakref to the live `_Element` wrapper.
+    /// Callback-free deliberately: pyFF-style walks create a proxy per node
+    /// and drop it immediately, so a death callback per proxy would dominate;
+    /// dead entries are reclaimed by the bounded sweep below instead.
+    proxies: std::collections::HashMap<usize, Py<pyo3::types::PyWeakrefReference>>,
+    /// Cache size at which the next `proxy()` sweeps dead weakrefs; re-armed
+    /// after each sweep to `max(256, 2 * live)` so transient walks hold a
+    /// bounded number of tombstones and total sweep work stays O(nodes).
+    sweep_at: usize,
+    /// Interned Clark-notation tag strings, keyed by a hash of
+    /// `(namespace_uri, local_name)` with a bucket vec for collisions
+    /// (verified by piecewise comparison -- zero allocation on a hit). Every
+    /// element after the first with the same qualified name returns the same
+    /// `Py<PyString>`, so `.tag` reads stop allocating and equal tags become
+    /// pointer-identical (hitting CPython's str identity fast path in `==`).
+    /// A SAML tree has a few dozen unique QNames across tens of thousands of
+    /// nodes, so the table stays tiny; renames simply hash to a different
+    /// key, so there is nothing to invalidate.
+    tag_table: std::collections::HashMap<u64, Vec<Py<pyo3::types::PyString>>>,
+}
+
+/// True if `s` is exactly the Clark notation `{ns}local` (or bare `local`
+/// when `ns` is None) -- the zero-allocation verify for tag-table hits.
+fn clark_eq(s: &str, ns: Option<&str>, local: &str) -> bool {
+    match ns {
+        Some(ns) => {
+            s.len() == ns.len() + local.len() + 2
+                && s.as_bytes()[0] == b'{'
+                && &s[1..1 + ns.len()] == ns
+                && s.as_bytes()[1 + ns.len()] == b'}'
+                && &s[2 + ns.len()..] == local
+        }
+        None => s == local,
+    }
+}
+
+impl DocHolderBase {
+    /// Return the interned `Py<PyString>` for the Clark tag of
+    /// `(namespace_uri, local_name)`, formatting and caching it on first
+    /// sight. Hits allocate nothing and return the same object every time.
+    fn intern_tag(
+        &mut self,
+        py: Python<'_>,
+        ns: Option<&str>,
+        local: &str,
+    ) -> PyResult<Py<pyo3::types::PyString>> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ns.hash(&mut h);
+        local.hash(&mut h);
+        let key = h.finish();
+        let bucket = self.tag_table.entry(key).or_default();
+        for s in bucket.iter() {
+            // to_str is fine here: interned tags are always valid UTF-8 we
+            // created ourselves, and reading a PyString runs no Python code.
+            if clark_eq(s.bind(py).to_str()?, ns, local) {
+                return Ok(s.clone_ref(py));
+            }
+        }
+        let clark = match ns {
+            Some(ns) => format!("{{{}}}{}", ns, local),
+            None => local.to_string(),
+        };
+        let obj = pyo3::types::PyString::new(py, &clark).unbind();
+        bucket.push(obj.clone_ref(py));
+        Ok(obj)
+    }
+
+    /// Return the identity-stable `_Element` for node id `nid`, creating and
+    /// caching it if no live wrapper exists. `node` supplies an existing
+    /// native `Node` handle to reuse on the miss path (avoids re-creating
+    /// one); pass `None` to build the handle only when actually needed.
+    ///
+    /// Structured in three phases so the `RefCell` borrow is never held
+    /// across a call into Python: constructing `_Element` can trigger GC,
+    /// and a finalizer may re-enter `proxy` on this same holder, which would
+    /// panic on an overlapping borrow.
+    fn proxy_for_id(
+        slf: &Bound<'_, DocHolderBase>,
+        nid: usize,
+        node: Option<Py<Node>>,
+    ) -> PyResult<Py<PyAny>> {
+        use pyo3::types::PyWeakrefMethods;
+        let py = slf.py();
+        // Phase 1: cache hit under a short borrow. Upgrading a weakref reads
+        // a pointer and increfs -- it runs no Python code, so holding the
+        // borrow here is safe. On a hit the cached wrapper is returned as-is:
+        // its stored `Node` is just `(Arc, node_id)`, both invariant for the
+        // life of the document, so no refresh is needed.
+        {
+            let cell = slf.borrow();
+            if let Some(wref) = cell.proxies.get(&nid) {
+                if let Some(el) = wref.bind(py).upgrade() {
+                    return Ok(el.unbind());
+                }
+                // Dead tombstone: fall through and recreate (the insert below
+                // overwrites it).
+            }
+        }
+        // Phase 2: miss -- construct outside any borrow.
+        let node_obj = match node {
+            Some(n) => n,
+            None => {
+                let shared = {
+                    let cell = slf.borrow();
+                    let doc = cell.doc.bind(py).borrow();
+                    Arc::clone(&doc.inner)
+                };
+                Py::new(
+                    py,
+                    Node {
+                        doc: shared,
+                        id: NodeId::new(nid),
+                    },
+                )?
+            }
+        };
+        let eltype = ELEMENT_TYPE
+            .get(py)
+            .ok_or_else(|| PyRuntimeError::new_err("etree element type not registered"))?;
+        // `type.__call__` -> PyO3 `tp_new` -> `ElementBase::new`; `_Element`
+        // defines no `__init__`, so no Python frame runs here.
+        let el = eltype.bind(py).call1((slf, node_obj, nid))?;
+        let wref = pyo3::types::PyWeakrefReference::new(&el)?;
+        // Phase 3: insert + opportunistic sweep under a fresh borrow.
+        {
+            let mut cell = slf.borrow_mut();
+            cell.proxies.insert(nid, wref.unbind());
+            if cell.proxies.len() >= cell.sweep_at {
+                cell.proxies.retain(|_, r| r.bind(py).upgrade().is_some());
+                cell.sweep_at = std::cmp::max(256, cell.proxies.len() * 2);
+            }
+        }
+        Ok(el.unbind())
+    }
+}
+
+#[pymethods]
+impl DocHolderBase {
+    #[new]
+    fn new(doc: Py<Document>) -> Self {
+        DocHolderBase {
+            doc,
+            proxies: std::collections::HashMap::new(),
+            sweep_at: 256,
+            tag_table: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The owned native `Document`.
+    #[getter]
+    fn doc(&self, py: Python<'_>) -> Py<Document> {
+        self.doc.clone_ref(py)
+    }
+
+    /// Return the identity-stable `_Element` wrapper for `node` (or None for
+    /// None), creating and caching it on first access. See the class docs;
+    /// this is the native port of the former Python `_DocHolder.proxy`.
+    fn proxy(slf: &Bound<'_, Self>, node: Option<Py<Node>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let Some(node) = node else {
+            return Ok(py.None());
+        };
+        let nid = node.bind(py).borrow().id.index();
+        DocHolderBase::proxy_for_id(slf, nid, Some(node))
+    }
+
+    /// Move any live proxies from the source subtree rooted at `snode` (in
+    /// this holder's document) onto the cloned subtree rooted at `dnode` (in
+    /// `dst`'s document), preserving Python identity across cross-document
+    /// moves -- the native port of the former `_repoint_subtree`.
+    ///
+    /// Runs in two phases: (A) collect the `(source id, clone id)` pairs by a
+    /// lock-step arena walk under both document locks (pure reads, no Python
+    /// allocation while locked, so GC cannot re-enter and try to re-lock);
+    /// (B) with the GIL only, re-point each live wrapper and move its cache
+    /// entry. The upfront dead sweep keeps a holder whose proxies are all
+    /// dead on the O(1) fast path instead of degrading the walk to
+    /// O(proxies * subtree) (the historical quadratic-append bug).
+    fn repoint_subtree(
+        slf: &Bound<'_, Self>,
+        dst: &Bound<'_, DocHolderBase>,
+        snode: PyRef<'_, Node>,
+        dnode: PyRef<'_, Node>,
+    ) -> PyResult<()> {
+        use pyo3::types::PyWeakrefMethods;
+        let py = slf.py();
+        if slf.is(dst) {
+            // Same holder on both sides: nothing to move between caches.
+            return Ok(());
+        }
+        // Upfront dead sweep + emptiness fast path.
+        {
+            let mut cell = slf.borrow_mut();
+            cell.proxies.retain(|_, r| r.bind(py).upgrade().is_some());
+            cell.sweep_at = std::cmp::max(256, cell.proxies.len() * 2);
+            if cell.proxies.is_empty() {
+                return Ok(());
+            }
+        }
+        // Phase A: lock-step pair collection. Both mutexes are taken in the
+        // same fixed global order (by Arc address) as `Document::import_subtree`
+        // so the two-document lock discipline stays unique crate-wide.
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        {
+            let src_shared = Arc::clone(&snode.doc);
+            let dst_shared = Arc::clone(&dnode.doc);
+            let lock_err = |e: std::sync::PoisonError<std::sync::MutexGuard<'_, DocWithInput>>| {
+                PyRuntimeError::new_err(e.to_string())
+            };
+            let (src_guard, dst_guard) = if Arc::ptr_eq(&src_shared, &dst_shared) {
+                // Clones within one document share a single lock.
+                (src_shared.lock().map_err(lock_err)?, None)
+            } else if Arc::as_ptr(&dst_shared) < Arc::as_ptr(&src_shared) {
+                let d = dst_shared.lock().map_err(lock_err)?;
+                let s = src_shared.lock().map_err(lock_err)?;
+                (s, Some(d))
+            } else {
+                let s = src_shared.lock().map_err(lock_err)?;
+                let d = dst_shared.lock().map_err(lock_err)?;
+                (s, Some(d))
+            };
+            let sdoc = &src_guard.doc;
+            let ddoc = match &dst_guard {
+                Some(g) => &g.doc,
+                None => sdoc,
+            };
+            // Children are cloned in document order, so a positional lock-step
+            // walk pairs source and clone nodes exactly (same invariant the
+            // Python `zip(snode.children, dnode.children)` walk relied on).
+            let mut stack = vec![(snode.id, dnode.id)];
+            while let Some((s, d)) = stack.pop() {
+                pairs.push((s.index(), d.index()));
+                let mut sc = sdoc.first_child(s);
+                let mut dc = ddoc.first_child(d);
+                while let (Some(scn), Some(dcn)) = (sc, dc) {
+                    stack.push((scn, dcn));
+                    sc = sdoc.next_sibling(scn);
+                    dc = ddoc.next_sibling(dcn);
+                }
+            }
+        }
+        // Phase B: cache surgery, GIL only (no document locks held).
+        let dst_shared = Arc::clone(&dnode.doc);
+        let dst_obj: Py<PyAny> = dst.clone().unbind().into_any();
+        for (sid, did) in pairs {
+            let wref = slf.borrow_mut().proxies.remove(&sid);
+            let Some(wref) = wref else { continue };
+            let Some(el) = wref.bind(py).upgrade() else {
+                continue; // dead tombstone: reclaimed by the remove above
+            };
+            let el_base = el.cast::<ElementBase>()?;
+            let new_node = Py::new(
+                py,
+                Node {
+                    doc: Arc::clone(&dst_shared),
+                    id: NodeId::new(did),
+                },
+            )?;
+            {
+                let mut b = el_base.borrow_mut();
+                b.holder = dst_obj.clone_ref(py);
+                b.node = new_node;
+                b.node_id = did;
+            }
+            // The weakref still points at `el`; reuse it under the new key.
+            dst.borrow_mut().proxies.insert(did, wref);
+            if slf.borrow().proxies.is_empty() {
+                // Every live source proxy has been moved; skip the rest of
+                // the (possibly large) subtree.
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Number of cache entries (live + not-yet-swept tombstones); for tests.
+    fn _proxy_cache_len(&self) -> usize {
+        self.proxies.len()
     }
 }
 
@@ -1652,6 +2097,49 @@ struct DescendantIterator {
     filter: DescFilter,
 }
 
+/// Advance a pre-order descendant walk to the next node matching `filter`,
+/// returning its id, or `None` when the stack is exhausted. Shared by
+/// `DescendantIterator` (yields `Node`s) and `ProxyDescendantIterator`
+/// (yields cached `_Element` proxies). Children are pushed in reverse so
+/// they pop in document order, giving the pre-order sequence lxml produces.
+fn advance_desc_walk(
+    doc: &UDocument<'static>,
+    stack: &mut Vec<NodeId>,
+    filter: &DescFilter,
+) -> Option<NodeId> {
+    while let Some(id) = stack.pop() {
+        // Push this node's children in reverse document order so the first
+        // child is popped next (pre-order). Done before the match check so
+        // we descend into matching nodes too.
+        let start = stack.len();
+        let mut child = doc.first_child(id);
+        while let Some(cid) = child {
+            stack.push(cid);
+            child = doc.next_sibling(cid);
+        }
+        stack[start..].reverse();
+
+        let matched = match filter {
+            DescFilter::All => matches!(
+                doc.node_kind(id),
+                Some(NodeKind::Element(_))
+                    | Some(NodeKind::Comment(_))
+                    | Some(NodeKind::ProcessingInstruction(_))
+            ),
+            DescFilter::Elements => {
+                matches!(doc.node_kind(id), Some(NodeKind::Element(_)))
+            }
+            DescFilter::Named { ns, local } => {
+                matches!(doc.element(id), Some(e) if e.name.matches(ns.as_deref(), local))
+            }
+        };
+        if matched {
+            return Some(id);
+        }
+    }
+    None
+}
+
 #[pymethods]
 impl DescendantIterator {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1663,40 +2151,71 @@ impl DescendantIterator {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        while let Some(id) = self.stack.pop() {
-            // Push this node's children in reverse document order so the first
-            // child is popped next (pre-order). Done before the match check so
-            // we descend into matching nodes too.
-            let start = self.stack.len();
-            let mut child = guard.doc.first_child(id);
-            while let Some(cid) = child {
-                self.stack.push(cid);
-                child = guard.doc.next_sibling(cid);
-            }
-            self.stack[start..].reverse();
+        Ok(
+            advance_desc_walk(&guard.doc, &mut self.stack, &self.filter).map(|id| Node {
+                doc: Arc::clone(&self.doc),
+                id,
+            }),
+        )
+    }
+}
 
-            let matched = match &self.filter {
-                DescFilter::All => matches!(
-                    guard.doc.node_kind(id),
-                    Some(NodeKind::Element(_))
-                        | Some(NodeKind::Comment(_))
-                        | Some(NodeKind::ProcessingInstruction(_))
-                ),
-                DescFilter::Elements => {
-                    matches!(guard.doc.node_kind(id), Some(NodeKind::Element(_)))
-                }
-                DescFilter::Named { ns, local } => {
-                    matches!(guard.doc.element(id), Some(e) if e.name.matches(ns.as_deref(), local))
-                }
-            };
-            if matched {
-                return Ok(Some(Node {
-                    doc: Arc::clone(&self.doc),
-                    id,
-                }));
+// ---------------------------------------------------------------------------
+// ProxyDescendantIterator
+// ---------------------------------------------------------------------------
+
+/// A lazy pre-order descendant iterator that yields identity-stable etree
+/// `_Element` proxies directly (the backing of `_Element.iter`).
+///
+/// Same native walk as `DescendantIterator`, but each `__next__` finishes in
+/// the holder's proxy cache instead of materialising a throwaway `Node`
+/// pyobject that Python then re-wraps: a cache hit allocates nothing at all,
+/// and a miss builds the `Node` + `_Element` entirely in Rust. This removes
+/// the per-match Python generator frame + `proxy()` call that made
+/// `etree.iter` ~0.5 s of the pyFF full-sign profile.
+#[pyclass]
+struct ProxyDescendantIterator {
+    holder: Py<DocHolderBase>,
+    doc: SharedDoc,
+    stack: Vec<NodeId>,
+    filter: DescFilter,
+}
+
+#[pymethods]
+impl ProxyDescendantIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        // Find the next matching node id under the document lock, releasing
+        // both the lock and the iterator borrow before touching the proxy
+        // cache (proxy construction may run Python code via `tp_new`).
+        let (holder, next_id) = {
+            let mut cell = slf.borrow_mut();
+            // Destructure once so the lock guard, the stack and the filter
+            // borrow disjoint fields of the same `PyRefMut`.
+            let ProxyDescendantIterator {
+                holder,
+                doc,
+                stack,
+                filter,
+            } = &mut *cell;
+            let guard = doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let id = advance_desc_walk(&guard.doc, stack, filter);
+            drop(guard);
+            (holder.clone_ref(py), id)
+        };
+        match next_id {
+            Some(id) => {
+                let el = DocHolderBase::proxy_for_id(holder.bind(py), id.index(), None)?;
+                Ok(Some(el))
             }
+            None => Ok(None),
         }
-        Ok(None)
     }
 }
 
@@ -1739,6 +2258,7 @@ impl Document {
     #[new]
     #[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
     fn new(
+        py: Python<'_>,
         xml: &str,
         max_depth: Option<u32>,
         max_entity_expansion: Option<usize>,
@@ -1746,6 +2266,9 @@ impl Document {
         forbid_dtd: Option<bool>,
         forbid_entities: Option<bool>,
     ) -> PyResult<Self> {
+        // Copy the input to an owned String while attached to Python, so the
+        // parse below can run detached (GIL released): only owned data may
+        // cross into the detach closure.
         let input = xml.to_string();
         let parser = build_parser(
             max_depth,
@@ -1754,7 +2277,12 @@ impl Document {
             forbid_dtd,
             forbid_entities,
         );
-        let doc = parser.parse(xml).map_err(xml_error_to_pyerr)?.into_static();
+        // Parsing is pure Rust over `input` and touches no Python objects, so
+        // release the GIL for its duration: other Python threads keep running,
+        // and N threads parsing concurrently genuinely use N cores. The PyErr
+        // is only built after re-attaching.
+        let parsed = py.detach(|| parser.parse(&input).map(|d| d.into_static()));
+        let doc = parsed.map_err(xml_error_to_pyerr)?;
         Ok(Document {
             inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
         })
@@ -1774,6 +2302,7 @@ impl Document {
     #[staticmethod]
     #[pyo3(signature = (data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
     fn from_bytes(
+        py: Python<'_>,
         data: &[u8],
         max_depth: Option<u32>,
         max_entity_expansion: Option<usize>,
@@ -1781,6 +2310,7 @@ impl Document {
         forbid_dtd: Option<bool>,
         forbid_entities: Option<bool>,
     ) -> PyResult<Document> {
+        // Decode while attached (borrows the Python buffer); parse detached.
         let input = decode_xml_bytes(data)?;
         let parser = build_parser(
             max_depth,
@@ -1789,10 +2319,8 @@ impl Document {
             forbid_dtd,
             forbid_entities,
         );
-        let doc = parser
-            .parse(&input)
-            .map_err(xml_error_to_pyerr)?
-            .into_static();
+        let parsed = py.detach(|| parser.parse(&input).map(|d| d.into_static()));
+        let doc = parsed.map_err(xml_error_to_pyerr)?;
         Ok(Document {
             inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
         })
@@ -2154,12 +2682,16 @@ impl Document {
     // -- Serialization -------------------------------------------------------
 
     /// Serialize the document to a compact XML string.
-    fn to_xml(&self) -> PyResult<String> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.to_xml())
+    fn to_xml(&self, py: Python<'_>) -> PyResult<String> {
+        // Whole-document serialization is pure Rust producing a String, so it
+        // runs detached; the doc mutex is taken and released inside the
+        // closure (lock order: GIL -> doc mutex, never the reverse).
+        let shared = Arc::clone(&self.inner);
+        py.detach(|| {
+            let guard = shared.lock().map_err(|e| e.to_string())?;
+            Ok::<_, String>(guard.doc.to_xml())
+        })
+        .map_err(PyRuntimeError::new_err)
     }
 
     /// Serialize the document to an XML string with formatting options.
@@ -2174,31 +2706,35 @@ impl Document {
     #[pyo3(signature = (indent=None, expand_empty_elements=false, include_doctype=false))]
     fn to_xml_with_options(
         &self,
+        py: Python<'_>,
         indent: Option<&str>,
         expand_empty_elements: bool,
         include_doctype: bool,
     ) -> PyResult<String> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let opts = make_write_options(indent, expand_empty_elements, include_doctype);
-        Ok(guard.doc.to_xml_with_options(&opts))
+        let shared = Arc::clone(&self.inner);
+        py.detach(|| {
+            let guard = shared.lock().map_err(|e| e.to_string())?;
+            Ok::<_, String>(guard.doc.to_xml_with_options(&opts))
+        })
+        .map_err(PyRuntimeError::new_err)
     }
 
     /// Write the document to a file.
-    fn write_to_file(&self, path: &str) -> PyResult<()> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mut file = std::fs::File::create(path)
-            .map_err(|e| PyRuntimeError::new_err(format!("Cannot create file: {}", e)))?;
-        guard
-            .doc
-            .write_to(&mut file)
-            .map_err(|e| PyRuntimeError::new_err(format!("Write error: {}", e)))?;
-        Ok(())
+    fn write_to_file(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        // Serialization + file I/O both benefit from a detached GIL.
+        let shared = Arc::clone(&self.inner);
+        let path = path.to_string();
+        py.detach(|| {
+            let guard = shared.lock().map_err(|e| e.to_string())?;
+            let mut file =
+                std::fs::File::create(&path).map_err(|e| format!("Cannot create file: {}", e))?;
+            guard
+                .doc
+                .write_to(&mut file)
+                .map_err(|e| format!("Write error: {}", e))
+        })
+        .map_err(PyRuntimeError::new_err)
     }
 
     // -- XPath ---------------------------------------------------------------
@@ -2215,8 +2751,8 @@ impl Document {
 
     // -- Dunder methods -------------------------------------------------------
 
-    fn __str__(&self) -> PyResult<String> {
-        self.to_xml()
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        self.to_xml(py)
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -2418,25 +2954,32 @@ struct XsdValidator {
 impl XsdValidator {
     /// Create a validator from an XSD schema string.
     #[new]
-    fn new(schema_xml: &str) -> PyResult<Self> {
-        let schema_doc = uppsala::parse(schema_xml)
-            .map_err(xml_error_to_pyerr)?
-            .into_static();
-        let validator = UXsdValidator::from_schema(&schema_doc).map_err(xml_error_to_pyerr)?;
-        Ok(XsdValidator { inner: validator })
+    fn new(py: Python<'_>, schema_xml: &str) -> PyResult<Self> {
+        // Schema parse + compile are pure Rust; run them with the GIL
+        // released (owned copy of the input crosses into the closure).
+        let xml = schema_xml.to_string();
+        let built = py.detach(|| {
+            let schema_doc = uppsala::parse(&xml)?.into_static();
+            UXsdValidator::from_schema(&schema_doc)
+        });
+        Ok(XsdValidator {
+            inner: built.map_err(xml_error_to_pyerr)?,
+        })
     }
 
     /// Create a validator from an XSD schema string, resolving external
     /// includes/imports relative to the given base path.
     #[staticmethod]
-    fn from_file(schema_xml: &str, base_path: &str) -> PyResult<XsdValidator> {
-        let schema_doc = uppsala::parse(schema_xml)
-            .map_err(xml_error_to_pyerr)?
-            .into_static();
-        let path = std::path::Path::new(base_path);
-        let validator = UXsdValidator::from_schema_with_base_path(&schema_doc, Some(path))
-            .map_err(xml_error_to_pyerr)?;
-        Ok(XsdValidator { inner: validator })
+    fn from_file(py: Python<'_>, schema_xml: &str, base_path: &str) -> PyResult<XsdValidator> {
+        let xml = schema_xml.to_string();
+        let base = std::path::PathBuf::from(base_path);
+        let built = py.detach(|| {
+            let schema_doc = uppsala::parse(&xml)?.into_static();
+            UXsdValidator::from_schema_with_base_path(&schema_doc, Some(base.as_path()))
+        });
+        Ok(XsdValidator {
+            inner: built.map_err(xml_error_to_pyerr)?,
+        })
     }
 
     /// Configure whether QName/NOTATION length facets are enforced.
@@ -2458,12 +3001,19 @@ impl XsdValidator {
     /// Validate an XML document against this schema.
     ///
     /// Returns a list of ValidationError objects. An empty list means valid.
-    fn validate(&self, doc: &Document) -> PyResult<Vec<ValidationErrorPy>> {
-        let inner_doc = doc
-            .inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let errors = self.inner.validate(&inner_doc.doc);
+    fn validate(&self, py: Python<'_>, doc: &Document) -> PyResult<Vec<ValidationErrorPy>> {
+        // Validation walks the whole document in pure Rust: release the GIL
+        // and take the document lock inside the detached closure (lock order
+        // is always GIL -> doc mutex; the closure releases the mutex before
+        // re-attaching, so a GIL-holding thread waiting on it cannot deadlock).
+        let shared = Arc::clone(&doc.inner);
+        let validator = &self.inner;
+        let errors = py
+            .detach(|| {
+                let inner_doc = shared.lock().map_err(|e| e.to_string())?;
+                Ok::<_, String>(validator.validate(&inner_doc.doc))
+            })
+            .map_err(PyRuntimeError::new_err)?;
         Ok(errors
             .into_iter()
             .map(|e| ValidationErrorPy {
@@ -2477,11 +3027,16 @@ impl XsdValidator {
     /// Validate an XML string against this schema. Convenience method.
     ///
     /// Returns a list of ValidationError objects. An empty list means valid.
-    fn validate_str(&self, xml: &str) -> PyResult<Vec<ValidationErrorPy>> {
-        let doc = uppsala::parse(xml)
-            .map_err(xml_error_to_pyerr)?
-            .into_static();
-        let errors = self.inner.validate(&doc);
+    fn validate_str(&self, py: Python<'_>, xml: &str) -> PyResult<Vec<ValidationErrorPy>> {
+        // Parse + validate detached (see `validate`); owned input only.
+        let input = xml.to_string();
+        let validator = &self.inner;
+        let errors = py
+            .detach(|| {
+                let doc = uppsala::parse(&input)?.into_static();
+                Ok::<_, uppsala::XmlError>(validator.validate(&doc))
+            })
+            .map_err(xml_error_to_pyerr)?;
         Ok(errors
             .into_iter()
             .map(|e| ValidationErrorPy {
@@ -2493,21 +3048,24 @@ impl XsdValidator {
     }
 
     /// Check if an XML document is valid. Returns True/False.
-    fn is_valid(&self, doc: &Document) -> PyResult<bool> {
-        let inner_doc = doc
-            .inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(self.inner.validate(&inner_doc.doc).is_empty())
+    fn is_valid(&self, py: Python<'_>, doc: &Document) -> PyResult<bool> {
+        let shared = Arc::clone(&doc.inner);
+        let validator = &self.inner;
+        py.detach(|| {
+            let inner_doc = shared.lock().map_err(|e| e.to_string())?;
+            Ok::<_, String>(validator.validate(&inner_doc.doc).is_empty())
+        })
+        .map_err(PyRuntimeError::new_err)
     }
 
     /// Check if an XML string is valid. Returns True/False.
-    fn is_valid_str(&self, xml: &str) -> PyResult<bool> {
-        let doc = match uppsala::parse(xml) {
-            Ok(d) => d.into_static(),
-            Err(_) => return Ok(false),
-        };
-        Ok(self.inner.validate(&doc).is_empty())
+    fn is_valid_str(&self, py: Python<'_>, xml: &str) -> PyResult<bool> {
+        let input = xml.to_string();
+        let validator = &self.inner;
+        Ok(py.detach(|| match uppsala::parse(&input) {
+            Ok(d) => validator.validate(&d.into_static()).is_empty(),
+            Err(_) => false,
+        }))
     }
 
     fn __repr__(&self) -> String {
@@ -2738,12 +3296,20 @@ impl Xslt {
     /// ``max_depth`` overrides the template-activation recursion cap.
     #[new]
     #[pyo3(signature = (stylesheet_xml, *, exslt=true, max_depth=None))]
-    fn new(stylesheet_xml: &str, exslt: bool, max_depth: Option<u32>) -> PyResult<Self> {
-        let style_doc = UParser::new()
-            .parse(stylesheet_xml)
-            .map_err(xml_error_to_pyerr)?;
-        let mut sheet =
-            uppsala::xslt::Stylesheet::compile(&style_doc).map_err(xml_error_to_pyerr)?;
+    fn new(
+        py: Python<'_>,
+        stylesheet_xml: &str,
+        exslt: bool,
+        max_depth: Option<u32>,
+    ) -> PyResult<Self> {
+        // Owned copy while attached; stylesheet parse + compile are pure Rust,
+        // so they run with the GIL released (see Document::new for the rule).
+        let xml = stylesheet_xml.to_string();
+        let compiled = py.detach(|| {
+            let style_doc = UParser::new().parse(&xml)?;
+            uppsala::xslt::Stylesheet::compile(&style_doc)
+        });
+        let mut sheet = compiled.map_err(xml_error_to_pyerr)?;
         if let Some(d) = max_depth {
             sheet = sheet.set_max_depth(d);
         }
@@ -2753,12 +3319,17 @@ impl Xslt {
 
     /// Apply the stylesheet to a source XML string, returning the serialized
     /// result. The source is parsed and prepared for XPath internally.
-    fn transform(&self, source_xml: &str) -> PyResult<String> {
-        let mut source = UParser::new()
-            .parse(source_xml)
-            .map_err(xml_error_to_pyerr)?;
-        source.prepare_xpath();
-        self.inner.transform(&source).map_err(xml_error_to_pyerr)
+    fn transform(&self, py: Python<'_>, source_xml: &str) -> PyResult<String> {
+        // Parse + transform are pure Rust over owned data; release the GIL so
+        // concurrent transforms (e.g. pyFF's per-entity tidy.xsl) parallelize.
+        let xml = source_xml.to_string();
+        let sheet = &self.inner;
+        py.detach(|| {
+            let mut source = UParser::new().parse(&xml)?;
+            source.prepare_xpath();
+            sheet.transform(&source)
+        })
+        .map_err(xml_error_to_pyerr)
     }
 }
 
@@ -2773,6 +3344,7 @@ impl Xslt {
 #[pyfunction]
 #[pyo3(signature = (xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
 fn parse(
+    py: Python<'_>,
     xml: &str,
     max_depth: Option<u32>,
     max_entity_expansion: Option<usize>,
@@ -2781,6 +3353,7 @@ fn parse(
     forbid_entities: Option<bool>,
 ) -> PyResult<Document> {
     Document::new(
+        py,
         xml,
         max_depth,
         max_entity_expansion,
@@ -2797,6 +3370,7 @@ fn parse(
 #[pyfunction]
 #[pyo3(signature = (data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
 fn parse_bytes(
+    py: Python<'_>,
     data: &[u8],
     max_depth: Option<u32>,
     max_entity_expansion: Option<usize>,
@@ -2805,6 +3379,7 @@ fn parse_bytes(
     forbid_entities: Option<bool>,
 ) -> PyResult<Document> {
     Document::from_bytes(
+        py,
         data,
         max_depth,
         max_entity_expansion,
@@ -2812,6 +3387,497 @@ fn parse_bytes(
         forbid_dtd,
         forbid_entities,
     )
+}
+
+/// One input to `parse_many`: text or bytes, extracted to owned data with the
+/// GIL held so the worker threads never touch Python buffers.
+#[derive(FromPyObject)]
+enum BatchInput {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+/// Parse many XML documents in parallel across native threads.
+///
+/// Takes a list of `str` / `bytes` items and returns a list of the same
+/// length, index-aligned with the input, where each slot is either a
+/// `Document` or an *exception object* (not raised) describing that item's
+/// parse failure -- a batch never fails wholesale; callers check
+/// `isinstance(r, Exception)` per item.
+///
+/// The whole batch runs under one GIL release: `max_threads` worker threads
+/// (default: available CPU parallelism, capped at the item count) pull items
+/// off a shared index and parse them concurrently, so N threads genuinely use
+/// N cores. Bytes items go through the same encoding auto-detection as
+/// `parse_bytes`. The remaining keyword arguments match `parse` and apply to
+/// every item.
+///
+/// .. warning::
+///    Do not source the resource-limit kwargs from untrusted input.
+///    See :class:`Document` for details.
+#[pyfunction]
+#[pyo3(signature = (items, *, max_threads=None, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
+#[allow(clippy::too_many_arguments)]
+fn parse_many(
+    py: Python<'_>,
+    items: Vec<BatchInput>,
+    max_threads: Option<usize>,
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
+) -> PyResult<Vec<Py<PyAny>>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let n_items = items.len();
+    if n_items == 0 {
+        return Ok(Vec::new());
+    }
+    let n_threads = max_threads
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+        .min(n_items);
+
+    // The entire fan-out runs detached: workers are pure Rust over the owned
+    // inputs. Results land in per-item slots (a mutex keeps the bookkeeping
+    // trivially safe; one uncontended lock per item is noise next to a parse).
+    // Workers may build PyErr values: `PyErr::new_err(String)` is lazy in
+    // PyO3 -- the Python exception object is only materialised on demand,
+    // with the GIL, in the wrap-up loop below.
+    let results: Vec<std::sync::Mutex<Option<Result<DocWithInput, PyErr>>>> =
+        (0..n_items).map(|_| std::sync::Mutex::new(None)).collect();
+    py.detach(|| {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| {
+                    // Each worker owns its parser; work-stealing via a shared
+                    // index handles skewed input sizes (one big aggregate among
+                    // many small fragments) better than static chunking.
+                    let parser = build_parser(
+                        max_depth,
+                        max_entity_expansion,
+                        namespace_aware,
+                        forbid_dtd,
+                        forbid_entities,
+                    );
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_items {
+                            break;
+                        }
+                        let parsed = (|| {
+                            let input = match &items[i] {
+                                BatchInput::Text(s) => s.clone(),
+                                BatchInput::Bytes(b) => decode_xml_bytes(b)?,
+                            };
+                            let doc = parser
+                                .parse(&input)
+                                .map_err(xml_error_to_pyerr)?
+                                .into_static();
+                            Ok(DocWithInput { doc, input })
+                        })();
+                        *results[i].lock().unwrap() = Some(parsed);
+                    }
+                });
+            }
+        });
+    });
+
+    // Re-attached: wrap successes into Document pyclasses and failures into
+    // exception *objects* returned in place.
+    results
+        .into_iter()
+        .map(|slot| {
+            match slot
+                .into_inner()
+                .unwrap()
+                .expect("worker filled every slot")
+            {
+                Ok(dwi) => Ok(Py::new(
+                    py,
+                    Document {
+                        inner: Arc::new(Mutex::new(dwi)),
+                    },
+                )?
+                .into_any()),
+                Err(e) => Ok(e.into_value(py).into_any()),
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Native fetch (feature "net"): fetch_many / fetch_and_parse_many
+// ---------------------------------------------------------------------------
+
+/// The result of one URL fetch from `fetch_many` / `fetch_and_parse_many`.
+#[cfg(feature = "net")]
+#[pyclass(name = "FetchResult", frozen)]
+struct FetchResult {
+    /// The requested URL (as passed in).
+    #[pyo3(get)]
+    url: String,
+    /// HTTP status code (200 for `file://` reads).
+    #[pyo3(get)]
+    status: u16,
+    /// Canonical reason phrase for the status, e.g. "OK".
+    #[pyo3(get)]
+    reason: String,
+    /// Response headers, keys lowercased. Empty for `file://` reads.
+    headers: Vec<(String, String)>,
+    /// Raw response body bytes (transparently gunzipped by the client).
+    body: Vec<u8>,
+    /// Wall-clock milliseconds spent on this fetch (including retries).
+    #[pyo3(get)]
+    elapsed_ms: f64,
+}
+
+#[cfg(feature = "net")]
+#[pymethods]
+impl FetchResult {
+    /// Response headers as a dict with lowercased keys.
+    #[getter]
+    fn headers(&self) -> std::collections::HashMap<String, String> {
+        self.headers.iter().cloned().collect()
+    }
+
+    /// Raw response body bytes.
+    #[getter]
+    fn body<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyBytes> {
+        pyo3::types::PyBytes::new(py, &self.body)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FetchResult(url={:?}, status={}, {} bytes)",
+            self.url,
+            self.status,
+            self.body.len()
+        )
+    }
+}
+
+/// Plain-Rust fetch output built on worker threads (no Python objects there).
+#[cfg(feature = "net")]
+struct FetchOut {
+    url: String,
+    status: u16,
+    reason: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    elapsed_ms: f64,
+}
+
+/// Shared fetch knobs, extracted from Python kwargs with the GIL held.
+#[cfg(feature = "net")]
+struct FetchOpts {
+    timeout: f64,
+    connect_timeout: f64,
+    verify_tls: bool,
+    follow_redirects: bool,
+    retries: u32,
+    retry_backoff: f64,
+    user_agent: String,
+    extra_headers: Vec<(String, String)>,
+    max_body: u64,
+}
+
+/// Build the shared ureq Agent for a batch (Send + Sync; shared by
+/// reference across the scoped worker threads).
+#[cfg(feature = "net")]
+fn build_agent(opts: &FetchOpts) -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .disable_verification(!opts.verify_tls)
+        .build();
+    ureq::Agent::config_builder()
+        .tls_config(tls)
+        .timeout_global(Some(std::time::Duration::from_secs_f64(opts.timeout)))
+        .timeout_connect(Some(std::time::Duration::from_secs_f64(
+            opts.connect_timeout,
+        )))
+        .max_redirects(if opts.follow_redirects { 10 } else { 0 })
+        .user_agent(opts.user_agent.as_str())
+        // pyFF-style callers inspect the status themselves (e.g. fall back to
+        // a local copy on non-2xx), so a non-2xx response is a result, not an
+        // error.
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+}
+
+/// Fetch one URL (with retries) on a worker thread. `file://` URLs read the
+/// local filesystem directly, covering pyFF's exploded directory sources.
+#[cfg(feature = "net")]
+fn fetch_one(agent: &ureq::Agent, url: &str, opts: &FetchOpts) -> Result<FetchOut, String> {
+    let start = std::time::Instant::now();
+    if let Some(path) = url.strip_prefix("file://") {
+        let body = std::fs::read(path).map_err(|e| format!("{}: {}", url, e))?;
+        return Ok(FetchOut {
+            url: url.to_string(),
+            status: 200,
+            reason: "OK".to_string(),
+            headers: Vec::new(),
+            body,
+            elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+    let mut attempt = 0u32;
+    loop {
+        let result = (|| -> Result<FetchOut, String> {
+            let mut req = agent.get(url);
+            for (k, v) in &opts.extra_headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let mut resp = req.call().map_err(|e| format!("{}: {}", url, e))?;
+            let status = resp.status();
+            let headers = resp
+                .headers()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_ascii_lowercase(),
+                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            let body = resp
+                .body_mut()
+                .with_config()
+                .limit(opts.max_body)
+                .read_to_vec()
+                .map_err(|e| format!("{}: {}", url, e))?;
+            Ok(FetchOut {
+                url: url.to_string(),
+                status: status.as_u16(),
+                reason: status.canonical_reason().unwrap_or("").to_string(),
+                headers,
+                body,
+                elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })
+        })();
+        match result {
+            Ok(out) => return Ok(out),
+            Err(e) if attempt < opts.retries => {
+                // Exponential backoff, matching the requests Retry(backoff)
+                // curve pyFF used: backoff * 2^attempt seconds.
+                std::thread::sleep(std::time::Duration::from_secs_f64(
+                    opts.retry_backoff * (1u64 << attempt) as f64,
+                ));
+                attempt += 1;
+                let _ = e;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Run the shared scoped-thread fan-out for a URL batch, entirely detached.
+#[cfg(feature = "net")]
+fn fetch_batch<R: Send>(
+    py: Python<'_>,
+    urls: &[String],
+    max_threads: Option<usize>,
+    opts: &FetchOpts,
+    per_item: impl Fn(Result<FetchOut, String>) -> R + Sync,
+) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n_items = urls.len();
+    let n_threads = max_threads
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+        .min(n_items.max(1));
+    let agent = build_agent(opts);
+    let results: Vec<std::sync::Mutex<Option<R>>> =
+        (0..n_items).map(|_| std::sync::Mutex::new(None)).collect();
+    py.detach(|| {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n_items {
+                        break;
+                    }
+                    let out = fetch_one(&agent, &urls[i], opts);
+                    *results[i].lock().unwrap() = Some(per_item(out));
+                });
+            }
+        });
+    });
+    results
+        .into_iter()
+        .map(|slot| slot.into_inner().unwrap().expect("worker filled slot"))
+        .collect()
+}
+
+/// Fetch many URLs concurrently in native threads with the GIL released.
+///
+/// Returns a list index-aligned with ``urls`` where each slot is either a
+/// :class:`FetchResult` or an exception object (not raised) -- a batch never
+/// fails wholesale. ``file://`` URLs are read from the local filesystem.
+/// Non-2xx HTTP responses are returned as results (check ``.status``), not
+/// errors, matching how pyFF inspects statuses itself.
+///
+/// ``verify_tls=False`` disables TLS certificate verification (pyFF fetches
+/// federation metadata this way and verifies XML signatures instead).
+#[cfg(feature = "net")]
+#[pyfunction]
+#[pyo3(signature = (urls, *, max_threads=None, timeout=30.0, connect_timeout=10.0, verify_tls=true, follow_redirects=true, retries=0, retry_backoff=0.5, user_agent=None, extra_headers=None, max_body=1_073_741_824))]
+#[allow(clippy::too_many_arguments)]
+fn fetch_many(
+    py: Python<'_>,
+    urls: Vec<String>,
+    max_threads: Option<usize>,
+    timeout: f64,
+    connect_timeout: f64,
+    verify_tls: bool,
+    follow_redirects: bool,
+    retries: u32,
+    retry_backoff: f64,
+    user_agent: Option<String>,
+    extra_headers: Option<std::collections::HashMap<String, String>>,
+    max_body: u64,
+) -> PyResult<Vec<Py<PyAny>>> {
+    let opts = FetchOpts {
+        timeout,
+        connect_timeout,
+        verify_tls,
+        follow_redirects,
+        retries,
+        retry_backoff,
+        user_agent: user_agent
+            .unwrap_or_else(|| format!("pyuppsala/{}", env!("CARGO_PKG_VERSION"))),
+        extra_headers: extra_headers
+            .map(|h| h.into_iter().collect())
+            .unwrap_or_default(),
+        max_body,
+    };
+    let outs = fetch_batch(py, &urls, max_threads, &opts, |r| r);
+    outs.into_iter()
+        .map(|r| match r {
+            Ok(o) => Ok(Py::new(
+                py,
+                FetchResult {
+                    url: o.url,
+                    status: o.status,
+                    reason: o.reason,
+                    headers: o.headers,
+                    body: o.body,
+                    elapsed_ms: o.elapsed_ms,
+                },
+            )?
+            .into_any()),
+            Err(msg) => Ok(PyRuntimeError::new_err(msg).into_value(py).into_any()),
+        })
+        .collect()
+}
+
+/// Fetch many URLs and parse each response as XML, all in native threads
+/// with the GIL released (the parse happens on the same worker that fetched,
+/// so the response bytes never cross the FFI boundary).
+///
+/// Returns a list index-aligned with ``urls``: each slot is a
+/// ``(FetchResult, Document)`` tuple, or an exception object for a fetch,
+/// non-2xx status, or parse failure of that item.
+#[cfg(feature = "net")]
+#[pyfunction]
+#[pyo3(signature = (urls, *, max_threads=None, timeout=30.0, connect_timeout=10.0, verify_tls=true, follow_redirects=true, retries=0, retry_backoff=0.5, user_agent=None, extra_headers=None, max_body=1_073_741_824, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None))]
+#[allow(clippy::too_many_arguments)]
+fn fetch_and_parse_many(
+    py: Python<'_>,
+    urls: Vec<String>,
+    max_threads: Option<usize>,
+    timeout: f64,
+    connect_timeout: f64,
+    verify_tls: bool,
+    follow_redirects: bool,
+    retries: u32,
+    retry_backoff: f64,
+    user_agent: Option<String>,
+    extra_headers: Option<std::collections::HashMap<String, String>>,
+    max_body: u64,
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
+) -> PyResult<Vec<Py<PyAny>>> {
+    let opts = FetchOpts {
+        timeout,
+        connect_timeout,
+        verify_tls,
+        follow_redirects,
+        retries,
+        retry_backoff,
+        user_agent: user_agent
+            .unwrap_or_else(|| format!("pyuppsala/{}", env!("CARGO_PKG_VERSION"))),
+        extra_headers: extra_headers
+            .map(|h| h.into_iter().collect())
+            .unwrap_or_default(),
+        max_body,
+    };
+    // Fetch AND parse inside the worker: the response bytes stay in Rust.
+    // Errors are plain strings (PyErr construction is deferred to the
+    // attached wrap-up below).
+    let outs = fetch_batch(py, &urls, max_threads, &opts, |r| {
+        r.and_then(|o| {
+            if !(200..300).contains(&o.status) {
+                return Err(format!("{}: HTTP status {}", o.url, o.status));
+            }
+            let parser = build_parser(
+                max_depth,
+                max_entity_expansion,
+                namespace_aware,
+                forbid_dtd,
+                forbid_entities,
+            );
+            // Plain-string errors only in this detached worker: XmlError's
+            // Display is pure Rust, and PyErr's Display would re-attach to
+            // Python, so the decode error is reported without its detail.
+            let input = decode_xml_bytes(&o.body)
+                .map_err(|_| format!("{}: response is not valid UTF-8/UTF-16 XML text", o.url))?;
+            let doc = parser
+                .parse(&input)
+                .map_err(|e| format!("{}: {}", o.url, e))?
+                .into_static();
+            Ok((o, DocWithInput { doc, input }))
+        })
+    });
+    outs.into_iter()
+        .map(|r| match r {
+            Ok((o, dwi)) => {
+                let fr = Py::new(
+                    py,
+                    FetchResult {
+                        url: o.url,
+                        status: o.status,
+                        reason: o.reason,
+                        headers: o.headers,
+                        body: o.body,
+                        elapsed_ms: o.elapsed_ms,
+                    },
+                )?;
+                let doc = Py::new(
+                    py,
+                    Document {
+                        inner: Arc::new(Mutex::new(dwi)),
+                    },
+                )?;
+                Ok((fr, doc).into_pyobject(py)?.into_any().unbind())
+            }
+            Err(msg) => Ok(PyRuntimeError::new_err(msg).into_value(py).into_any()),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2954,6 +4020,7 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Document>()?;
     m.add_class::<Node>()?;
     m.add_class::<ElementBase>()?;
+    m.add_class::<DocHolderBase>()?;
     m.add_class::<QName>()?;
     m.add_class::<Attribute>()?;
     m.add_class::<XPathEvaluator>()?;
@@ -2966,7 +4033,15 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Functions
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(parse_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_many, m)?)?;
+    #[cfg(feature = "net")]
+    {
+        m.add_class::<FetchResult>()?;
+        m.add_function(wrap_pyfunction!(fetch_many, m)?)?;
+        m.add_function(wrap_pyfunction!(fetch_and_parse_many, m)?)?;
+    }
     m.add_function(wrap_pyfunction!(_register_element_helpers, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_element_type, m)?)?;
 
     // Default resource-limit constants (uppsala 0.4.0 / 0.5.0 hardening)
     m.add("DEFAULT_MAX_DEPTH", DEFAULT_MAX_DEPTH)?;

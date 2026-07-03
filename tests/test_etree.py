@@ -1374,3 +1374,35 @@ class TestNamespaceSerializationAndCopy:
 
     def test_document_invalid_has_error_log(self):
         assert P.DocumentInvalid("x").error_log == []
+
+
+class TestFromstringMany:
+    def test_roots_and_errors_aligned(self):
+        from pyuppsala import etree as ET
+
+        results = ET.fromstring_many(["<a x='1'/>", "<broken", b"<b>t</b>"])
+        assert results[0].tag == "a" and results[0].get("x") == "1"
+        assert isinstance(results[1], ET.XMLSyntaxError)
+        assert results[2].tag == "b" and results[2].text == "t"
+
+    def test_identity_and_full_api_on_results(self):
+        from pyuppsala import etree as ET
+
+        (root,) = ET.fromstring_many(["<r><c/><c/></r>"])
+        assert root[0] is root[0]
+        assert [c.tag for c in root.iter("c")] == ["c", "c"]
+        assert ET.tostring(root, encoding="unicode") == "<r><c/><c/></r>"
+
+    def test_parser_options_apply(self):
+        from pyuppsala import etree as ET
+
+        p = ET.XMLParser(remove_comments=True)
+        (root,) = ET.fromstring_many(["<r><!-- gone --><c/></r>"], parser=p)
+        assert len(root) == 1 and root[0].tag == "c"
+
+    def test_parser_encoding_override(self):
+        from pyuppsala import etree as ET
+
+        p = ET.XMLParser(encoding="latin-1")
+        (root,) = ET.fromstring_many(["<r>\xe9</r>".encode("latin-1")], parser=p)
+        assert root.text == "é"

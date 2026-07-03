@@ -20,7 +20,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-from weakref import ref as _weakref
 
 from . import _elementpath as ElementPath
 from . import _pyuppsala as _u
@@ -351,74 +350,26 @@ _CONTENT_KINDS = ("element", "comment", "processing_instruction")
 _TEXT_KINDS = ("text", "cdata")
 
 
-class _DocHolder:
-    """Owns one native Document and an identity-stable proxy cache."""
+class _DocHolder(_u._DocHolderBase):
+    """Owns one native Document and an identity-stable proxy cache.
 
-    __slots__ = ("doc", "_proxies", "_ns_counter", "base_url", "_sweep_at", "__weakref__")
+    The document handle (``.doc``), the ``node_id -> weakref(_Element)`` cache,
+    ``proxy()``, and ``repoint_subtree()`` all live on the native
+    ``_DocHolderBase`` (see ``src/lib.rs``): the entire hit path (dict lookup +
+    weakref upgrade) and miss path (construct ``_Element``, insert a
+    callback-free weakref, bounded tombstone sweep) run in Rust with no Python
+    frame. This subclass keeps only the cold Python-side state: the ``ns<N>``
+    prefix counter and the XInclude base URL.
+    """
+
+    __slots__ = ("_ns_counter", "base_url")
 
     def __init__(self, doc):
-        self.doc = doc
-        # node_id -> weakref.ref(_Element), *without* a death callback. A plain
-        # dict of callback-free weakrefs is markedly cheaper than
-        # WeakValueDictionary on the hot tree-walk path: pyFF's iter()/with_tree
-        # walks create a proxy per node and drop it immediately (no re-access),
-        # so WeakValueDictionary paid, per node, both a KeyedRef-with-callback
-        # creation *and* the callback firing on the proxy's near-instant death
-        # (~25% of with_tree wall time was this churn). Callback-free refs skip
-        # the death callback entirely; dead entries are reclaimed by the bounded
-        # lazy sweep below instead.
-        self._proxies = {}
+        # ``doc`` is consumed by the native ``_DocHolderBase.__new__``; this
+        # __init__ only initialises the Python-side extras.
         self._ns_counter = 0
-        # Size at which proxy() next sweeps dead refs. Re-armed after each sweep
-        # to a small multiple of the live count, so during a transient walk the
-        # cache holds at most ~this many tombstones (bounded memory) and the
-        # total sweep work stays O(nodes visited).
-        self._sweep_at = 256
         # Base URL/path for resolving relative XInclude hrefs (set by parse()).
         self.base_url = None
-
-    def proxy(self, node):
-        """Return the identity-stable ``_Element`` wrapper for ``node``.
-
-        Looks the node up by its stable ``node_id`` in the per-document cache so
-        that repeated lookups of the same underlying node return the *same*
-        Python object (``root[0] is root[0]``), matching lxml. ``node_id`` values
-        are never reused by uppsala's arena, so a cached wrapper stays valid for
-        the life of the document; entries are weak, so the wrapper is collected
-        once no Python code holds it and the slot is later swept.
-        """
-        if node is None:
-            return None
-        nid = node.node_id
-        proxies = self._proxies
-        r = proxies.get(nid)
-        if r is not None:
-            el = r()
-            if el is not None:
-                # Refresh the live native handle: the cached wrapper's stored
-                # Node may be stale after tree mutations, but its id is unchanged.
-                el._node = node
-                return el
-            # Dead weakref (proxy was collected): fall through and recreate.
-        # Build the wrapper via the native base constructor (holder, node, id)
-        # and register a callback-free weakref to it in the cache.
-        el = _Element(self, node, nid)
-        proxies[nid] = _weakref(el)
-        # Opportunistically reclaim tombstones. Without WeakValueDictionary's
-        # death callback nothing removes a dead entry on its own, so sweep here
-        # once the cache crosses the armed threshold.
-        if len(proxies) >= self._sweep_at:
-            self._sweep()
-        return el
-
-    def _sweep(self):
-        """Drop cache entries whose weakref has died, then re-arm the threshold."""
-        proxies = self._proxies
-        for k in [k for k, r in proxies.items() if r() is None]:
-            del proxies[k]
-        # Re-arm to a multiple of the surviving live count so steady-state walks
-        # amortise the sweep and memory stays bounded near the live set size.
-        self._sweep_at = max(256, len(proxies) * 2)
 
     def new_prefix(self, node):
         """Generate a fresh ``ns<N>`` prefix not already in scope on ``node``.
@@ -546,58 +497,15 @@ def _copy_inherited_ns(dst, snode, dnode):
 def _repoint_subtree(src_holder, dst, snode, dnode):
     """Move any live proxies from the source subtree onto the cloned subtree.
 
-    Walks the source (``snode``) and cloned (``dnode``) trees in lock-step. When
-    a source node has a live wrapper, that wrapper is re-pointed at the cloned
-    node and re-registered in the destination cache, so existing Python
-    references to a moved element (and its descendants) remain valid afterward -
-    mirroring lxml's in-place move semantics.
+    Fully native (see ``_DocHolderBase.repoint_subtree`` in ``src/lib.rs``):
+    an upfront dead-weakref sweep keeps a proxy-free source on the O(1) fast
+    path, then a lock-step arena walk pairs source and clone nodes and each
+    live wrapper is re-pointed at its clone and moved into the destination
+    cache, so existing Python references to a moved element (and its
+    descendants) remain valid afterward - mirroring lxml's in-place move
+    semantics.
     """
-    # The weakrefs are callback-free (no cache eviction on collection), so the
-    # dict can hold dead tombstones and stay non-empty after every proxy has
-    # been garbage-collected. Sweep them ONCE up front so a holder whose proxies
-    # are all dead still takes the fast path in the walk below. This sweep is
-    # O(proxies); it must NOT run inside the recursive walk, or the cost becomes
-    # O(proxies * subtree-size) and cross-tree ``append`` of a large source
-    # (e.g. pyFF aggregation, where the source document holds thousands of live
-    # proxies) degrades to an effectively-hung quadratic walk.
-    proxies = src_holder._proxies
-    if proxies:
-        dead = [nid for nid, ref in proxies.items() if ref() is None]
-        for nid in dead:
-            proxies.pop(nid, None)
-    _repoint_subtree_walk(src_holder, dst, snode, dnode)
-
-
-def _repoint_subtree_walk(src_holder, dst, snode, dnode):
-    """Recursive lock-step walk for :func:`_repoint_subtree` (no dead sweep).
-
-    The one-time dead-weakref sweep lives in the entry point; this inner walk
-    stays O(subtree) with an O(1) fast-path check per node.
-    """
-    # Fast path: once the source holder has no live proxies left, there is
-    # nothing in the (possibly large) subtree to repoint, so skip the walk
-    # entirely. This is the common case for pyFF's ``deepcopy(entity)`` +
-    # ``append`` aggregation: the freshly deep-copied source holds exactly one
-    # live proxy (its root), so after repointing it the whole descendant walk
-    # (hundreds of nodes per entity) is avoided.
-    if not src_holder._proxies:
-        return
-    r = src_holder._proxies.get(snode.node_id)
-    proxy = r() if r is not None else None
-    if r is not None:
-        # Drop the source entry (a live proxy is moved below; a dead tombstone
-        # is simply reclaimed here).
-        src_holder._proxies.pop(snode.node_id, None)
-    if proxy is not None:
-        proxy._holder = dst
-        proxy._node = dnode
-        proxy._id = dnode.node_id
-        dst._proxies[dnode.node_id] = _weakref(proxy)
-        if not src_holder._proxies:
-            return
-    # Children are cloned in the same order, so a positional zip pairs them up.
-    for sc, dc in zip(snode.children, dnode.children):
-        _repoint_subtree_walk(src_holder, dst, sc, dc)
+    src_holder.repoint_subtree(dst, snode, dnode)
 
 
 def _extract(holder, node):
@@ -939,16 +847,16 @@ class _Element(_u._ElementBase):
 
     def __iter__(self):
         """Iterate over child elements (and comments/PIs) as proxies."""
-        proxy = self._holder.proxy
-        return (proxy(k) for k in _content_children(self._node))
+        # Fully native: collects the content-child ids and materialises the
+        # cached proxies in one call (see ElementBase._children_proxies).
+        return iter(self._children_proxies())
 
     def __getitem__(self, index):
         """Index or slice into the child elements."""
-        kids = _content_children(self._node)
-        proxy = self._holder.proxy
+        kids = self._children_proxies()
         if isinstance(index, slice):
-            return [proxy(k) for k in kids[index]]
-        return proxy(kids[index])
+            return kids[index]
+        return kids[index]
 
     def __setitem__(self, index, element):
         """Replace the child at ``index``, or splice a slice of children.
@@ -1194,12 +1102,8 @@ class _Element(_u._ElementBase):
 
     # -- navigation -------------------------------------------------------
 
-    def getparent(self):
-        """Return the parent element, or None at the tree root."""
-        p = self._node.parent
-        if p is None or p.kind == "document":
-            return None
-        return self._holder.proxy(p)
+    # getparent() is provided natively by ElementBase (parent lookup + proxy
+    # cache in one native call); do not shadow it here.
 
     def getnext(self):
         """Return the next sibling element (skipping text nodes), or None."""
@@ -1255,21 +1159,18 @@ class _Element(_u._ElementBase):
         * a specific tag yields only matching elements.
 
         Implementation note: this is the hottest path in the layer (callers and
-        ElementPath walk large subtrees repeatedly). The pre-order tree walk and
-        tag matching run **natively** in ``Node.iter_descendants`` (one mutex
-        acquisition per step, not per visited node, with no per-node Python
-        attribute access or Clark-string building), so the only Python-level
-        cost here is wrapping the nodes that actually match in their identity
-        proxies. For a find-first pattern (``next(el.iter(tag))``) the native
-        iterator stops as soon as the first match is found.
+        ElementPath walk large subtrees repeatedly). The walk, the tag matching
+        AND the proxy-cache lookup all run natively: ``_iter_proxies`` returns a
+        native iterator whose ``__next__`` ends in the identity cache, so a
+        cache hit allocates no Python object at all and there is no per-match
+        generator frame. For a find-first pattern (``next(el.iter(tag))``) the
+        native iterator stops as soon as the first match is found.
         """
-        proxy = self._holder.proxy
         # Normalise a QName argument to its Clark-notation string; the native
         # filter understands None, "*", "{ns}local" and bare local names.
         if isinstance(tag, QName):
             tag = tag.text
-        for node in self._node.iter_descendants(tag):
-            yield proxy(node)
+        return self._iter_proxies(tag)
 
     def itertext(self):
         """Yield all text and tail content in this subtree, in document order."""
@@ -1380,6 +1281,11 @@ class _Element(_u._ElementBase):
     def base(self):
         """The xml:base URI of this element. Not tracked in v1 (always None)."""
         return None
+
+
+# Hand the native proxy cache (_DocHolderBase) the concrete _Element class so
+# a cache miss constructs wrappers directly in Rust with no Python frame.
+_u._register_element_type(_Element)
 
 
 def _tag_matches(node, tag):
@@ -1923,6 +1829,71 @@ def fromstring(text, parser=None):
 
 
 XML = fromstring
+
+
+def fromstring_many(texts, parser=None, max_threads=None):
+    """Parse many XML strings/bytes in parallel and return their root elements.
+
+    Returns a list index-aligned with ``texts`` where each slot is either the
+    parsed document's root ``_Element`` or an :class:`XMLSyntaxError` instance
+    (not raised) describing that item's failure -- a batch never raises
+    wholesale; check ``isinstance(r, Exception)`` per item.
+
+    The parsing itself is the native ``pyuppsala.parse_many``: the whole batch
+    runs with the GIL released across ``max_threads`` native threads (default:
+    the machine's CPU parallelism), so N threads use N cores. This is the
+    fast path for ingesting many separate documents (e.g. a federation
+    aggregator's per-entity metadata files); lxml has no equivalent.
+
+    A parser ``encoding`` override applies to byte items (decoded in Python
+    before the batch, like :func:`fromstring`); other parser options map
+    exactly as in :func:`fromstring`, including post-processing options such
+    as ``remove_comments``.
+    """
+    opts = parser._opts if parser is not None else {}
+    kw = _parse_kwargs(opts)
+    encoding = opts.get("encoding")
+
+    items = list(texts)
+    if encoding:
+        # Decode byte items here so the parser-encoding override behaves
+        # identically to fromstring; decode errors become per-item results.
+        decoded_items = []
+        for t in items:
+            if isinstance(t, (bytes, bytearray)):
+                try:
+                    d = bytes(t).decode(encoding)
+                except (LookupError, UnicodeDecodeError) as e:
+                    decoded_items.append(XMLSyntaxError(str(e)))
+                    continue
+                if d[:1] == "\ufeff":
+                    d = d[1:]  # drop a leading BOM
+                decoded_items.append(d)
+            else:
+                decoded_items.append(t)
+        items = decoded_items
+
+    # Split out items that already failed decoding, keeping slots aligned.
+    to_parse = [(i, t) for i, t in enumerate(items) if not isinstance(t, Exception)]
+    results = list(items)  # pre-seeded with the decode failures
+    parsed = _u.parse_many(
+        [bytes(t) if isinstance(t, (bytes, bytearray)) else t for _, t in to_parse],
+        max_threads=max_threads,
+        **kw,
+    )
+    for (i, _), doc in zip(to_parse, parsed):
+        if isinstance(doc, Exception):
+            results[i] = XMLSyntaxError(str(doc))
+            continue
+        holder = _DocHolder(doc)
+        if opts:
+            _postprocess(holder, opts)
+        root = doc.document_element
+        if root is None:
+            results[i] = XMLSyntaxError("Document has no root element")
+        else:
+            results[i] = holder.proxy(root)
+    return results
 
 
 def fromstringlist(strings, parser=None):

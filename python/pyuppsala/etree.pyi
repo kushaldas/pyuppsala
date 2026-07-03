@@ -263,6 +263,14 @@ class XMLParser:
 def fromstring(
     text: Union[str, bytes], parser: Optional[XMLParser] = None
 ) -> _Element: ...
+def fromstring_many(
+    texts: Iterable[str | bytes],
+    parser: Optional[XMLParser] = None,
+    max_threads: Optional[int] = None,
+) -> list[_Element | XMLSyntaxError]:
+    """Parse many documents in parallel; index-aligned roots or per-item errors."""
+    ...
+
 def fromstringlist(
     strings: Iterable[Union[str, bytes]], parser: Optional[XMLParser] = None
 ) -> _Element: ...
