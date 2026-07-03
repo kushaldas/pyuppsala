@@ -1683,10 +1683,37 @@ impl ElementBase {
         }
     }
 
+    /// Native backing of `_Element.__iter__`: a lazy content-child iterator
+    /// yielding identity-stable proxies one sibling hop at a time, so
+    /// early-termination patterns (`next(iter(el))`) never pay for the whole
+    /// child list. Callers that want the materialised list (indexing, full
+    /// slices) use `_children_proxies` below instead.
+    fn _iter_children(&self, py: Python<'_>) -> PyResult<ProxyChildIterator> {
+        let holder: Py<DocHolderBase> = self
+            .holder
+            .bind(py)
+            .cast::<DocHolderBase>()?
+            .clone()
+            .unbind();
+        let node = self.node.bind(py).borrow();
+        let first = {
+            let guard = node
+                .doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            guard.doc.first_child(node.id)
+        };
+        Ok(ProxyChildIterator {
+            holder,
+            doc: Arc::clone(&node.doc),
+            next: first,
+        })
+    }
+
     /// The element's content children (elements, comments, PIs -- the ones
     /// lxml exposes as indexable children) as a list of cached proxies; backs
-    /// `_Element.__iter__` / `__getitem__`. Collects the ids under one lock,
-    /// then materialises proxies through the cache.
+    /// `_Element.__getitem__` for full slices. Collects the ids under one
+    /// lock, then materialises proxies through the cache.
     fn _children_proxies(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let (holder, ids) = {
             let cell = slf.borrow();
@@ -2271,6 +2298,80 @@ impl ProxyDescendantIterator {
                 let el = DocHolderBase::proxy_for_id(holder.bind(py), id.index(), None)?;
                 Ok(Some(el))
             }
+            None => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProxyChildIterator
+// ---------------------------------------------------------------------------
+
+/// A lazy content-child iterator that yields identity-stable etree
+/// `_Element` proxies (the backing of `_Element.__iter__`).
+///
+/// Walks the sibling chain one hop per `__next__` instead of materialising
+/// every child's proxy up front, so early-termination patterns
+/// (`next(iter(el))`, `zip`, `any(...)`) only pay for the children they
+/// actually consume -- with the eager list, the first item of a wide element
+/// cost O(children). Full iteration stays native: each step is one sibling
+/// hop under the document lock plus a proxy-cache lookup, with no Python
+/// frame in between.
+///
+/// Like lxml, the walk follows the *live* sibling chain: restructuring the
+/// children mid-iteration redirects the remaining walk accordingly.
+#[pyclass]
+struct ProxyChildIterator {
+    holder: Py<DocHolderBase>,
+    doc: SharedDoc,
+    /// The next sibling to consider (not yet filtered to content kinds);
+    /// `None` when the chain is exhausted.
+    next: Option<NodeId>,
+}
+
+#[pymethods]
+impl ProxyChildIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        // Advance to the next content child (element/comment/PI -- the kinds
+        // lxml exposes as children; text/CDATA surface via .text/.tail) under
+        // the document lock, releasing both the lock and the iterator borrow
+        // before touching the proxy cache (proxy construction may run Python
+        // code via `tp_new`).
+        let (holder, found) = {
+            let mut cell = slf.borrow_mut();
+            let ProxyChildIterator { holder, doc, next } = &mut *cell;
+            let guard = doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let mut cur = *next;
+            let mut found = None;
+            while let Some(cid) = cur {
+                cur = guard.doc.next_sibling(cid);
+                match guard.doc.node_kind(cid) {
+                    Some(NodeKind::Element(_))
+                    | Some(NodeKind::Comment(_))
+                    | Some(NodeKind::ProcessingInstruction(_)) => {
+                        found = Some(cid);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            *next = cur;
+            drop(guard);
+            (holder.clone_ref(py), found)
+        };
+        match found {
+            Some(id) => Ok(Some(DocHolderBase::proxy_for_id(
+                holder.bind(py),
+                id.index(),
+                None,
+            )?)),
             None => Ok(None),
         }
     }

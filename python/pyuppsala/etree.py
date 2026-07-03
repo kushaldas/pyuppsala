@@ -847,9 +847,11 @@ class _Element(_u._ElementBase):
 
     def __iter__(self):
         """Iterate over child elements (and comments/PIs) as proxies."""
-        # Fully native: collects the content-child ids and materialises the
-        # cached proxies in one call (see ElementBase._children_proxies).
-        return iter(self._children_proxies())
+        # Fully native and *lazy* (see ElementBase._iter_children): each step
+        # is one sibling hop plus a proxy-cache lookup, so early-termination
+        # patterns like ``next(iter(el))`` on a wide element do not pay to
+        # materialise every child's proxy up front.
+        return self._iter_children()
 
     def __getitem__(self, index):
         """Index or slice into the child elements."""

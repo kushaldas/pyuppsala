@@ -188,6 +188,26 @@ class TestSearchDifferential:
         assert names(pr.iter("*")) == names(lr.iter("*"))
         assert names(pr.iter()) == names(lr.iter())
 
+    def test_child_iteration_lazy_matches_lxml(self):
+        # __iter__ is a lazy native child iterator; behavior must match
+        # lxml's equally-lazy ElementChildIterator.
+        doc = "<r>t<a/><!--c-->x<?pi d?><b/>tail</r>"
+        pr, lr = P.fromstring(doc), L.fromstring(doc)
+
+        def names(it):
+            return ["#" if not isinstance(c.tag, str) else c.tag for c in it]
+
+        assert names(pr) == names(lr)  # elements, comments, PIs in order
+        assert next(iter(pr)).tag == next(iter(lr)).tag  # early termination
+        assert names(iter(P.fromstring("<r>text only</r>"))) == []
+        # Live-chain semantics: a child appended mid-iteration is reached by
+        # the ongoing walk, and an exhausted iterator stays exhausted.
+        pi, li = iter(pr), iter(lr)
+        next(pi), next(li)
+        P.SubElement(pr, "new"), L.SubElement(lr, "new")
+        assert names(pi) == names(li)
+        assert next(pi, None) is None and next(li, None) is None
+
     def test_itertext(self):
         pr, lr = P.fromstring(SAMPLE), L.fromstring(SAMPLE)
         assert list(pr.itertext()) == list(lr.itertext())
