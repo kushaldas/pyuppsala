@@ -1,0 +1,2 @@
+<xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'><xs:element name='r'><xs:complexType><xs:sequence><xs:element name='i' maxOccurs='unbounded'><xs:complexType><xs:attribute name='id' type='xs:ID'/></xs:complexType></xs:element></xs:sequence></xs:complexType><xs:key name='k'><xs:selector xpath='i'/><xs:field xpath='@id'/></xs:key></xs:element></xs:schema>
+<r><i id='a'/><i id='b'/></r>
