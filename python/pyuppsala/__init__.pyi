@@ -705,7 +705,7 @@ def parse_bytes(
     ...
 
 def parse_many(
-    items: list[str | bytes],
+    items: list[str | bytes | bytearray],
     *,
     max_threads: Optional[int] = None,
     max_depth: Optional[int] = None,

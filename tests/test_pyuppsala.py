@@ -1917,7 +1917,13 @@ class TestGilRelease:
         import threading
         import time
 
-        if (os.cpu_count() or 1) < 2:
+        # Count CPUs actually available to this process (cgroups / affinity can
+        # constrain it below the host total); fall back to the host count.
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except AttributeError:  # sched_getaffinity is not on every platform
+            available_cpus = os.cpu_count() or 1
+        if available_cpus < 2:
             pytest.skip("needs >= 2 CPUs to observe GIL-released overlap")
 
         xml = self._big_xml(8000)

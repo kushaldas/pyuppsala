@@ -5,10 +5,9 @@ numbers vs `lxml`, and how to reproduce them. The consumer-side view of the same
 (pyFF macro benchmarks, per-cycle A/B/C wall times on the deployment host) lives in
 `pyFF/performance.md`; this file is the library-side record.
 
-Status 2026-07-02: everything below is on the `fix/more_pyff_perf` branch (pyuppsala) and
-the `fix/xpath-arena-reuse` branch (uppsala), with `Cargo.toml` pointing at
-`uppsala = { path = "../uppsala" }`. **Nothing is released**; re-pin to a crates.io
-uppsala release before shipping wheels.
+Status: the work below ships in pyuppsala 0.7.2, built against the `uppsala` 0.8 release
+from crates.io (`Cargo.toml`: `uppsala = "0.8"`), which carries the required uppsala-side
+changes (the xpath arena-reuse fix and the serializer fast paths).
 
 ## Design principles
 

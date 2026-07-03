@@ -887,20 +887,46 @@ class _Element(_u._ElementBase):
 
         if step != 1:
             # Extended slice: element-wise replacement, lengths must match
-            # (same rule as list / lxml). Positions are fixed, so capturing the
-            # target handles up front is safe.
-            positions = range(start, stop, step)
+            # (same rule as list / lxml). Done in three phases so a right-hand
+            # side that reuses elements from the target range works -- e.g.
+            # ``r[0:4:2] = [r[2], r[0]]`` (a swap). Adopting/detaching inside a
+            # single loop, as before, could remove a node another slot still
+            # needs, so capture stable anchors first, then adopt, then place.
+            positions = list(range(start, stop, step))
             targets = [kids[p] for p in positions]
             if len(targets) != len(new_els):
                 raise ValueError(
                     "attempt to assign sequence of size %d to extended slice of size %d"
                     % (len(new_els), len(targets))
                 )
-            for old, el in zip(targets, new_els):
-                node, tail = self._adopt(el)
-                self._holder.doc.insert_before(self._node, node, old)
-                _extract(self._holder, old)
-                _attach_tail(self._holder, self._node, tail, node)
+            target_ids = {t.node_id for t in targets}
+            # RHS elements already in this tree get *moved* (detached from their
+            # current slot), so they cannot serve as stable insertion anchors.
+            reused_ids = {el._node.node_id for el in new_els if self._is_child(el)}
+            # For each slot capture, up front, its anchor: the first following
+            # sibling that is neither a target (about to be removed) nor a reused
+            # RHS node (about to move), so it stays put through the whole
+            # operation. ``None`` => append. Anchors only go None as a trailing
+            # run, so appended slots keep their relative order.
+            anchors = []
+            for p in positions:
+                anchor = None
+                for k in kids[p + 1:]:
+                    if k.node_id not in target_ids and k.node_id not in reused_ids:
+                        anchor = k
+                        break
+                anchors.append(anchor)
+            # Phase 1: materialize every RHS element (detach reused, deep-copy
+            # foreign) before touching any target.
+            adopted = [self._adopt(el) for el in new_els]
+            adopted_ids = {node.node_id for node, _tail in adopted}
+            # Phase 2: drop old targets not themselves reused as an RHS element.
+            for old in targets:
+                if old.node_id not in adopted_ids:
+                    _extract(self._holder, old)
+            # Phase 3: place each replacement before its captured anchor.
+            for (node, tail), anchor in zip(adopted, anchors):
+                _attach(self._holder, self._node, node, tail, ref=anchor)
             return
 
         # Simple slice (step == 1): splice ``[start:stop)`` -> ``new_els``.

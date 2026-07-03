@@ -264,7 +264,7 @@ def fromstring(
     text: Union[str, bytes], parser: Optional[XMLParser] = None
 ) -> _Element: ...
 def fromstring_many(
-    texts: Iterable[str | bytes],
+    texts: Iterable[str | bytes | bytearray],
     parser: Optional[XMLParser] = None,
     max_threads: Optional[int] = None,
 ) -> list[_Element | XMLSyntaxError]:

@@ -3,7 +3,7 @@
 
 ## 0.7.2
 
-Bugfix + small-feature release (still built against uppsala 0.7.1).
+Bugfix + small-feature release, built against uppsala 0.8.
 
 ### Added
 
