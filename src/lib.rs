@@ -1497,28 +1497,46 @@ impl ElementBase {
         // holder's tag table -- the same Py<PyString> for every element with
         // this qualified name, so repeated .tag reads allocate nothing and
         // equal tags compare by pointer identity first.
+        //
+        // The document mutex is held only while *reading* the name: a
+        // tag-table hit resolves under it too (hash lookup + piecewise
+        // compare + incref, no Python-object allocation), but on a miss the
+        // name is copied out and the lock released before any Python string
+        // is created -- allocating can trigger GC/finalizers that re-enter
+        // this document, which must not happen with the lock held.
+        let missed: Option<(Option<String>, String)>;
         {
             let guard = node_ref
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             if let Some(e) = guard.doc.element(node_ref.id) {
+                let ns = e.name.namespace_uri.as_deref();
+                let local = &e.name.local_name;
                 if let Ok(holder) = self.holder.bind(py).cast::<DocHolderBase>() {
-                    let interned = holder.borrow_mut().intern_tag(
-                        py,
-                        e.name.namespace_uri.as_deref(),
-                        &e.name.local_name,
-                    )?;
-                    return Ok(interned.into_any());
+                    if let Some(s) = holder.borrow().lookup_tag(py, ns, local)? {
+                        return Ok(s.into_any());
+                    }
                 }
-                // Unusual holder (not a _DocHolder): fall back to building
-                // the Clark string fresh, preserving old behaviour.
-                let clark = match e.name.namespace_uri.as_deref() {
-                    Some(ns) => format!("{{{}}}{}", ns, e.name.local_name),
-                    None => e.name.local_name.to_string(),
-                };
-                return Ok(clark.into_pyobject(py)?.into_any().unbind());
+                missed = Some((ns.map(str::to_owned), local.to_string()));
+            } else {
+                missed = None;
             }
+        }
+        // Tag-table miss (or unusual holder): the lock is released, so it is
+        // now safe to allocate Python objects.
+        if let Some((ns, local)) = missed {
+            if let Ok(holder) = self.holder.bind(py).cast::<DocHolderBase>() {
+                let interned = DocHolderBase::intern_tag(holder, py, ns.as_deref(), &local)?;
+                return Ok(interned.into_any());
+            }
+            // Unusual holder (not a _DocHolder): fall back to building the
+            // Clark string fresh, preserving old behaviour.
+            let clark = match ns {
+                Some(ns) => format!("{{{}}}{}", ns, local),
+                None => local,
+            };
+            return Ok(clark.into_pyobject(py)?.into_any().unbind());
         }
         let kind = node_ref.kind()?;
         match kind.as_str() {
@@ -1755,34 +1773,75 @@ fn clark_eq(s: &str, ns: Option<&str>, local: &str) -> bool {
     }
 }
 
+/// Hash key for the tag table: mixes `(namespace_uri, local_name)`.
+fn tag_key(ns: Option<&str>, local: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ns.hash(&mut h);
+    local.hash(&mut h);
+    h.finish()
+}
+
 impl DocHolderBase {
+    /// Look up the interned Clark tag for `(namespace_uri, local_name)`.
+    ///
+    /// Read-only companion to [`DocHolderBase::intern_tag`]: a hit costs a
+    /// hash lookup, a piecewise compare, and an incref -- no Python-object
+    /// allocation, no Python code -- so it is safe to call while the document
+    /// mutex (or a holder borrow) is held.
+    fn lookup_tag(
+        &self,
+        py: Python<'_>,
+        ns: Option<&str>,
+        local: &str,
+    ) -> PyResult<Option<Py<pyo3::types::PyString>>> {
+        if let Some(bucket) = self.tag_table.get(&tag_key(ns, local)) {
+            for s in bucket.iter() {
+                // to_str is fine here: interned tags are always valid UTF-8 we
+                // created ourselves, and reading a PyString runs no Python code.
+                if clark_eq(s.bind(py).to_str()?, ns, local) {
+                    return Ok(Some(s.clone_ref(py)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Return the interned `Py<PyString>` for the Clark tag of
     /// `(namespace_uri, local_name)`, formatting and caching it on first
     /// sight. Hits allocate nothing and return the same object every time.
+    ///
+    /// Takes the holder as a `Bound` rather than `&mut self` so no `RefCell`
+    /// borrow is held while the Python string is allocated: `PyString::new`
+    /// can trigger GC, and a finalizer may re-enter this holder (the same
+    /// hazard `proxy_for_id` guards against). Callers must not hold the
+    /// document mutex either -- use [`DocHolderBase::lookup_tag`] under the
+    /// lock and call this only after releasing it.
     fn intern_tag(
-        &mut self,
+        slf: &Bound<'_, DocHolderBase>,
         py: Python<'_>,
         ns: Option<&str>,
         local: &str,
     ) -> PyResult<Py<pyo3::types::PyString>> {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        ns.hash(&mut h);
-        local.hash(&mut h);
-        let key = h.finish();
-        let bucket = self.tag_table.entry(key).or_default();
-        for s in bucket.iter() {
-            // to_str is fine here: interned tags are always valid UTF-8 we
-            // created ourselves, and reading a PyString runs no Python code.
-            if clark_eq(s.bind(py).to_str()?, ns, local) {
-                return Ok(s.clone_ref(py));
-            }
+        if let Some(s) = slf.borrow().lookup_tag(py, ns, local)? {
+            return Ok(s);
         }
+        // Miss: allocate with no borrow held (see doc comment above).
         let clark = match ns {
             Some(ns) => format!("{{{}}}{}", ns, local),
             None => local.to_string(),
         };
         let obj = pyo3::types::PyString::new(py, &clark).unbind();
+        // Re-check under the write borrow: a GC finalizer may have interned
+        // the same tag while we allocated. Returning the existing entry keeps
+        // identity stable (exactly one object per unique tag).
+        let mut cell = slf.borrow_mut();
+        let bucket = cell.tag_table.entry(tag_key(ns, local)).or_default();
+        for s in bucket.iter() {
+            if clark_eq(s.bind(py).to_str()?, ns, local) {
+                return Ok(s.clone_ref(py));
+            }
+        }
         bucket.push(obj.clone_ref(py));
         Ok(obj)
     }

@@ -854,8 +854,15 @@ class _Element(_u._ElementBase):
     def __getitem__(self, index):
         """Index or slice into the child elements."""
         if isinstance(index, slice):
-            # A slice needs several proxies; fetch them in one native call.
-            return self._children_proxies()[index]
+            # Full slice (``el[:]``): every child is needed, so fetch all the
+            # cached proxies in one native call.
+            if index.start is None and index.stop is None and index.step in (None, 1):
+                return self._children_proxies()
+            # Partial slice: materialise proxies only for the selected
+            # children, so e.g. ``el[:2]`` on a wide element stays O(slice)
+            # instead of O(children).
+            kids = _content_children(self._node)
+            return [self._holder.proxy(k) for k in kids[index]]
         # Scalar index: materialise only the selected child's proxy rather than
         # every child's. `_content_children` returns cheap native handles; the
         # list index handles negative indices and out-of-range IndexError.
