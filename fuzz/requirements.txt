@@ -1,4 +1,4 @@
 # Fuzzing dependencies for the pyuppsala Atheris harnesses.
-# Install into the project venv:  sfw uv pip install -r fuzz/requirements.txt
+# Install into the project venv:  uv pip install -r fuzz/requirements.txt
 atheris>=2.3
 coverage>=7.0   # optional: only used by scripts/coverage.sh

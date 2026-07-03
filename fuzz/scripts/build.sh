@@ -46,16 +46,19 @@ fi
 
 echo "Fuzz build: retargeting uppsala -> $SRC_DESC (via [patch.crates-io], Cargo.toml untouched)"
 
+# Invoke maturin through the runner (`$RUNNER -m maturin`) so the RUNNER
+# override from common.sh actually holds here too: it works the same for the
+# default `uv run python` and for a self-managed `RUNNER=python` venv.
 if [ "${ASAN:-0}" = "1" ]; then
   echo "Building with AddressSanitizer (nightly + -Zsanitizer=address)..."
   TRIPLE="$(rustc -vV | sed -n 's/host: //p')"
   export RUSTFLAGS="-Zsanitizer=address -Cdebuginfo=1 ${RUSTFLAGS:-}"
   export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
-  uv run maturin develop --release --target "$TRIPLE" -Zbuild-std "${PATCH_ARGS[@]}"
+  $RUNNER -m maturin develop --release --target "$TRIPLE" -Zbuild-std "${PATCH_ARGS[@]}"
   echo "ASan build done. run.sh will LD_PRELOAD $(asan_preload)"
 else
   echo "Building pyuppsala (release, no sanitizer)..."
-  uv run maturin develop --release "${PATCH_ARGS[@]}"
+  $RUNNER -m maturin develop --release "${PATCH_ARGS[@]}"
 fi
 
 # Effectiveness check: confirm the override actually took effect. [patch.crates-io]
@@ -64,7 +67,7 @@ fi
 # the patch silently no-ops and the fuzzer would test that local copy, NOT main.
 # Warn loudly so the result is never silently misattributed.
 SRC="$(cargo metadata --format-version 1 "${PATCH_ARGS[@]}" 2>/dev/null \
-  | uv run python -c "import sys,json; d=json.load(sys.stdin); print(next((p['source'] or 'local-path' for p in d['packages'] if p['name']=='uppsala'), 'none'))" 2>/dev/null || echo unknown)"
+  | $RUNNER -c "import sys,json; d=json.load(sys.stdin); print(next((p['source'] or 'local-path' for p in d['packages'] if p['name']=='uppsala'), 'none'))" 2>/dev/null || echo unknown)"
 
 if [ -z "$UPPSALA_PATH" ] && [ "${SRC#git+}" = "$SRC" ]; then
   cat >&2 <<EOF

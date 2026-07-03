@@ -39,10 +39,14 @@ dict_for() {
 RUNNER="${RUNNER:-uv run python}"
 
 require_tools() {
-  command -v uv >/dev/null 2>&1 || command -v python >/dev/null 2>&1 || {
-    echo "need 'uv' (or python on PATH)"; exit 1; }
+  # Probe the runner itself rather than guessing at uv/python separately:
+  # the default is `uv run python`, but RUNNER=python is a supported
+  # override, and only the interpreter the scripts will actually invoke
+  # matters.
+  $RUNNER -c "" 2>/dev/null || {
+    echo "runner '$RUNNER' not usable: install uv, or set RUNNER=python for a self-managed environment"; exit 1; }
   $RUNNER -c "import atheris" 2>/dev/null || {
-    echo "atheris missing: run 'just fuzz-setup' (sfw uv pip install atheris)"; exit 1; }
+    echo "atheris missing: run 'just fuzz-setup' (uv pip install -r fuzz/requirements.txt)"; exit 1; }
   $RUNNER -c "import pyuppsala" 2>/dev/null || {
     echo "pyuppsala not importable: run 'just fuzz-build'"; exit 1; }
 }

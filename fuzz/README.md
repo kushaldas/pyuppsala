@@ -46,7 +46,7 @@ See `harness_common.py`.
 ## Quick start
 
 ```bash
-just fuzz-setup                       # sfw uv pip install atheris coverage
+just fuzz-setup                       # uv pip install -r fuzz/requirements.txt
 just fuzz-build                       # maturin develop --release (uppsala main)
 just fuzz-one roundtrip_fuzzer 60     # one target, 60s, foreground
 just fuzz 0                           # all targets, forever, in tmux

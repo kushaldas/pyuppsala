@@ -39,7 +39,7 @@ docs:
 
 # Install the fuzzing toolchain (atheris + coverage). Run once per machine.
 fuzz-setup:
-    sfw uv pip install -r fuzz/requirements.txt
+    uv pip install -r fuzz/requirements.txt
 
 # Build the extension for fuzzing. Retargets uppsala to git `main` via a
 # [patch.crates-io] override (Cargo.toml untouched; CI keeps the crates.io dep).

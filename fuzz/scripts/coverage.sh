@@ -12,7 +12,7 @@ require_tools
 TARGET="${1:?usage: coverage.sh <target>}"
 
 $RUNNER -c "import coverage" 2>/dev/null || {
-  echo "coverage.py missing: sfw uv pip install coverage"; exit 1; }
+  echo "coverage.py missing: uv pip install -r fuzz/requirements.txt"; exit 1; }
 
 CORPUS="$FUZZ_DIR/corpus/$TARGET"
 OUT="$FUZZ_DIR/coverage/$TARGET"
