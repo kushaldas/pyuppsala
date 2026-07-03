@@ -224,9 +224,7 @@ fn validate_pi_target(target: &str) -> PyResult<()> {
     Ok(())
 }
 
-fn writer_attr_refs<'a>(
-    attrs: &'a Option<Vec<(String, String)>>,
-) -> PyResult<Vec<(&'a str, &'a str)>> {
+fn writer_attr_refs(attrs: &Option<Vec<(String, String)>>) -> PyResult<Vec<(&str, &str)>> {
     // Attribute values are escaped by the writer. Attribute names are not, so
     // validate them before handing references to the underlying writer.
     match attrs {
@@ -3179,7 +3177,10 @@ impl XmlWriter {
     }
 
     /// Return the accumulated XML as a string.
-    fn to_string(&self) -> String {
+    // Exposed to Python as `to_string()`; the Rust name differs so it is not an
+    // inherent `to_string` (which would shadow the `ToString`/`Display` idiom).
+    #[pyo3(name = "to_string")]
+    fn to_string_py(&self) -> String {
         self.inner.as_str().to_string()
     }
 
@@ -3397,6 +3398,17 @@ enum BatchInput {
     Bytes(Vec<u8>),
 }
 
+/// GIL-free failure from a `parse_many` worker thread. Converted to the
+/// matching Python exception only in the attached wrap-up loop, never on a
+/// detached thread (constructing a `PyErr` without the GIL is undefined
+/// behavior).
+enum BatchError {
+    /// Byte decode failed (bad UTF-8 / UTF-16); becomes `XmlWellFormednessError`.
+    Decode(String),
+    /// Parse failed; mapped through `xml_error_to_pyerr` for a faithful type.
+    Parse(XmlError),
+}
+
 /// Parse many XML documents in parallel across native threads.
 ///
 /// Takes a list of `str` / `bytes` items and returns a list of the same
@@ -3446,10 +3458,10 @@ fn parse_many(
     // The entire fan-out runs detached: workers are pure Rust over the owned
     // inputs. Results land in per-item slots (a mutex keeps the bookkeeping
     // trivially safe; one uncontended lock per item is noise next to a parse).
-    // Workers may build PyErr values: `PyErr::new_err(String)` is lazy in
-    // PyO3 -- the Python exception object is only materialised on demand,
-    // with the GIL, in the wrap-up loop below.
-    let results: Vec<std::sync::Mutex<Option<Result<DocWithInput, PyErr>>>> =
+    // Workers never touch the Python C-API: a failure is carried as a GIL-free
+    // `BatchError` and only turned into a Python exception in the wrap-up loop
+    // below, once the GIL is held again.
+    let results: Vec<std::sync::Mutex<Option<Result<DocWithInput, BatchError>>>> =
         (0..n_items).map(|_| std::sync::Mutex::new(None)).collect();
     py.detach(|| {
         let next = AtomicUsize::new(0);
@@ -3471,14 +3483,16 @@ fn parse_many(
                         if i >= n_items {
                             break;
                         }
-                        let parsed = (|| {
+                        let parsed: Result<DocWithInput, BatchError> = (|| {
                             let input = match &items[i] {
                                 BatchInput::Text(s) => s.clone(),
-                                BatchInput::Bytes(b) => decode_xml_bytes(b)?,
+                                BatchInput::Bytes(b) => {
+                                    decode_xml_bytes_raw(b).map_err(BatchError::Decode)?
+                                }
                             };
                             let doc = parser
                                 .parse(&input)
-                                .map_err(xml_error_to_pyerr)?
+                                .map_err(BatchError::Parse)?
                                 .into_static();
                             Ok(DocWithInput { doc, input })
                         })();
@@ -3506,7 +3520,13 @@ fn parse_many(
                     },
                 )?
                 .into_any()),
-                Err(e) => Ok(e.into_value(py).into_any()),
+                Err(be) => {
+                    let e = match be {
+                        BatchError::Decode(msg) => XmlWellFormednessError::new_err(msg),
+                        BatchError::Parse(xe) => xml_error_to_pyerr(xe),
+                    };
+                    Ok(e.into_value(py).into_any())
+                }
             }
         })
         .collect()
@@ -3841,10 +3861,10 @@ fn fetch_and_parse_many(
                 forbid_dtd,
                 forbid_entities,
             );
-            // Plain-string errors only in this detached worker: XmlError's
-            // Display is pure Rust, and PyErr's Display would re-attach to
-            // Python, so the decode error is reported without its detail.
-            let input = decode_xml_bytes(&o.body)
+            // Plain-string errors only in this detached worker: the GIL-free
+            // decoder and XmlError's Display are pure Rust, so no PyErr is ever
+            // constructed off the GIL (that would touch the Python C-API).
+            let input = decode_xml_bytes_raw(&o.body)
                 .map_err(|_| format!("{}: response is not valid UTF-8/UTF-16 XML text", o.url))?;
             let doc = parser
                 .parse(&input)
@@ -3917,54 +3937,67 @@ fn build_parser(
 /// builder only accepts `&str`, so without this the only option would be a
 /// lossy UTF-8 decode that mangles UTF-16 input.
 fn decode_xml_bytes(data: &[u8]) -> PyResult<String> {
+    // GIL-holding wrapper: turns the plain-String decode error into the
+    // Python exception. Callers inside `py.detach` must use the `_raw` form
+    // instead (see `decode_xml_bytes_raw`).
+    decode_xml_bytes_raw(data).map_err(XmlWellFormednessError::new_err)
+}
+
+/// GIL-free core of [`decode_xml_bytes`]: BOM sniffing plus UTF-8/UTF-16 decode,
+/// returning a plain `String` error. This is the form that detached worker
+/// threads (`py.detach`) must call: constructing a `PyErr` there touches the
+/// Python C-API without the GIL, which is undefined behavior. The caller
+/// re-attaches and converts the error into a Python exception.
+fn decode_xml_bytes_raw(data: &[u8]) -> Result<String, String> {
     if data.len() < 2 {
         // Too short for BOM detection - assume UTF-8.
-        return decode_utf8(data);
+        return decode_utf8_raw(data);
     }
 
     // Byte-order mark detection.
     if data[0] == 0xFF && data[1] == 0xFE {
-        return decode_utf16(&data[2..], false); // UTF-16 LE BOM
+        return decode_utf16_raw(&data[2..], false); // UTF-16 LE BOM
     }
     if data[0] == 0xFE && data[1] == 0xFF {
-        return decode_utf16(&data[2..], true); // UTF-16 BE BOM
+        return decode_utf16_raw(&data[2..], true); // UTF-16 BE BOM
     }
     if data.len() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
         // UTF-8 BOM - strip it and decode as UTF-8.
-        return decode_utf8(&data[3..]);
+        return decode_utf8_raw(&data[3..]);
     }
 
     // No BOM - check for UTF-16 without BOM (XML spec Appendix F).
     if data[0] == 0x00 && data[1] == 0x3C {
-        return decode_utf16(data, true); // UTF-16 BE without BOM
+        return decode_utf16_raw(data, true); // UTF-16 BE without BOM
     }
     if data[0] == 0x3C && data[1] == 0x00 {
-        return decode_utf16(data, false); // UTF-16 LE without BOM
+        return decode_utf16_raw(data, false); // UTF-16 LE without BOM
     }
 
     // Default: UTF-8.
-    decode_utf8(data)
+    decode_utf8_raw(data)
 }
 
 /// Validate UTF-8 bytes and copy them into a String. Borrows the slice for
 /// validation (`std::str::from_utf8`) so there is no intermediate `Vec<u8>`
-/// allocation on the common UTF-8 path - only the final owned copy.
-fn decode_utf8(bytes: &[u8]) -> PyResult<String> {
+/// allocation on the common UTF-8 path - only the final owned copy. GIL-free.
+fn decode_utf8_raw(bytes: &[u8]) -> Result<String, String> {
     std::str::from_utf8(bytes)
         .map(str::to_owned)
-        .map_err(|e| XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-8: {}", e)))
+        .map_err(|e| format!("1:1: Invalid UTF-8: {}", e))
 }
 
 /// Decode UTF-16 bytes (big- or little-endian) to a String. An odd-length
 /// input is rejected as malformed rather than silently dropping the trailing
 /// byte (which could truncate invalid UTF-16 into superficially valid text).
-fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
+/// GIL-free.
+fn decode_utf16_raw(bytes: &[u8], big_endian: bool) -> Result<String, String> {
     let endian = if big_endian { "BE" } else { "LE" };
     if !bytes.len().is_multiple_of(2) {
-        return Err(XmlWellFormednessError::new_err(format!(
+        return Err(format!(
             "1:1: Invalid UTF-16 {}: odd number of bytes",
             endian
-        )));
+        ));
     }
     let code_units: Vec<u16> = bytes
         .chunks_exact(2)
@@ -3976,9 +4009,7 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> PyResult<String> {
             }
         })
         .collect();
-    String::from_utf16(&code_units).map_err(|e| {
-        XmlWellFormednessError::new_err(format!("1:1: Invalid UTF-16 {}: {}", endian, e))
-    })
+    String::from_utf16(&code_units).map_err(|e| format!("1:1: Invalid UTF-16 {}: {}", endian, e))
 }
 
 fn make_write_options(
