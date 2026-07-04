@@ -66,6 +66,11 @@ was never published; its changes ship here.)
   `DEFAULT_MAX_XPATH_NODE_VISITS` instead of an effectively unbounded budget, so
   broad XPath traversals over adversarial documents fail with `XPathEvalError`
   unless trusted callers explicitly raise `etree.MAX_XPATH_NODE_VISITS`.
+- **Security: same-document mutators now reject foreign node handles.** The
+  native binding validates node arguments for `append_child()`, `insert_before()`,
+  `insert_after()`, `remove_child()`, `replace_child()`, `detach()`, and
+  `set_namespace_declaration()` before using their document-scoped node ids,
+  preventing cross-document same-id confusion from mutating the wrong document.
 - **`etree` now rejects XML-incompatible strings at the API boundary**
   (lxml parity): setting text/tails, attribute values, comment/PI content,
   or namespace URIs (Clark keys, QNames, `nsmap`) containing NUL, C0 control

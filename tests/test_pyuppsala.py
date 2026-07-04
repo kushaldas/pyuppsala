@@ -255,6 +255,21 @@ class TestDocument:
         assert len(doc.document_element) == 1
         assert doc.document_element[0].tag.local_name == "child"
 
+    def test_append_child_rejects_foreign_handles(self):
+        """Foreign append_child handles must not be resolved inside this document."""
+        other = parse("<other><x/></other>")
+        doc = parse("<root/>")
+        child = doc.create_element("child")
+
+        with pytest.raises(ValueError, match="parent.*different Document"):
+            doc.append_child(other.document_element, child)
+
+        with pytest.raises(ValueError, match="child.*different Document"):
+            doc.append_child(doc.document_element, other.create_element("foreign"))
+
+        assert other.to_xml() == "<other><x/></other>"
+        assert doc.to_xml() == "<root/>"
+
     def test_insert_before(self):
         doc = parse("<root><b/></root>")
         a = doc.create_element("a")
@@ -264,6 +279,33 @@ class TestDocument:
         children = root.children
         assert children[0].tag.local_name == "a"
         assert children[1].tag.local_name == "b"
+
+    def test_insert_before_rejects_foreign_handles(self):
+        """insert_before must reject every foreign same-document node argument."""
+        other = parse("<other><x/><y/></other>")
+        doc = parse("<root><ref/><keep/></root>")
+
+        with pytest.raises(ValueError, match="parent.*different Document"):
+            doc.insert_before(
+                other.document_element,
+                doc.create_element("new"),
+                doc.document_element.children[0],
+            )
+        with pytest.raises(ValueError, match="new_child.*different Document"):
+            doc.insert_before(
+                doc.document_element,
+                other.create_element("foreign"),
+                doc.document_element.children[0],
+            )
+        with pytest.raises(ValueError, match="reference.*different Document"):
+            doc.insert_before(
+                doc.document_element,
+                doc.create_element("new"),
+                other.document_element.children[0],
+            )
+
+        assert other.to_xml() == "<other><x/><y/></other>"
+        assert doc.to_xml() == "<root><ref/><keep/></root>"
 
     def test_insert_after(self):
         doc = parse("<root><a/></root>")
@@ -275,12 +317,52 @@ class TestDocument:
         assert children[0].tag.local_name == "a"
         assert children[1].tag.local_name == "b"
 
+    def test_insert_after_rejects_foreign_handles(self):
+        """insert_after must reject every foreign same-document node argument."""
+        other = parse("<other><x/><y/></other>")
+        doc = parse("<root><ref/><keep/></root>")
+
+        with pytest.raises(ValueError, match="parent.*different Document"):
+            doc.insert_after(
+                other.document_element,
+                doc.create_element("new"),
+                doc.document_element.children[0],
+            )
+        with pytest.raises(ValueError, match="new_child.*different Document"):
+            doc.insert_after(
+                doc.document_element,
+                other.create_element("foreign"),
+                doc.document_element.children[0],
+            )
+        with pytest.raises(ValueError, match="reference.*different Document"):
+            doc.insert_after(
+                doc.document_element,
+                doc.create_element("new"),
+                other.document_element.children[0],
+            )
+
+        assert other.to_xml() == "<other><x/><y/></other>"
+        assert doc.to_xml() == "<root><ref/><keep/></root>"
+
     def test_remove_child(self):
         doc = parse("<root><child/></root>")
         root = doc.document_element
         child = root.children[0]
         doc.remove_child(root, child)
         assert len(root.children) == 0
+
+    def test_remove_child_rejects_foreign_handles(self):
+        """Foreign remove_child handles must not remove same-id local nodes."""
+        other = parse("<other><x/><y/></other>")
+        doc = parse("<root><child/><keep/></root>")
+
+        with pytest.raises(ValueError, match="parent.*different Document"):
+            doc.remove_child(other.document_element, doc.document_element.children[0])
+        with pytest.raises(ValueError, match="child.*different Document"):
+            doc.remove_child(doc.document_element, other.document_element.children[0])
+
+        assert other.to_xml() == "<other><x/><y/></other>"
+        assert doc.to_xml() == "<root><child/><keep/></root>"
 
     def test_replace_child(self):
         doc = parse("<root><old/></root>")
@@ -289,6 +371,52 @@ class TestDocument:
         new = doc.create_element("new")
         doc.replace_child(root, new, old)
         assert root.children[0].tag.local_name == "new"
+
+    def test_replace_child_rejects_foreign_parent(self):
+        """A foreign parent must not select a same-id parent in this document."""
+        other = parse("<other><x/><y/></other>")
+        doc = parse("<root><old/><keep/></root>")
+        old = doc.document_element.children[0]
+        new = doc.create_element("new")
+
+        with pytest.raises(ValueError, match="parent.*different Document"):
+            doc.replace_child(other.document_element, new, old)
+
+        assert other.to_xml() == "<other><x/><y/></other>"
+        assert doc.to_xml() == "<root><old/><keep/></root>"
+
+    def test_replace_child_rejects_foreign_old_child(self):
+        """A foreign old_child must not replace a same-id child here."""
+        other = parse("<other><x/><y/></other>")
+        doc = parse("<root><old/><keep/></root>")
+        new = doc.create_element("new")
+
+        with pytest.raises(ValueError, match="old_child.*different Document"):
+            doc.replace_child(
+                doc.document_element,
+                new,
+                other.document_element.children[0],
+            )
+
+        assert other.to_xml() == "<other><x/><y/></other>"
+        assert doc.to_xml() == "<root><old/><keep/></root>"
+
+    def test_replace_child_rejects_foreign_new_child(self):
+        """A foreign new_child must not resolve to a same-id local node."""
+        other = parse("<other><x/><y/></other>")
+        foreign_new = other.create_element("foreign")
+        doc = parse("<root><old/><keep/></root>")
+        doc.create_element("local_decoy")
+
+        with pytest.raises(ValueError, match="new_child.*different Document"):
+            doc.replace_child(
+                doc.document_element,
+                foreign_new,
+                doc.document_element.children[0],
+            )
+
+        assert other.to_xml() == "<other><x/><y/></other>"
+        assert doc.to_xml() == "<root><old/><keep/></root>"
 
     def test_detach(self):
         doc = parse("<root><child>text</child></root>")
@@ -300,6 +428,28 @@ class TestDocument:
         doc.append_child(root, child)
         assert len(root.children) == 1
         assert root.children[0].tag.local_name == "child"
+
+    def test_detach_rejects_foreign_node(self):
+        """detach must not detach a same-id local node for a foreign handle."""
+        other = parse("<other><x/><y/></other>")
+        doc = parse("<root><child/><keep/></root>")
+
+        with pytest.raises(ValueError, match="node.*different Document"):
+            doc.detach(other.document_element.children[0])
+
+        assert other.to_xml() == "<other><x/><y/></other>"
+        assert doc.to_xml() == "<root><child/><keep/></root>"
+
+    def test_set_namespace_declaration_rejects_foreign_node(self):
+        """Namespace mutation must reject foreign node handles before id lookup."""
+        other = parse("<other/>")
+        doc = parse("<root/>")
+
+        with pytest.raises(ValueError, match="node.*different Document"):
+            doc.set_namespace_declaration(other.document_element, "p", "urn:test")
+
+        assert other.to_xml() == "<other/>"
+        assert doc.to_xml() == "<root/>"
 
     # -- Serialization --------------------------------------------------------
 
