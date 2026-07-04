@@ -16,6 +16,7 @@ This release is against `0.8` of Uppsala library.
 - **XPath 1.0** evaluation (all axes, functions, predicates)
 - **XSD validation** (structures + datatypes, 40+ built-in types, facets, complex types)
 - **XSD regex** pattern matching (Unicode categories, blocks, character class subtraction)
+- **XSLT 1.0** transforms with bounded template recursion
 - **Imperative XML builder** (`XmlWriter`) for constructing output without a DOM
 - **Serialization** with pretty-printing, compact output, and streaming to files
 - **Automatic encoding detection** for UTF-8 and UTF-16 (LE/BE)
@@ -23,6 +24,40 @@ This release is against `0.8` of Uppsala library.
   `lxml.etree` backed by Uppsala's secure parser
 
 Read the [full documentation](https://pyuppsala.rtfd.io)
+
+## Security defaults
+
+pyuppsala keeps the main XML attack classes bounded by default:
+
+- Parser resource caps are enabled by default for element depth, entity
+  expansion size, and entity-reference nesting.
+- DTDs and entity declarations are accepted by default for compatibility, but
+  entity expansion is capped. Use `forbid_dtd=True` or `forbid_entities=True`
+  when parsing untrusted XML that should not contain DTDs or entity
+  declarations.
+- XPath evaluation is capped by expression depth and by a per-evaluation node
+  visit budget. Do not let untrusted callers choose `max_depth` or
+  `max_node_visits`.
+- XSD regex matching has group-depth and backtracking-step limits. Do not let
+  untrusted callers raise `max_steps`.
+- XSLT template recursion is capped by default. Treat stylesheets as trusted
+  application configuration; EXSLT compatibility is enabled by default.
+- `Document` mutators reject `Node` handles from another document. Use
+  `Document.import_subtree()` for intentional cross-document copies.
+- `pyuppsala.etree` keeps parser caps on by default. `huge_tree=True` lifts
+  those caps for lxml compatibility and should only be used with trusted XML.
+- XInclude processing is explicit. Remote includes require
+  `network_access=True`; local includes are restricted to the including
+  document's base directory and are size-limited.
+ - Native fetch helpers (available only in builds with the default-on `net`
+   feature; gate use on `pyuppsala._HAS_NET`) cap response bodies at 128 MiB by
+   default, including `file://` reads, and keep TLS verification enabled by
+   default. Apply your own URL allowlist before fetching attacker-controlled
+   URLs.
+
+See the [resource limits and hardening guide](https://pyuppsala.rtfd.io/en/latest/examples.html#resource-limits-and-hardening)
+and the [API security notes](https://pyuppsala.rtfd.io/en/latest/api.html#security-defaults-and-boundaries)
+for all knobs and default values.
 
 ## Installation
 
@@ -75,7 +110,6 @@ print(w.to_string())
 from pyuppsala import XsdValidator
 
 schema = """\
-<?xml version="1.0"?>
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
   <xs:element name="greeting" type="xs:string"/>
 </xs:schema>
@@ -145,8 +179,12 @@ for the supported and unsupported feature matrix.
 | `XsdValidator(schema)` | Validate documents against an XSD schema |
 | `XmlWriter` | Imperative XML builder (no DOM needed) |
 | `XsdRegex(pattern)` | XSD regular expression pattern matcher |
+| `Xslt(stylesheet_xml)` | Compile and apply XSLT 1.0 stylesheets |
 | `parse(xml)` | Module-level shorthand for `Document(xml)` |
 | `parse_bytes(data)` | Module-level shorthand for `Document.from_bytes(data)` |
+| `parse_many(items)` | Parse many XML strings or byte strings in native worker threads |
+| `fetch_many(urls)` | Fetch many HTTP(S) or file URLs with body limits and per-item results (requires `pyuppsala._HAS_NET`) |
+| `fetch_and_parse_many(urls)` | Fetch many URLs and parse each response as XML (requires `pyuppsala._HAS_NET`) |
 | `pyuppsala.etree` | lxml.etree-compatible API (`Element`, `SubElement`, `fromstring`, `tostring`, `find`/`findall`, `XPath`, `XMLSchema`, ...) |
 
 ### Exceptions

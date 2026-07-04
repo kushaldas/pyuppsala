@@ -52,10 +52,67 @@ default. Use :class:`~pyuppsala.etree.XMLParser` to adjust limits:
 
     from pyuppsala import etree as ET
 
-    parser = ET.XMLParser(huge_tree=True)              # lift depth/expansion caps
-    parser = ET.XMLParser(max_depth=256, remove_comments=True)
+    parser = ET.XMLParser(
+        max_depth=256,
+        remove_comments=True,
+        forbid_dtd=True,
+        forbid_entities=True,
+    )
 
     root = ET.fromstring(deeply_nested_xml, parser)
+
+.. important::
+
+   ``XMLParser()`` keeps Uppsala's safe parser defaults: depth and entity
+   expansion are capped, namespace processing is enabled, and no network fetches
+   are performed by parsing. ``forbid_dtd`` and ``forbid_entities`` default to
+   ``False`` for lxml compatibility; set them to ``True`` for untrusted XML that
+   should not contain DTDs or entity declarations.
+
+.. important::
+
+   ``huge_tree=True`` deliberately lifts the parser depth and entity-expansion
+   caps for lxml compatibility. Use it only for trusted documents. Prefer
+   explicit ``max_depth`` / ``max_entity_expansion`` values when you know the
+   expected upper bound.
+
+XPath and XInclude security defaults
+------------------------------------
+
+``.xpath()``, :class:`XPath`, :class:`ETXPath`, and :func:`XPathEvaluator` use
+the native XPath engine. By default, the etree compatibility layer keeps the
+native per-evaluation node-visit budget
+(:data:`pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS`); raise
+``pyuppsala.etree.MAX_XPATH_NODE_VISITS`` only for trusted large documents.
+
+XInclude processing is explicit: call ``tree.xinclude()`` or ``element.xinclude()``
+when you want to process ``xi:include`` elements. Remote ``http(s)``/``ftp``
+includes are blocked by default and require ``network_access=True``. Local file
+targets must stay under the including document's base directory after symlink
+resolution, and every include target is size-limited before buffering.
+
+.. important::
+
+   Do not run XInclude over untrusted XML with ``network_access=True`` unless
+   your application has already applied an allowlist for remote destinations.
+   The default is local-only, sandboxed, and size-limited.
+
+XSLT security defaults
+----------------------
+
+:class:`XSLT` compiles stylesheets through the native :class:`pyuppsala.Xslt`
+engine. Stylesheets and source documents are parsed with the native parser
+resource caps, and template recursion uses the native
+:data:`pyuppsala.DEFAULT_MAX_XSLT_DEPTH` cap by default.
+
+.. important::
+
+   Treat XSLT stylesheets as trusted application configuration. The lxml
+   compatibility wrapper defaults ``regexp=True`` and enables the supported
+   EXSLT regexp functions. Passing ``regexp=False`` raises
+   ``NotImplementedError`` rather than silently ignoring a request to disable
+   them. Custom extension functions and XSLT access-control objects are not
+   supported.
 
 Supported features
 ------------------
@@ -79,8 +136,13 @@ Supported features
   plus :class:`XPath` / :class:`ETXPath` / :func:`XPathEvaluator`.
 - **Parser & validation**: :class:`XMLParser`, :func:`register_namespace`, and
   :class:`XMLSchema` (wrapping :class:`pyuppsala.XsdValidator`).
+- **XSLT**: :class:`XSLT` supports native XSLT 1.0 transforms with EXSLT regexp
+  compatibility enabled by default.
 - **Cross-tree moves**: appending an element from another tree deep-copies the
   subtree into the target document and preserves Python object identity.
+  Native ``NodeId`` values are document-scoped; low-level native mutators reject
+  foreign node handles, and the etree layer uses deep-copy/import behavior for
+  cross-tree operations.
 - **DOCTYPE**: ``tree.docinfo.doctype`` returns the ``<!DOCTYPE ...>``
   declaration preserved from the source (``""`` when absent). Serializing a
   whole :class:`_ElementTree` round-trips that DOCTYPE; serializing a bare
@@ -167,4 +229,6 @@ API reference
 .. autoclass:: XMLParser
    :members:
 .. autoclass:: XMLSchema
+   :members:
+.. autoclass:: XSLT
    :members:
