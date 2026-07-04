@@ -11,6 +11,7 @@ import sys
 
 import pytest
 
+import pyuppsala
 from pyuppsala import etree as P
 
 # lxml is only needed by the differential tests. Import it optionally so the
@@ -46,6 +47,11 @@ NS_DOC = (
     "<b:item>y</b:item>"
     "</a:root>"
 )
+
+
+def sibling_xml(count):
+    """Build a wide tree that forces broad XPath traversal."""
+    return "<r>" + "<a/>" * count + "</r>"
 
 
 def lxml_canon(xml_text):
@@ -769,6 +775,45 @@ class TestStandalone:
 
         root = P.parse(io.BytesIO(b"<doc>hi</doc>")).getroot()
         assert root.tag == "doc"
+
+    def test_xpath_default_node_visit_budget_caps_etree_traversal(self):
+        """etree XPath must preserve the native visit cap by default.
+
+        The vulnerable behavior set ``MAX_XPATH_NODE_VISITS`` to ``sys.maxsize``;
+        a wide attacker-controlled tree therefore returned every matching node
+        instead of aborting at the native anti-DoS budget. All public etree XPath
+        facades delegate through the same capped path and should raise here.
+        """
+        count = pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS + 1_000
+        root = P.fromstring(sibling_xml(count))
+        evaluators = (
+            lambda: root.xpath("//a"),
+            lambda: P.ElementTree(root).xpath("//a"),
+            lambda: P.XPath("//a")(root),
+            lambda: P.XPathEvaluator(root)("//a"),
+        )
+
+        assert P.MAX_XPATH_NODE_VISITS == pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS
+        for evaluate in evaluators:
+            with pytest.raises(P.XPathEvalError):
+                evaluate()
+
+    def test_xpath_node_visit_budget_can_be_raised_for_trusted_documents(
+        self, monkeypatch
+    ):
+        """Trusted callers can still opt into larger etree XPath traversals.
+
+        The security fix changes only the default. Applications that know both
+        the document and expression are trusted may explicitly raise the module
+        budget and retain the previous large-document compatibility behavior.
+        """
+        count = pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS + 1_000
+        monkeypatch.setattr(
+            P, "MAX_XPATH_NODE_VISITS", pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS * 4
+        )
+
+        root = P.fromstring(sibling_xml(count))
+        assert len(root.xpath("//a")) == count
 
     def test_empty_elementtree_convenience_methods(self):
         tree = P.ElementTree()

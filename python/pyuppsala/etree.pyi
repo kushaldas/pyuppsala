@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Iterator, Optional, Union, overload
 
-# Per-evaluation node-visit budget applied by ``_Element.xpath`` (unbounded by
-# default to match lxml; lower it to restore an anti-DoS bound on untrusted input).
+# Per-evaluation node-visit budget applied by ``_Element.xpath``. Defaults to
+# pyuppsala's native anti-DoS cap; raise only for trusted large documents.
 MAX_XPATH_NODE_VISITS: int
 
 # ---------------------------------------------------------------------------

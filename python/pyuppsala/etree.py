@@ -71,14 +71,10 @@ __all__ = [
 ]
 
 
-# Per-evaluation node-visit budget applied by :meth:`_Element.xpath`. lxml's
-# ``.xpath()`` has no such cap, so the default is effectively unbounded to match
-# it (and to allow XPath over large *trusted* documents, e.g. a SAML aggregate
-# with thousands of entities, which would otherwise exceed the native
-# evaluator's much lower default). Applications that evaluate XPath over
-# UNTRUSTED input can lower this module attribute to restore an anti-DoS bound,
-# e.g. ``etree.MAX_XPATH_NODE_VISITS = pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS``.
-MAX_XPATH_NODE_VISITS = sys.maxsize
+# Per-evaluation node-visit budget applied by :meth:`_Element.xpath`. The
+# default preserves the native anti-DoS cap. Applications that evaluate XPath
+# only over trusted large documents can raise this module attribute explicitly.
+MAX_XPATH_NODE_VISITS = _u.DEFAULT_MAX_XPATH_NODE_VISITS
 
 
 # ---------------------------------------------------------------------------
@@ -1325,11 +1321,9 @@ class _Element(_u._ElementBase):
                 "XPath variable binding is not supported (got %r)"
                 % sorted(variables)
             )
-        # lxml's .xpath() has no per-evaluation node-visit cap; the native
-        # evaluator defaults to one (anti-DoS) that is far too low for large
-        # trusted documents (e.g. a SAML aggregate with thousands of entities).
-        # The budget is the module-level ``MAX_XPATH_NODE_VISITS`` (unbounded by
-        # default to match lxml), which applications can lower for untrusted input.
+        # The budget is the module-level ``MAX_XPATH_NODE_VISITS``. It defaults
+        # to the native anti-DoS cap and can be raised explicitly by callers
+        # that evaluate XPath only over trusted large documents.
         ev = _u.XPathEvaluator(max_node_visits=MAX_XPATH_NODE_VISITS)
         if namespaces:
             for pfx, uri in namespaces.items():

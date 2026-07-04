@@ -61,6 +61,11 @@ was never published; its changes ship here.)
   directory after symlink resolution, and every XInclude target is capped before
   buffering so attacker-controlled XML cannot include arbitrary or oversized
   local files.
+- **Security: `etree` XPath now keeps the native node-visit cap by default.**
+  The lxml-compatible `.xpath()`, `XPath`, and `XPathEvaluator` facades now use
+  `DEFAULT_MAX_XPATH_NODE_VISITS` instead of an effectively unbounded budget, so
+  broad XPath traversals over adversarial documents fail with `XPathEvalError`
+  unless trusted callers explicitly raise `etree.MAX_XPATH_NODE_VISITS`.
 - **`etree` now rejects XML-incompatible strings at the API boundary**
   (lxml parity): setting text/tails, attribute values, comment/PI content,
   or namespace URIs (Clark keys, QNames, `nsmap`) containing NUL, C0 control
