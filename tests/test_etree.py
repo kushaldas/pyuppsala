@@ -1341,6 +1341,70 @@ class TestXInclude:
         with pytest.raises(P.XIncludeError):
             tree.xinclude()
 
+    def test_xinclude_rejects_local_path_escape(self, tmp_path):
+        """XML-controlled local hrefs must not escape the document directory."""
+        base = tmp_path / "base"
+        base.mkdir()
+        _write(tmp_path, "secret.txt", "TOPSECRET")
+        main = _write(
+            base,
+            "main.xml",
+            '<list xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="../secret.txt" parse="text"/></list>',
+        )
+
+        tree = P.parse(str(main))
+        with pytest.raises(P.XIncludeError):
+            tree.xinclude()
+
+    def test_xinclude_rejects_file_url_escape(self, tmp_path):
+        """Absolute file: URLs are still checked against the local base."""
+        base = tmp_path / "base"
+        base.mkdir()
+        secret = _write(tmp_path, "secret.txt", "TOPSECRET")
+        main = _write(
+            base,
+            "main.xml",
+            '<list xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="%s" parse="text"/></list>' % secret.as_uri(),
+        )
+
+        tree = P.parse(str(main))
+        with pytest.raises(P.XIncludeError):
+            tree.xinclude()
+
+    def test_xinclude_local_path_escape_uses_fallback(self, tmp_path):
+        """A blocked local target is a load failure, so fallback remains safe."""
+        base = tmp_path / "base"
+        base.mkdir()
+        _write(tmp_path, "secret.txt", "TOPSECRET")
+        main = _write(
+            base,
+            "main.xml",
+            '<list xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="../secret.txt" parse="text">'
+            "<xi:fallback>SAFE</xi:fallback></xi:include></list>",
+        )
+
+        tree = P.parse(str(main))
+        tree.xinclude()
+        assert tree.getroot().text == "SAFE"
+
+    def test_xinclude_local_read_size_cap(self, tmp_path, monkeypatch):
+        """Local text/XML includes must not buffer unbounded file contents."""
+        _write(tmp_path, "big.txt", "0123456789")
+        main = _write(
+            tmp_path,
+            "main.xml",
+            '<list xmlns:xi="http://www.w3.org/2001/XInclude">'
+            '<xi:include href="big.txt" parse="text"/></list>',
+        )
+        monkeypatch.setattr(P, "_XINCLUDE_MAX_BYTES", 4)
+
+        tree = P.parse(str(main))
+        with pytest.raises(P.XIncludeError):
+            tree.xinclude()
+
     def test_xinclude_nested(self, tmp_path):
         _write(tmp_path, "leaf.xml", "<leaf/>")
         _write(
