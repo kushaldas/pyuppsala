@@ -551,8 +551,8 @@ Node iteration patterns
 Resource limits and hardening
 -----------------------------
 
-The parser, XPath engine, and XSD regex engine apply safe defaults that
-block denial-of-service inputs out of the box.
+The parser, XPath engine, XSD regex engine, and XSLT engine apply safe defaults
+that block denial-of-service inputs out of the box.
 
 .. code-block:: python
 
@@ -563,8 +563,10 @@ block denial-of-service inputs out of the box.
     print(pyuppsala.DEFAULT_MAX_DEPTH)             # 128
     print(pyuppsala.DEFAULT_MAX_ENTITY_EXPANSION)  # 1048576
     print(pyuppsala.DEFAULT_MAX_XPATH_DEPTH)       # 32
+    print(pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS) # 100000
     print(pyuppsala.DEFAULT_MAX_REGEX_GROUP_DEPTH) # 64
     print(pyuppsala.DEFAULT_MAX_REGEX_STEPS)       # 1000000
+    print(pyuppsala.DEFAULT_MAX_XSLT_DEPTH)        # template recursion cap
 
     # Billion-laughs is rejected by default: each entity expands the next
     # tenfold, so &g; would expand to ~10 MiB -- well past the 1 MiB cap.
@@ -595,3 +597,6 @@ block denial-of-service inputs out of the box.
 
     # Raise the XPath depth cap for an unusually nested expression
     ev = XPathEvaluator(max_depth=128)
+
+    # Tighten parsing further for untrusted XML that should not contain DTDs
+    doc = parse("<root/>", forbid_dtd=True, forbid_entities=True)

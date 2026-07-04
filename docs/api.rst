@@ -4,11 +4,11 @@ API reference
 Resource limits
 ---------------
 
-The parser, XPath engine, and XSD regex engine all enforce safe defaults
-that block denial-of-service inputs (deep nesting, billion-laughs entity
-expansion, deeply-nested XPath/regex expressions, catastrophic regex
-backtracking). The keyword arguments below let you raise (or lower) those
-defaults when you need to.
+The parser, XPath engine, XSD regex engine, and XSLT engine all enforce safe
+defaults that block denial-of-service inputs (deep nesting, billion-laughs
+entity expansion, deeply-nested XPath/regex/XSLT expressions, broad XPath
+traversals, catastrophic regex backtracking). The keyword arguments below let
+you raise (or lower) those defaults when you need to.
 
 .. data:: DEFAULT_MAX_DEPTH
    :type: int
@@ -54,18 +54,55 @@ defaults when you need to.
    (currently 1,000,000). When the cap is reached the matcher returns
    ``False`` rather than burning CPU.
 
+.. data:: DEFAULT_MAX_XSLT_DEPTH
+   :type: int
+
+   Default maximum XSLT template-activation recursion depth. Override with
+   ``Xslt(..., max_depth=...)`` only for trusted stylesheets that legitimately
+   need deeper recursion.
+
 .. warning::
    Do not source the ``max_depth`` / ``max_entity_expansion`` /
-   ``max_node_visits`` / ``max_steps`` keyword arguments from untrusted input.
-   An attacker who controls a cap can re-enable the DoS class it was designed
-   to block.
+   ``max_node_visits`` / ``max_steps`` / ``max_body`` keyword arguments from
+   untrusted input. An attacker who controls a cap can re-enable the DoS class
+   it was designed to block.
    These arguments are intended for application authors who have a
    legitimate reason to relax (or tighten) the safe defaults.
+
+Security defaults and boundaries
+--------------------------------
+
+.. important::
+
+   Parser APIs keep resource caps enabled by default. ``max_depth=None`` uses
+   :data:`DEFAULT_MAX_DEPTH`, ``max_entity_expansion=None`` uses
+   :data:`DEFAULT_MAX_ENTITY_EXPANSION`, and ``namespace_aware=None`` leaves
+   namespace processing enabled. ``forbid_dtd`` and ``forbid_entities`` default
+   to ``False``/``None`` for compatibility; set them to ``True`` when processing
+   XML from untrusted sources that should not contain a DOCTYPE or entity
+   declarations.
+
+.. important::
+
+   ``Node`` handles are scoped to their owning :class:`Document`. Same-document
+   mutators reject foreign nodes with :class:`ValueError`; use
+   :meth:`Document.import_subtree` for cross-document copies. XPath context
+   nodes must also belong to the :class:`Document` being queried.
+
+.. important::
+
+    Network and filesystem fetch helpers (available only when built with the
+    default-on ``net`` feature; check :data:`pyuppsala._HAS_NET`) buffer
+    response bodies in memory and enforce ``max_body`` for every scheme,
+    including ``file://``. The default is 128 MiB. Do not pass
+    attacker-controlled URLs without an application allowlist if SSRF or
+    local-file reads are in scope; keep ``verify_tls=True`` unless you control
+    the endpoint.
 
 Module-level functions
 ----------------------
 
-.. function:: parse(xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None) -> Document
+.. function:: parse(xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None) -> Document
 
    Parse an XML string and return a :class:`Document`.
 
@@ -75,9 +112,24 @@ Module-level functions
    :param max_entity_expansion: Maximum total bytes produced by entity
        expansion. Defaults to :data:`DEFAULT_MAX_ENTITY_EXPANSION`.
    :param namespace_aware: When ``False``, disables XML namespace processing.
+       Defaults to namespace-aware parsing.
+   :param forbid_dtd: When ``True``, rejects any ``<!DOCTYPE`` declaration.
+       Defaults to ``False``/``None`` for compatibility.
+   :param forbid_entities: When ``True``, rejects ``<!ENTITY>`` declarations
+       while still allowing other DTD declarations. Defaults to
+       ``False``/``None`` for compatibility.
    :raises XmlParseError: If the XML is syntactically malformed or a
        resource cap is exceeded.
    :raises XmlWellFormednessError: If a well-formedness constraint is violated.
+
+   .. important::
+
+      The default parser accepts DTD declarations and entity declarations, but
+      entity expansion is capped by :data:`DEFAULT_MAX_ENTITY_EXPANSION` and
+      entity-reference nesting is capped internally. Use ``forbid_dtd=True`` or
+      ``forbid_entities=True`` for stricter defused-style parsing of untrusted
+      XML. Raise ``max_depth`` or ``max_entity_expansion`` only for trusted
+      documents that legitimately exceed the defaults.
 
    .. code-block:: python
 
@@ -86,7 +138,7 @@ Module-level functions
       doc = parse("<root>hello</root>")
       print(doc.document_element.text_content)  # "hello"
 
-.. function:: parse_bytes(data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None) -> Document
+.. function:: parse_bytes(data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None) -> Document
 
    Parse XML from bytes with automatic encoding detection (UTF-8, UTF-16
    LE/BE, with or without a BOM). Encoding detection is applied in all
@@ -97,7 +149,15 @@ Module-level functions
    :param max_depth: See :func:`parse`.
    :param max_entity_expansion: See :func:`parse`.
    :param namespace_aware: See :func:`parse`.
+   :param forbid_dtd: See :func:`parse`.
+   :param forbid_entities: See :func:`parse`.
    :raises XmlParseError: If the XML is malformed or a resource cap is exceeded.
+
+   .. important::
+
+      Encoding detection is independent of the parser security knobs. UTF-8 and
+      UTF-16 inputs keep working when you tighten ``forbid_dtd`` /
+      ``forbid_entities`` or adjust resource caps.
 
    .. code-block:: python
 
@@ -110,10 +170,124 @@ Module-level functions
       data = b"\xff\xfe<\x00r\x00o\x00o\x00t\x00/\x00>\x00"
       doc = parse_bytes(data)
 
+.. function:: parse_many(items, *, max_threads=None, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None) -> list[Document | Exception]
+
+   Parse many XML strings or byte strings in parallel across native threads.
+
+   The result list is index-aligned with ``items``. Each slot is either a
+   :class:`Document` or an exception object for that item; one malformed
+   document does not fail the whole batch.
+
+   :param items: XML documents as ``str``, ``bytes``, or ``bytearray``.
+   :param max_threads: Maximum worker threads. Defaults to native parallelism.
+   :param max_depth: See :func:`parse`.
+   :param max_entity_expansion: See :func:`parse`.
+   :param namespace_aware: See :func:`parse`.
+   :param forbid_dtd: See :func:`parse`.
+   :param forbid_entities: See :func:`parse`.
+
+   .. important::
+
+      Parser resource limits and ``forbid_*`` settings apply independently to
+      every item. Keep the defaults for untrusted batches unless you have a
+      trusted reason to raise them. ``max_threads`` controls local CPU
+      concurrency; do not expose it as an attacker-controlled value.
+
+.. note::
+
+   The native fetch APIs require the extension to be built with the default-on
+   ``net`` feature. Check :data:`pyuppsala._HAS_NET` before using them.
+
+.. class:: FetchResult
+
+   The result of one URL fetch from :func:`fetch_many` or
+   :func:`fetch_and_parse_many`.
+
+   .. attribute:: url
+      :type: str
+
+      The requested URL.
+
+   .. attribute:: status
+      :type: int
+
+      HTTP status code. ``file://`` reads use status ``200``.
+
+   .. attribute:: reason
+      :type: str
+
+      Canonical reason phrase, for example ``"OK"``.
+
+   .. attribute:: headers
+      :type: dict[str, str]
+
+      Response headers with lowercased keys. Empty for ``file://`` reads.
+
+   .. attribute:: body
+      :type: bytes
+
+      Raw response body bytes, transparently gunzipped by the client and capped
+      by the caller's ``max_body`` setting.
+
+   .. attribute:: elapsed_ms
+      :type: float
+
+      Wall-clock milliseconds spent fetching this item, including retries.
+
+.. function:: fetch_many(urls, *, max_threads=None, timeout=30.0, connect_timeout=10.0, verify_tls=True, follow_redirects=True, retries=0, retry_backoff=0.5, user_agent=None, extra_headers=None, max_body=134_217_728) -> list[FetchResult | Exception]
+
+   Fetch many URLs concurrently in native threads. Each result slot is either a
+   :class:`FetchResult` or an exception object; a failed URL does not fail the
+   whole batch. Non-2xx HTTP responses are returned as results, not exceptions.
+
+   :param urls: URLs to fetch. ``http://``, ``https://``, and ``file://`` are
+       supported by the default ``net`` build.
+   :param max_threads: Maximum worker threads. Defaults to native parallelism.
+   :param timeout: Per-request total timeout in seconds. Defaults to ``30.0``.
+   :param connect_timeout: Connect timeout in seconds. Defaults to ``10.0``.
+   :param verify_tls: Verify HTTPS certificates. Defaults to ``True``.
+   :param follow_redirects: Follow HTTP redirects. Defaults to ``True``.
+   :param retries: Retry count for transient failures. Defaults to ``0``.
+   :param retry_backoff: Exponential retry backoff base in seconds. Defaults to
+       ``0.5``.
+   :param max_body: Maximum response body bytes buffered in memory per item.
+       Defaults to ``134_217_728`` (128 MiB) and is enforced for HTTP(S) and
+       ``file://`` reads.
+
+   .. important::
+
+      ``fetch_many`` is a fetch primitive, not an SSRF policy engine. If URLs
+      can come from untrusted input, apply an application allowlist for schemes,
+      hosts, and local-file access before calling it. Keep ``verify_tls=True``
+      for HTTPS unless you control the endpoint. Raise ``max_body`` only for
+      trusted large responses; oversized HTTP and ``file://`` bodies fail that
+      item instead of being read without a cap.
+
+.. function:: fetch_and_parse_many(urls, *, max_threads=None, timeout=30.0, connect_timeout=10.0, verify_tls=True, follow_redirects=True, retries=0, retry_backoff=0.5, user_agent=None, extra_headers=None, max_body=134_217_728, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None) -> list[tuple[FetchResult, Document] | Exception]
+
+   Fetch many URLs and parse each response as XML on the worker that fetched it.
+   Each result slot is a ``(FetchResult, Document)`` tuple or an exception
+   object for that item.
+
+   :param max_body: See :func:`fetch_many`.
+   :param max_depth: See :func:`parse`.
+   :param max_entity_expansion: See :func:`parse`.
+   :param namespace_aware: See :func:`parse`.
+   :param forbid_dtd: See :func:`parse`.
+   :param forbid_entities: See :func:`parse`.
+
+   .. important::
+
+      Both sets of defaults apply: fetches are body-capped at 128 MiB by
+      default, and parsing keeps the XML resource limits enabled by default.
+      Tighten ``forbid_dtd`` / ``forbid_entities`` for untrusted XML. Do not
+      relax TLS verification, body limits, parser limits, or thread counts based
+      on attacker-controlled input.
+
 Document
 --------
 
-.. class:: Document(xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None)
+.. class:: Document(xml, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None)
 
    Parse an XML string into a DOM document.
 
@@ -121,6 +295,15 @@ Document
    :param max_depth: See :func:`parse`.
    :param max_entity_expansion: See :func:`parse`.
    :param namespace_aware: See :func:`parse`.
+   :param forbid_dtd: See :func:`parse`.
+   :param forbid_entities: See :func:`parse`.
+
+   .. important::
+
+      ``Document(...)`` uses the same safe parser defaults as :func:`parse`.
+      DTDs and entity declarations are accepted for compatibility unless
+      ``forbid_dtd=True`` or ``forbid_entities=True`` is set; entity expansion
+      is still bounded by the default resource limits.
 
    .. code-block:: python
 
@@ -129,7 +312,7 @@ Document
       doc = Document("<catalog><book>XML Guide</book></catalog>")
       print(doc.document_element.tag.local_name)  # "catalog"
 
-   .. staticmethod:: from_bytes(data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None) -> Document
+   .. staticmethod:: from_bytes(data, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None) -> Document
 
       Parse XML from bytes with automatic encoding detection. See
       :func:`parse_bytes` for the keyword arguments that override the
@@ -216,6 +399,14 @@ Document
 
    **Tree mutation**
 
+   .. important::
+
+      ``Node`` ids are document-scoped. The same-document mutators below reject
+      any ``Node`` argument from another :class:`Document` with
+      :class:`ValueError`; they do not reinterpret foreign node ids in the
+      receiver document. Use :meth:`import_subtree` to copy a subtree from a
+      different document.
+
    .. method:: create_element(local_name, namespace_uri=None, prefix=None) -> Node
 
       Create a new element node. The node is not yet attached to the tree;
@@ -283,6 +474,7 @@ Document
    .. method:: append_child(parent: Node, child: Node) -> None
 
       Append *child* as the last child of *parent*.
+      Both nodes must belong to this document.
 
       .. code-block:: python
 
@@ -292,9 +484,27 @@ Document
          doc.append_child(root, b)
          print(doc.to_xml())  # "<root><a/><b/></root>"
 
+   .. method:: import_subtree(source: Node) -> Node
+
+      Deep-copy *source* from a different :class:`Document` into this document
+      and return the new, detached node. Use this when you intentionally need a
+      cross-document copy; same-document mutators reject foreign node handles.
+
+      :raises ValueError: If *source* already belongs to this document, is a
+          document root, or is an attribute node.
+
+      .. code-block:: python
+
+         src = Document("<items><item/></items>")
+         dst = Document("<root/>")
+         clone = dst.import_subtree(src.document_element.children[0])
+         dst.append_child(dst.document_element, clone)
+         print(dst.to_xml())  # "<root><item/></root>"
+
    .. method:: insert_before(parent: Node, new_child: Node, reference: Node) -> None
 
       Insert *new_child* before *reference* under *parent*.
+      All node arguments must belong to this document.
 
       .. code-block:: python
 
@@ -307,6 +517,7 @@ Document
    .. method:: insert_after(parent: Node, new_child: Node, reference: Node) -> None
 
       Insert *new_child* after *reference* under *parent*.
+      All node arguments must belong to this document.
 
       .. code-block:: python
 
@@ -319,6 +530,7 @@ Document
    .. method:: remove_child(parent: Node, child: Node) -> None
 
       Remove *child* from *parent*.
+      Both nodes must belong to this document.
 
       .. code-block:: python
 
@@ -331,6 +543,7 @@ Document
    .. method:: replace_child(parent: Node, new_child: Node, old_child: Node) -> None
 
       Replace *old_child* with *new_child* under *parent*.
+      All node arguments must belong to this document.
 
       .. code-block:: python
 
@@ -343,7 +556,7 @@ Document
    .. method:: detach(node: Node) -> None
 
       Detach *node* from its parent. The node remains valid and can be
-      re-attached elsewhere.
+      re-attached elsewhere. The node must belong to this document.
 
       .. code-block:: python
 
@@ -356,6 +569,20 @@ Document
          # Re-attach at the end
          doc.append_child(root, b)
          print(doc.to_xml())  # "<root><a/><c/><b/></root>"
+
+   .. method:: set_namespace_declaration(node: Node, prefix: str | None, uri: str) -> None
+
+      Add or replace an ``xmlns`` declaration on an element node. ``prefix=None``
+      sets the default namespace. The node must belong to this document.
+
+      :raises ValueError: If *node* is foreign, is not an element, or attempts
+          to bind reserved XML namespace prefixes incorrectly.
+
+      .. code-block:: python
+
+         doc = Document("<root/>")
+         doc.set_namespace_declaration(doc.document_element, "p", "urn:test")
+         print(doc.to_xml())  # '<root xmlns:p="urn:test"/>'
 
    **Serialization**
 
@@ -877,6 +1104,16 @@ XPathEvaluator
        :data:`DEFAULT_MAX_XPATH_NODE_VISITS`. Lower it to tighten the
        anti-denial-of-service budget on adversarial documents.
 
+   .. important::
+
+      With no keyword arguments, the evaluator uses the native safe defaults:
+      :data:`DEFAULT_MAX_XPATH_DEPTH` for expression depth and
+      :data:`DEFAULT_MAX_XPATH_NODE_VISITS` for traversal breadth. Raise these
+      limits only for trusted documents and expressions. When passing
+      ``context=...`` to :meth:`evaluate` or :meth:`select`, the context
+      :class:`Node` must belong to the queried :class:`Document`; foreign
+      context nodes raise :class:`ValueError`.
+
    .. code-block:: python
 
       from pyuppsala import Document, XPathEvaluator
@@ -908,7 +1145,9 @@ XPathEvaluator
       :param doc: The :class:`Document` to query (must have :meth:`~Document.prepare_xpath` called).
       :param expr: An XPath 1.0 expression string.
       :param context: Optional context node. Defaults to the document root.
+          Must belong to *doc*.
       :raises XPathError: If the expression is invalid.
+      :raises ValueError: If *context* belongs to a different document.
 
       .. code-block:: python
 
@@ -942,6 +1181,10 @@ XPathEvaluator
       Evaluate an XPath expression and return matching nodes. This is a
       convenience method equivalent to ``evaluate()`` when the result is a
       node-set.
+
+      :param context: Optional context node. Defaults to the document root.
+          Must belong to *doc*.
+      :raises ValueError: If *context* belongs to a different document.
 
       .. code-block:: python
 
@@ -980,6 +1223,12 @@ XsdValidator
 
       Create a validator that resolves ``xs:include``, ``xs:import``, and
       ``xs:redefine`` relative to *base_path*.
+
+      .. important::
+
+         ``base_path`` is used for local schema resolution. Treat schemas and
+         their include/import paths as trusted configuration, not as
+         attacker-controlled input.
 
       .. code-block:: python
 
@@ -1058,6 +1307,11 @@ XsdValidator
 
       Lenient mode only relaxes the known-stricter built-in checks; genuinely
       invalid documents still report errors.
+
+      .. important::
+
+         Strict mode is the default. Enable lenient mode only when you
+         deliberately need libxml2/lxml compatibility for trusted workflows.
 
    .. method:: set_enforce_qname_length_facets(enforce: bool) -> None
 
@@ -1232,6 +1486,12 @@ XmlWriter
 
       Write raw XML content (not escaped).
 
+      .. important::
+
+         ``raw()`` bypasses all escaping. Use it only with already-validated,
+         trusted XML fragments. For untrusted text, use :meth:`text` or normal
+         element/attribute writer methods.
+
       .. code-block:: python
 
          w = XmlWriter()
@@ -1272,6 +1532,39 @@ XmlWriter
       print(bool(w))  # True
       print(len(w))   # 13
 
+Xslt
+----
+
+.. class:: Xslt(stylesheet_xml, *, exslt=True, max_depth=None)
+
+   A compiled XSLT 1.0 stylesheet.
+
+   :param stylesheet_xml: XSLT stylesheet source text.
+   :param exslt: Enable the supported EXSLT extension-function library.
+       Defaults to ``True`` for lxml compatibility.
+   :param max_depth: Maximum template-activation recursion depth. Defaults to
+       :data:`DEFAULT_MAX_XSLT_DEPTH`.
+
+   .. important::
+
+      Stylesheets should be trusted application configuration. The stylesheet
+      and source document are parsed with the native parser's safe resource
+      defaults, and XSLT recursion is capped by :data:`DEFAULT_MAX_XSLT_DEPTH`
+      unless you explicitly raise ``max_depth``. Set ``exslt=False`` when you do
+      not need EXSLT compatibility.
+
+   .. method:: transform(source_xml: str) -> str
+
+      Apply the compiled stylesheet to a source XML string and return the
+      serialized result.
+
+      .. code-block:: python
+
+         from pyuppsala import Xslt
+
+         sheet = Xslt(stylesheet_xml, exslt=False)
+         result = sheet.transform("<root/>")
+
 XsdRegex
 --------
 
@@ -1282,6 +1575,12 @@ XsdRegex
 
    :param max_depth: Maximum group-nesting depth applied at compile
        time. Defaults to :data:`DEFAULT_MAX_REGEX_GROUP_DEPTH`.
+
+   .. important::
+
+      ``max_depth=None`` uses :data:`DEFAULT_MAX_REGEX_GROUP_DEPTH`; raise it
+      only for trusted patterns. Use :meth:`is_match`'s ``max_steps`` to tighten
+      or, for trusted input, explicitly relax the per-match backtracking budget.
 
    Supported features: alternation (``|``), grouping, quantifiers
    (``*``, ``+``, ``?``, ``{n}``, ``{n,m}``), character classes with
@@ -1308,6 +1607,12 @@ XsdRegex
       :param max_steps: Maximum backtracking steps. Defaults to
           :data:`DEFAULT_MAX_REGEX_STEPS`. Returns ``False`` when the
           cap is reached, preventing catastrophic-backtracking ReDoS.
+
+      .. important::
+
+         ``max_steps=None`` uses :data:`DEFAULT_MAX_REGEX_STEPS`. Do not let
+         untrusted users raise this value; lowering it is safe when you want a
+         stricter per-match CPU budget.
 
       .. code-block:: python
 
