@@ -56,6 +56,11 @@ was never published; its changes ship here.)
   `fetch_many()` and `fetch_and_parse_many()` helpers no longer read local
   files without applying the caller's body-size cap; oversized local files now
   fail as per-item errors, matching oversized HTTP responses.
+- **Security: XInclude local file reads are now sandboxed and size-limited.**
+  Local `href` targets must remain within the including document's base
+  directory after symlink resolution, and every XInclude target is capped before
+  buffering so attacker-controlled XML cannot include arbitrary or oversized
+  local files.
 - **`etree` now rejects XML-incompatible strings at the API boundary**
   (lxml parity): setting text/tails, attribute values, comment/PI content,
   or namespace URIs (Clark keys, QNames, `nsmap`) containing NUL, C0 control

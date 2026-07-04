@@ -1354,8 +1354,10 @@ class _Element(_u._ElementBase):
         included document's root element; ``parse="text"`` inserts its text. A
         child ``xi:fallback`` provides content if the resource cannot be loaded.
         Relative ``href`` values resolve against the document's ``base_url``
-        (set by :func:`parse`); ``file`` URLs and filesystem paths are always
-        supported. Processing is recursive (included XML is itself scanned).
+        (set by :func:`parse`). Local ``file`` URLs and filesystem paths must
+        stay within the including document's base directory after symlink
+        resolution, and each include target is capped at an internal byte limit.
+        Processing is recursive (included XML is itself scanned).
 
         Remote ``http(s)``/``ftp`` targets are only fetched when
         ``network_access=True``. The default is off (matching lxml parsers'
@@ -2520,6 +2522,11 @@ XINCLUDE_NS = "http://www.w3.org/2001/XInclude"
 _XI_INCLUDE = "{%s}include" % XINCLUDE_NS
 _XI_FALLBACK = "{%s}fallback" % XINCLUDE_NS
 _XINCLUDE_MAX_DEPTH = 250
+# Maximum bytes read from one XInclude target. This keeps XML/text includes
+# from buffering attacker-selected local files or remote responses without
+# bound; callers who need larger includes should split or pre-load them through
+# an application-controlled resolver.
+_XINCLUDE_MAX_BYTES = 134_217_728
 # Seconds to wait on a remote XInclude fetch before giving up (anti-hang).
 _XINCLUDE_NETWORK_TIMEOUT = 30
 
@@ -2553,7 +2560,62 @@ def _xinclude_resolve(href, base_url):
     return href  # relative to the current working directory
 
 
-def _xinclude_read_bytes(resolved, allow_network=False):
+def _xinclude_local_base_dir(base_url):
+    """Return the directory that local XInclude targets must stay under."""
+    import urllib.parse
+    import urllib.request
+
+    if not base_url:
+        return os.getcwd()
+    parts = urllib.parse.urlparse(base_url)
+    if parts.scheme == "file":
+        if parts.netloc and parts.netloc not in ("", "localhost"):
+            raise XIncludeError("remote file URL bases are not supported")
+        path = urllib.request.url2pathname(parts.path)
+    elif parts.scheme in ("http", "https", "ftp"):
+        raise XIncludeError("local XInclude targets require a local base URL")
+    else:
+        path = base_url
+    return path if os.path.isdir(path) else os.path.dirname(path)
+
+
+def _xinclude_checked_local_path(resolved, base_url):
+    """Map a local XInclude target to a real path inside the base directory."""
+    import urllib.parse
+    import urllib.request
+
+    parts = urllib.parse.urlparse(resolved)
+    if parts.scheme == "file":
+        if parts.netloc and parts.netloc not in ("", "localhost"):
+            raise XIncludeError("remote file URLs are not supported")
+        path = urllib.request.url2pathname(parts.path)
+    else:
+        path = resolved
+    base_dir = os.path.realpath(_xinclude_local_base_dir(base_url))
+    target = os.path.realpath(os.path.abspath(path))
+    try:
+        inside = os.path.commonpath([base_dir, target]) == base_dir
+    except ValueError:
+        inside = False
+    if not inside:
+        raise XIncludeError(
+            "local XInclude target %r escapes base directory %r"
+            % (resolved, base_dir)
+        )
+    return target
+
+
+def _xinclude_read_limited(handle, label):
+    data = handle.read(_XINCLUDE_MAX_BYTES + 1)
+    if len(data) > _XINCLUDE_MAX_BYTES:
+        raise XIncludeError(
+            "XInclude target %r exceeds %d byte limit"
+            % (label, _XINCLUDE_MAX_BYTES)
+        )
+    return data
+
+
+def _xinclude_read_bytes(resolved, base_url, allow_network=False):
     """Fetch the bytes for a resolved XInclude target (http(s)/ftp/file/path)."""
     import urllib.parse
     import urllib.request
@@ -2573,13 +2635,10 @@ def _xinclude_read_bytes(resolved, allow_network=False):
         with urllib.request.urlopen(  # noqa: S310
             resolved, timeout=_XINCLUDE_NETWORK_TIMEOUT
         ) as response:
-            return response.read()
-    if parts.scheme == "file":
-        path = urllib.request.url2pathname(parts.path)
-        with open(path, "rb") as fh:
-            return fh.read()
-    with open(resolved, "rb") as fh:
-        return fh.read()
+            return _xinclude_read_limited(response, resolved)
+    path = _xinclude_checked_local_path(resolved, base_url)
+    with open(path, "rb") as fh:
+        return _xinclude_read_limited(fh, resolved)
 
 
 def _xinclude_insert_text(parent, idx, text):
@@ -2641,7 +2700,7 @@ def _expand_include(parent, include, base_url, depth, allow_network=False):
         if href is None:
             raise XIncludeError("xi:include without href is not supported")
         resolved = _xinclude_resolve(href, base_url)
-        data = _xinclude_read_bytes(resolved, allow_network)
+        data = _xinclude_read_bytes(resolved, base_url, allow_network)
     except (OSError, ValueError, XIncludeError) as exc:
         load_error = exc
 
