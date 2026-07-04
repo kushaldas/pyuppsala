@@ -193,10 +193,10 @@ Module-level functions
       trusted reason to raise them. ``max_threads`` controls local CPU
       concurrency; do not expose it as an attacker-controlled value.
 
- .. note::
+.. note::
 
-    The native fetch APIs require the extension to be built with the default-on
-    ``net`` feature. Check :data:`pyuppsala._HAS_NET` before using them.
+   The native fetch APIs require the extension to be built with the default-on
+   ``net`` feature. Check :data:`pyuppsala._HAS_NET` before using them.
 
 .. class:: FetchResult
 
