@@ -2121,6 +2121,31 @@ class TestFetchMany:
         ((fr, doc),) = pyuppsala.fetch_and_parse_many([f"file://{p}"])
         assert doc.document_element.tag.local_name == "f"
 
+    def test_file_url_max_body_cap_is_per_item_error(self, tmp_path):
+        """file:// reads must enforce the same max_body cap as HTTP bodies."""
+        big = tmp_path / "big.xml"
+        small = tmp_path / "small.xml"
+        big.write_bytes(b"<r>" + b"x" * 4096 + b"</r>")
+        small.write_bytes(b"<s/>")
+
+        res = pyuppsala.fetch_many(
+            [f"file://{big}", f"file://{small}"],
+            max_body=len(b"<s/>"),
+        )
+        assert isinstance(res[0], Exception)
+        assert "max_body" in str(res[0])
+        assert res[1].status == 200 and res[1].body == b"<s/>"
+
+        parsed = pyuppsala.fetch_and_parse_many(
+            [f"file://{big}", f"file://{small}"],
+            max_body=len(b"<s/>"),
+        )
+        assert isinstance(parsed[0], Exception)
+        assert "max_body" in str(parsed[0])
+        fr, doc = parsed[1]
+        assert fr.status == 200
+        assert doc.document_element.tag.local_name == "s"
+
     def test_empty_batch(self):
         # An empty URL list is a no-op: no threads, no results, no error.
         assert pyuppsala.fetch_many([]) == []

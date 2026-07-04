@@ -52,6 +52,10 @@ was never published; its changes ship here.)
   text before synthesizing inherited `xmlns` declarations, so a URI containing
   an entity-decoded quote cannot break out of the namespace attribute and
   inject a new attribute into the standalone fragment.
+- **Security: `file://` fetches now enforce `max_body`.** The native
+  `fetch_many()` and `fetch_and_parse_many()` helpers no longer read local
+  files without applying the caller's body-size cap; oversized local files now
+  fail as per-item errors, matching oversized HTTP responses.
 - **`etree` now rejects XML-incompatible strings at the API boundary**
   (lxml parity): setting text/tails, attribute values, comment/PI content,
   or namespace URIs (Clark keys, QNames, `nsmap`) containing NUL, C0 control
