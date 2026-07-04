@@ -3036,7 +3036,9 @@ impl XPathEvaluator {
     /// Evaluate an XPath expression and return the result.
     ///
     /// Returns a Python object: list of Nodes, bool, float, or str
-    /// depending on the XPath result type.
+    /// depending on the XPath result type. If a context node is supplied, it
+    /// must belong to ``doc`` because XPath context ``NodeId`` values are
+    /// document-scoped.
     #[pyo3(signature = (doc, expr, context=None))]
     fn evaluate<'py>(
         &self,
@@ -3045,14 +3047,18 @@ impl XPathEvaluator {
         expr: &str,
         context: Option<&Node>,
     ) -> PyResult<Py<PyAny>> {
+        let context_id = match context {
+            Some(n) => {
+                ensure_node_in_document(&doc.inner, n, "context")?;
+                Some(n.id)
+            }
+            None => None,
+        };
         let inner_doc = doc
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let ctx_id = match context {
-            Some(n) => n.id,
-            None => inner_doc.doc.root(),
-        };
+        let ctx_id = context_id.unwrap_or_else(|| inner_doc.doc.root());
         let result = self
             .inner
             .evaluate(&inner_doc.doc, ctx_id, expr)
@@ -3062,16 +3068,23 @@ impl XPathEvaluator {
     }
 
     /// Evaluate an XPath expression and return matching nodes.
+    ///
+    /// If a context node is supplied, it must belong to ``doc`` because XPath
+    /// context ``NodeId`` values are document-scoped.
     #[pyo3(signature = (doc, expr, context=None))]
     fn select(&self, doc: &Document, expr: &str, context: Option<&Node>) -> PyResult<Vec<Node>> {
+        let context_id = match context {
+            Some(n) => {
+                ensure_node_in_document(&doc.inner, n, "context")?;
+                Some(n.id)
+            }
+            None => None,
+        };
         let inner_doc = doc
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let ctx_id = match context {
-            Some(n) => n.id,
-            None => inner_doc.doc.root(),
-        };
+        let ctx_id = context_id.unwrap_or_else(|| inner_doc.doc.root());
         let nodes = self
             .inner
             .select_nodes(&inner_doc.doc, ctx_id, expr)
