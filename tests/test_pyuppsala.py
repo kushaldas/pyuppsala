@@ -887,6 +887,30 @@ class TestXPathEvaluator:
         assert len(nodes) == 1
         assert nodes[0].tag.local_name == "b"
 
+    def test_select_rejects_foreign_context_node(self):
+        """A foreign XPath context must not select a same-id node in doc."""
+        other = parse("<other><foreign/><ignored/></other>")
+        doc = parse("<root><public/><secret/></root>")
+        other.prepare_xpath()
+        doc.prepare_xpath()
+        xpath = XPathEvaluator()
+
+        with pytest.raises(ValueError, match="context.*different Document"):
+            xpath.select(doc, ".", context=other.document_element)
+        with pytest.raises(ValueError, match="context.*different Document"):
+            xpath.select(doc, ".", context=other.document_element.children[0])
+
+    def test_evaluate_rejects_foreign_context_node(self):
+        """Foreign XPath contexts must not redirect scalar evaluation."""
+        other = parse("<other><foreign/><ignored/></other>")
+        doc = parse("<root><public/><secret/></root>")
+        other.prepare_xpath()
+        doc.prepare_xpath()
+        xpath = XPathEvaluator()
+
+        with pytest.raises(ValueError, match="context.*different Document"):
+            xpath.evaluate(doc, "name(.)", context=other.document_element.children[0])
+
     def test_invalid_xpath(self):
         doc = parse("<root/>")
         doc.prepare_xpath()

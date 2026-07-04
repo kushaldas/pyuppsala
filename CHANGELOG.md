@@ -71,6 +71,9 @@ was never published; its changes ship here.)
   `insert_after()`, `remove_child()`, `replace_child()`, `detach()`, and
   `set_namespace_declaration()` before using their document-scoped node ids,
   preventing cross-document same-id confusion from mutating the wrong document.
+- **Security: `XPathEvaluator` now rejects foreign context nodes.** The native
+  binding validates an explicit context node belongs to the queried document
+  before using its document-scoped node id for `evaluate()` or `select()`.
 - **`etree` now rejects XML-incompatible strings at the API boundary**
   (lxml parity): setting text/tails, attribute values, comment/PI content,
   or namespace URIs (Clark keys, QNames, `nsmap`) containing NUL, C0 control
