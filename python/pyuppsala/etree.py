@@ -217,6 +217,17 @@ def _validate_prefix(prefix):
 _ILLEGAL_XML_CHARS_RE = re.compile(
     "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]"
 )
+_XML_ATTR_ESCAPE_RE = re.compile('[&"<\t\n\r]')
+_XML_ATTR_ESCAPE_TRANS = str.maketrans(
+    {
+        "&": "&amp;",
+        '"': "&quot;",
+        "<": "&lt;",
+        "\t": "&#9;",
+        "\n": "&#10;",
+        "\r": "&#13;",
+    }
+)
 
 
 def _check_xml_string(value):
@@ -234,6 +245,13 @@ def _check_xml_string(value):
             "no NULL bytes or control characters"
         )
     return value
+
+
+def _escape_xml_attr_value(value):
+    """Escape a string for use inside a double-quoted XML attribute value."""
+    if _XML_ATTR_ESCAPE_RE.search(value) is None:
+        return value
+    return value.translate(_XML_ATTR_ESCAPE_TRANS)
 
 
 def register_namespace(prefix, uri):
@@ -2065,7 +2083,9 @@ def _inject_inherited_namespaces(element, text):
     if not missing:
         return text
     decls = "".join(
-        ' xmlns="%s"' % uri if pfx is None else ' xmlns:%s="%s"' % (pfx, uri)
+        ' xmlns="%s"' % _escape_xml_attr_value(uri)
+        if pfx is None
+        else ' xmlns:%s="%s"' % (pfx, _escape_xml_attr_value(uri))
         for pfx, uri in missing
     )
     insert_at = _tostring_open_tag_end(text)
