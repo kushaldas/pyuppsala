@@ -3865,7 +3865,7 @@ fn build_agent(opts: &FetchOpts) -> ureq::Agent {
 fn fetch_one(agent: &ureq::Agent, url: &str, opts: &FetchOpts) -> Result<FetchOut, String> {
     let start = std::time::Instant::now();
     if let Some(path) = url.strip_prefix("file://") {
-        let body = std::fs::read(path).map_err(|e| format!("{}: {}", url, e))?;
+        let body = read_file_url_body(url, path, opts.max_body)?;
         return Ok(FetchOut {
             url: url.to_string(),
             status: 200,
@@ -3929,6 +3929,32 @@ fn fetch_one(agent: &ureq::Agent, url: &str, opts: &FetchOpts) -> Result<FetchOu
             Err(e) => return Err(e),
         }
     }
+}
+
+#[cfg(feature = "net")]
+fn read_file_url_body(url: &str, path: &str, max_body: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", url, e))?;
+    let mut body = Vec::new();
+    if max_body == u64::MAX {
+        let mut reader = file;
+        reader
+            .read_to_end(&mut body)
+            .map_err(|e| format!("{}: {}", url, e))?;
+    } else {
+        let mut reader = file.take(max_body + 1);
+        reader
+            .read_to_end(&mut body)
+            .map_err(|e| format!("{}: {}", url, e))?;
+        if body.len() as u64 > max_body {
+            return Err(format!(
+                "{}: body exceeds max_body of {} bytes",
+                url, max_body
+            ));
+        }
+    }
+    Ok(body)
 }
 
 /// Run the shared scoped-thread fan-out for a URL batch, entirely detached.
@@ -4014,7 +4040,7 @@ fn fetch_batch<R: Send>(
 /// ``verify_tls=False`` disables TLS certificate verification (pyFF fetches
 /// federation metadata this way and verifies XML signatures instead).
 ///
-/// Each HTTP response body is buffered fully in memory, capped at
+/// Each response body is buffered fully in memory, capped at
 /// ``max_body`` bytes (default 128 MiB -- comfortably above the largest
 /// federation metadata aggregates while bounding what an untrusted or
 /// misbehaving URL can allocate). A larger body fails with a per-item
