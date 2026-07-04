@@ -38,7 +38,9 @@ defaults when you need to.
    Default maximum number of nodes a single XPath evaluation may visit
    (currently 100,000). Bounds algorithmic-complexity denial-of-service on
    adversarial documents; override per-evaluator with the ``max_node_visits``
-   argument to :class:`XPathEvaluator`.
+   argument to :class:`XPathEvaluator`. The :mod:`pyuppsala.etree` compatibility
+   layer also uses this bounded value for ``.xpath()`` by default; raise
+   ``pyuppsala.etree.MAX_XPATH_NODE_VISITS`` only for trusted large documents.
 
 .. data:: DEFAULT_MAX_REGEX_GROUP_DEPTH
    :type: int
