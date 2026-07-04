@@ -1395,6 +1395,41 @@ class TestNamespaceSerializationAndCopy:
         # must reparse standalone (the bug that broke pyFF)
         P.fromstring(s)
 
+    def test_subelement_serialization_escapes_inherited_namespace_uri(self):
+        """Inherited prefixed namespace URIs must stay data when serialized.
+
+        The parser decodes ``&quot;`` in the ancestor's namespace declaration to a
+        literal quote. When a child is serialized standalone, etree synthesizes
+        that inherited ``xmlns:p`` declaration on the child. The URI must be
+        escaped for the new attribute context; otherwise the quote breaks out of
+        ``xmlns:p`` and creates a real attacker-controlled attribute.
+        """
+        root = P.fromstring(
+            '<root xmlns:p="urn:&quot; injected=&quot;yes"><p:child/></root>'
+        )
+        out = P.tostring(root[0], encoding="unicode")
+        assert out == '<p:child xmlns:p="urn:&quot; injected=&quot;yes"/>'
+        reparsed = P.fromstring(out)
+        assert reparsed.tag == '{urn:" injected="yes}child'
+        assert reparsed.get("injected") is None
+
+    def test_subelement_serialization_escapes_inherited_default_namespace_uri(self):
+        """The same quote breakout must be blocked for default namespaces.
+
+        Default namespace declarations are synthesized as ``xmlns="..."`` when
+        a descendant in the inherited default namespace is serialized by itself.
+        This covers that branch so both prefixed and unprefixed inherited
+        namespace declarations use the same attribute escaping.
+        """
+        root = P.fromstring(
+            '<root xmlns="urn:&quot; injected=&quot;yes"><child/></root>'
+        )
+        out = P.tostring(root[0], encoding="unicode")
+        assert out == '<child xmlns="urn:&quot; injected=&quot;yes"/>'
+        reparsed = P.fromstring(out)
+        assert reparsed.tag == '{urn:" injected="yes}child'
+        assert reparsed.get("injected") is None
+
     @requires_lxml
     def test_subelement_serialization_matches_lxml(self):
         ps = P.tostring(P.fromstring(self.DOC)[0], encoding="unicode")

@@ -47,6 +47,11 @@ was never published; its changes ship here.)
 
 ### Fixed
 
+- **Security: escaped inherited namespace URI values during sub-element
+  serialization.** Serializing a descendant element now escapes namespace URI
+  text before synthesizing inherited `xmlns` declarations, so a URI containing
+  an entity-decoded quote cannot break out of the namespace attribute and
+  inject a new attribute into the standalone fragment.
 - **`etree` now rejects XML-incompatible strings at the API boundary**
   (lxml parity): setting text/tails, attribute values, comment/PI content,
   or namespace URIs (Clark keys, QNames, `nsmap`) containing NUL, C0 control
