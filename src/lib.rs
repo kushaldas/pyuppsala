@@ -254,6 +254,23 @@ struct DocWithInput {
 
 type SharedDoc = Arc<Mutex<DocWithInput>>;
 
+/// Ensure a Python ``Node`` handle belongs to the receiver ``Document``.
+///
+/// Uppsala ``NodeId`` values are scoped to one document, but the Python binding
+/// exposes nodes as independent handles. Same-document mutators must reject a
+/// handle from another document before passing its numeric id into the receiver
+/// document, otherwise a colliding id could select and mutate the wrong node.
+fn ensure_node_in_document(doc: &SharedDoc, node: &Node, role: &str) -> PyResult<()> {
+    if Arc::ptr_eq(doc, &node.doc) {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{} belongs to a different Document",
+            role
+        )))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // QName - Python wrapper
 // ---------------------------------------------------------------------------
@@ -2671,7 +2688,12 @@ impl Document {
     }
 
     /// Append a child node to a parent node.
+    ///
+    /// Both node handles must come from this ``Document`` because the native
+    /// DOM interprets their ``NodeId`` values in the receiver document.
     fn append_child(&self, parent: &Node, child: &Node) -> PyResult<()> {
+        ensure_node_in_document(&self.inner, parent, "parent")?;
+        ensure_node_in_document(&self.inner, child, "child")?;
         let mut guard = self
             .inner
             .lock()
@@ -2744,7 +2766,8 @@ impl Document {
     /// in memory serialize with correct namespace declarations. Raises
     /// ValueError if `node` is not an element, or if the declaration is one the
     /// XML Namespaces spec reserves (the `xmlns` prefix, rebinding `xml`/the XML
-    /// namespace, or declaring the `xmlns` namespace).
+    /// namespace, or declaring the `xmlns` namespace). The node handle must
+    /// come from this ``Document`` because its ``NodeId`` is document-scoped.
     #[pyo3(signature = (node, prefix, uri))]
     fn set_namespace_declaration(
         &self,
@@ -2752,6 +2775,7 @@ impl Document {
         prefix: Option<&str>,
         uri: &str,
     ) -> PyResult<()> {
+        ensure_node_in_document(&self.inner, node, "node")?;
         let prefix = validate_prefix(prefix)?;
         validate_ns_declaration(prefix, uri)?;
         let mut guard = self
@@ -2779,7 +2803,13 @@ impl Document {
     }
 
     /// Insert a child node before a reference node.
+    ///
+    /// All three node handles must come from this ``Document`` because their
+    /// ``NodeId`` values are document-scoped.
     fn insert_before(&self, parent: &Node, new_child: &Node, reference: &Node) -> PyResult<()> {
+        ensure_node_in_document(&self.inner, parent, "parent")?;
+        ensure_node_in_document(&self.inner, new_child, "new_child")?;
+        ensure_node_in_document(&self.inner, reference, "reference")?;
         let mut guard = self
             .inner
             .lock()
@@ -2791,7 +2821,13 @@ impl Document {
     }
 
     /// Insert a child node after a reference node.
+    ///
+    /// All three node handles must come from this ``Document`` because their
+    /// ``NodeId`` values are document-scoped.
     fn insert_after(&self, parent: &Node, new_child: &Node, reference: &Node) -> PyResult<()> {
+        ensure_node_in_document(&self.inner, parent, "parent")?;
+        ensure_node_in_document(&self.inner, new_child, "new_child")?;
+        ensure_node_in_document(&self.inner, reference, "reference")?;
         let mut guard = self
             .inner
             .lock()
@@ -2803,7 +2839,12 @@ impl Document {
     }
 
     /// Remove a child node from its parent.
+    ///
+    /// Both node handles must come from this ``Document`` because the native
+    /// DOM interprets their ``NodeId`` values in the receiver document.
     fn remove_child(&self, parent: &Node, child: &Node) -> PyResult<()> {
+        ensure_node_in_document(&self.inner, parent, "parent")?;
+        ensure_node_in_document(&self.inner, child, "child")?;
         let mut guard = self
             .inner
             .lock()
@@ -2813,7 +2854,14 @@ impl Document {
     }
 
     /// Replace old_child with new_child under the given parent.
+    ///
+    /// All three node handles must come from this ``Document``. The native
+    /// DOM uses document-scoped ``NodeId`` values, so accepting a foreign
+    /// handle here would reinterpret that id inside the receiver document.
     fn replace_child(&self, parent: &Node, new_child: &Node, old_child: &Node) -> PyResult<()> {
+        ensure_node_in_document(&self.inner, parent, "parent")?;
+        ensure_node_in_document(&self.inner, new_child, "new_child")?;
+        ensure_node_in_document(&self.inner, old_child, "old_child")?;
         let mut guard = self
             .inner
             .lock()
@@ -2827,8 +2875,10 @@ impl Document {
     /// Detach a node from its parent, removing it from the tree.
     ///
     /// The node remains valid and can be re-attached elsewhere with
-    /// append_child, insert_before, or insert_after.
+    /// append_child, insert_before, or insert_after. The node handle must come
+    /// from this ``Document`` because its ``NodeId`` is document-scoped.
     fn detach(&self, node: &Node) -> PyResult<()> {
+        ensure_node_in_document(&self.inner, node, "node")?;
         let mut guard = self
             .inner
             .lock()
