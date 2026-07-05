@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable, Iterator, Optional, Union, overload
+from typing import Any, Callable, Iterable, Iterator, Optional, Protocol, Union, overload
 
 # Per-evaluation node-visit budget applied by ``_Element.xpath``. Defaults to
 # pyuppsala's native anti-DoS cap; raise only for trusted large documents.
@@ -47,11 +47,15 @@ class QName:
     def __hash__(self) -> int: ...
     def __eq__(self, other: object) -> bool: ...
 
+class _QNameLike(Protocol):
+    @property
+    def text(self) -> str: ...
+
 # ---------------------------------------------------------------------------
 # Elements
 # ---------------------------------------------------------------------------
 
-_TagName = Union[str, QName]
+_TagName = Union[str, QName, _QNameLike]
 
 class _Element:
     tag: Any

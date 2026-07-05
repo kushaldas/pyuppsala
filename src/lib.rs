@@ -3275,66 +3275,114 @@ impl IterparseEventSet {
     }
 }
 
-/// Owns the input buffer and a pull parser borrowing it.
-///
-/// PyO3 classes cannot express this self-reference safely. The boxed string's
-/// allocation is stable after construction, and `Drop` clears the parser before
-/// the string is dropped, so the transmuted parser lifetime never outlives the
-/// buffer in practice.
-struct OwnedPullParser {
-    parser: Option<UPullParser<'static>>,
-    _input: Box<str>,
+enum IterPullEvent {
+    StartNamespace {
+        prefix: Option<String>,
+        uri: String,
+    },
+    EndNamespace,
+    StartElement {
+        name: UQName<'static>,
+        attributes: Vec<uppsala::Attribute<'static>>,
+        namespace_declarations: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    },
+    EndElement {
+        name: UQName<'static>,
+    },
+    Text {
+        content: String,
+    },
+    CData {
+        content: String,
+    },
+    Comment {
+        content: String,
+    },
+    ProcessingInstruction {
+        pi: uppsala::ProcessingInstruction<'static>,
+    },
 }
 
-impl OwnedPullParser {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        input: String,
-        max_depth: Option<u32>,
-        max_entity_expansion: Option<usize>,
-        namespace_aware: Option<bool>,
-        forbid_dtd: Option<bool>,
-        forbid_entities: Option<bool>,
-    ) -> Self {
-        let input = input.into_boxed_str();
-        // SAFETY: `input` is stored in the same `OwnedPullParser` allocation and
-        // is not mutated or moved out. `Drop` takes `parser` before `input` is
-        // dropped, so the borrowed `&str` stays valid for every parser access.
-        let input_ref: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(&input) };
-        let mut parser = match namespace_aware {
-            Some(false) => UPullParser::with_namespace_aware(input_ref, false),
-            _ => UPullParser::new(input_ref),
-        };
-        if let Some(d) = max_depth {
-            parser = parser.with_max_depth(d);
-        }
-        if let Some(b) = max_entity_expansion {
-            parser = parser.with_max_entity_expansion(b);
-        }
-        if let Some(true) = forbid_dtd {
-            parser = parser.with_forbid_dtd(true);
-        }
-        if let Some(true) = forbid_entities {
-            parser = parser.with_forbid_entities(true);
-        }
-        OwnedPullParser {
-            parser: Some(parser),
-            _input: input,
-        }
+#[allow(clippy::too_many_arguments)]
+fn collect_iterparse_events(
+    input: &str,
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
+) -> XmlResult<VecDeque<IterPullEvent>> {
+    let mut parser = match namespace_aware {
+        Some(false) => UPullParser::with_namespace_aware(input, false),
+        _ => UPullParser::new(input),
+    };
+    if let Some(d) = max_depth {
+        parser = parser.with_max_depth(d);
+    }
+    if let Some(b) = max_entity_expansion {
+        parser = parser.with_max_entity_expansion(b);
+    }
+    if let Some(true) = forbid_dtd {
+        parser = parser.with_forbid_dtd(true);
+    }
+    if let Some(true) = forbid_entities {
+        parser = parser.with_forbid_entities(true);
     }
 
-    fn next_event(&mut self) -> XmlResult<Option<UPullEvent<'static>>> {
-        self.parser
-            .as_mut()
-            .expect("parser is present until drop")
-            .next_event()
+    let mut out = VecDeque::new();
+    while let Some(event) = parser.next_event()? {
+        match event {
+            UPullEvent::XmlDeclaration(_) | UPullEvent::Doctype(_) => {}
+            UPullEvent::StartNamespace { prefix, uri } => {
+                out.push_back(IterPullEvent::StartNamespace {
+                    prefix: prefix.map(|p| p.into_owned()),
+                    uri: uri.into_owned(),
+                });
+            }
+            UPullEvent::EndNamespace => out.push_back(IterPullEvent::EndNamespace),
+            UPullEvent::StartElement {
+                name,
+                attributes,
+                namespace_declarations,
+                ..
+            } => {
+                out.push_back(IterPullEvent::StartElement {
+                    name: name.into_static(),
+                    attributes: attributes.into_iter().map(|a| a.into_static()).collect(),
+                    namespace_declarations: namespace_declarations
+                        .into_iter()
+                        .map(|(p, u)| (Cow::Owned(p.into_owned()), Cow::Owned(u.into_owned())))
+                        .collect(),
+                });
+            }
+            UPullEvent::EndElement { name, .. } => {
+                out.push_back(IterPullEvent::EndElement {
+                    name: name.into_static(),
+                });
+            }
+            UPullEvent::Text { content, .. } => {
+                out.push_back(IterPullEvent::Text {
+                    content: content.into_owned(),
+                });
+            }
+            UPullEvent::CData { content, .. } => {
+                out.push_back(IterPullEvent::CData {
+                    content: content.into_owned(),
+                });
+            }
+            UPullEvent::Comment { content, .. } => {
+                out.push_back(IterPullEvent::Comment {
+                    content: content.into_owned(),
+                });
+            }
+            UPullEvent::ProcessingInstruction { pi, .. } => {
+                out.push_back(IterPullEvent::ProcessingInstruction {
+                    pi: pi.into_static(),
+                });
+            }
+        }
     }
-}
-
-impl Drop for OwnedPullParser {
-    fn drop(&mut self) {
-        let _ = self.parser.take();
-    }
+    Ok(out)
 }
 
 #[pyclass(name = "_IterParse")]
@@ -3344,7 +3392,7 @@ struct IterParse {
 }
 
 struct IterParseState {
-    pull: OwnedPullParser,
+    input_events: VecDeque<IterPullEvent>,
     doc: SharedDoc,
     stack: Vec<NodeId>,
     events: IterparseEventSet,
@@ -3354,7 +3402,6 @@ struct IterParseState {
     tag: Option<String>,
     root_id: Option<NodeId>,
     pending: VecDeque<IterYield>,
-    pending_error: Option<IterStepError>,
     done: bool,
 }
 
@@ -3413,17 +3460,22 @@ impl IterParse {
     ) -> PyResult<Self> {
         let event_set = IterparseEventSet::parse(events)?;
         let doc = shared_doc_from_holder(py, &holder)?;
-        Ok(IterParse {
-            holder,
-            state: Arc::new(Mutex::new(IterParseState {
-                pull: OwnedPullParser::new(
-                    input,
+        let input_events = py
+            .detach(move || {
+                collect_iterparse_events(
+                    &input,
                     max_depth,
                     max_entity_expansion,
                     namespace_aware,
                     forbid_dtd,
                     forbid_entities,
-                ),
+                )
+            })
+            .map_err(|e| IterStepError::Xml(e).into_pyerr(py))?;
+        Ok(IterParse {
+            holder,
+            state: Arc::new(Mutex::new(IterParseState {
+                input_events,
                 doc,
                 stack: Vec::new(),
                 events: event_set,
@@ -3433,7 +3485,6 @@ impl IterParse {
                 tag,
                 root_id: None,
                 pending: VecDeque::new(),
-                pending_error: None,
                 done: false,
             })),
         })
@@ -3552,60 +3603,38 @@ impl IterParseState {
         if let Some(yielded) = self.pending.pop_front() {
             return Ok(Some(yielded));
         }
-        if let Some(err) = self.pending_error.take() {
-            return Err(err);
-        }
         if self.done {
             return Ok(None);
         }
 
         while self.pending.len() < ITERPARSE_YIELD_BATCH {
-            let event = match self.pull.next_event() {
-                Ok(Some(event)) => event,
-                Ok(None) => {
+            let event = match self.input_events.pop_front() {
+                Some(event) => event,
+                None => {
                     self.done = true;
-                    break;
-                }
-                Err(err) => {
-                    let err = IterStepError::Xml(err);
-                    if self.pending.is_empty() {
-                        return Err(err);
-                    }
-                    self.pending_error = Some(err);
                     break;
                 }
             };
 
             match event {
-                UPullEvent::XmlDeclaration(_) | UPullEvent::Doctype(_) => {}
-                UPullEvent::StartNamespace { prefix, uri } => {
+                IterPullEvent::StartNamespace { prefix, uri } => {
                     if self.events.start_ns {
-                        self.pending.push_back(IterYield::Namespace {
-                            prefix: prefix.map(|p| p.into_owned()),
-                            uri: uri.into_owned(),
-                        });
+                        self.pending.push_back(IterYield::Namespace { prefix, uri });
                     }
                 }
-                UPullEvent::EndNamespace => {
+                IterPullEvent::EndNamespace => {
                     if self.events.end_ns {
                         self.pending.push_back(IterYield::EndNamespace);
                     }
                 }
-                UPullEvent::StartElement {
+                IterPullEvent::StartElement {
                     name,
                     attributes,
                     namespace_declarations,
-                    ..
                 } => {
-                    let name = name.into_static();
-                    let attrs = attributes.into_iter().map(|a| a.into_static()).collect();
-                    let ns_decls = namespace_declarations
-                        .into_iter()
-                        .map(|(p, u)| (Cow::Owned(p.into_owned()), Cow::Owned(u.into_owned())))
-                        .collect();
                     let should_yield = self.events.start
                         && IterParse::qname_matches_tag(&name, self.tag.as_deref());
-                    let id = self.append_start(name, attrs, ns_decls)?;
+                    let id = self.append_start(name, attributes, namespace_declarations)?;
                     if self.root_id.is_none() {
                         self.root_id = Some(id);
                     }
@@ -3617,8 +3646,7 @@ impl IterParseState {
                         });
                     }
                 }
-                UPullEvent::EndElement { name, .. } => {
-                    let name = name.into_static();
+                IterPullEvent::EndElement { name } => {
                     let id = self.stack.pop().ok_or_else(|| {
                         IterStepError::Runtime("iterparse element stack underflow".to_string())
                     })?;
@@ -3629,13 +3657,13 @@ impl IterParseState {
                         });
                     }
                 }
-                UPullEvent::Text { content, .. } => {
+                IterPullEvent::Text { content } => {
                     self.append_text(&content, false)?;
                 }
-                UPullEvent::CData { content, .. } => {
+                IterPullEvent::CData { content } => {
                     self.append_text(&content, true)?;
                 }
-                UPullEvent::Comment { content, .. } => {
+                IterPullEvent::Comment { content } => {
                     if !self.remove_comments {
                         let id = self.append_comment(&content)?;
                         if self.events.comment {
@@ -3646,9 +3674,9 @@ impl IterParseState {
                         }
                     }
                 }
-                UPullEvent::ProcessingInstruction { pi, .. } => {
+                IterPullEvent::ProcessingInstruction { pi } => {
                     if !self.remove_pis {
-                        let id = self.append_pi(pi.into_static())?;
+                        let id = self.append_pi(pi)?;
                         if self.events.pi {
                             self.pending.push_back(IterYield::Element {
                                 event_name: "pi",
