@@ -2946,6 +2946,7 @@ fn postprocess_parse_options_detached(
                 );
                 if remove {
                     doc.remove_child(parent, cid);
+                    release_detached_subtree_payload(doc, cid);
                     child = next;
                     continue;
                 }
@@ -2992,6 +2993,7 @@ fn coalesce_text_subtree(doc: &mut UDocument<'static>, root: NodeId) {
                             existing.to_mut().push_str(&text);
                         }
                         doc.remove_child(parent, cid);
+                        release_detached_subtree_payload(doc, cid);
                     } else {
                         run_head = Some(cid);
                     }
