@@ -540,8 +540,9 @@ def _standalone_clone(el):
 
 def _copy_to_holder(el, dst):
     """Copy ``el`` as a detached subtree into ``dst`` and return its proxy."""
-    dnode = _clone_node(dst, el._node)
-    _copy_inherited_ns(dst, el._node, dnode)
+    snode = el._node
+    dnode = _clone_node(dst, snode)
+    _copy_inherited_ns(dst, snode, dnode)
     return dst.proxy(dnode)
 
 
