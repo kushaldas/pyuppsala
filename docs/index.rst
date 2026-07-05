@@ -32,4 +32,3 @@ Features
    etree
    exceptions
    examples
-   adr/index
