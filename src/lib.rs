@@ -1,5 +1,5 @@
 use pyo3::create_exception;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyDict;
@@ -168,10 +168,14 @@ fn split_etree_key_py(key: &Bound<'_, PyAny>) -> PyResult<(Option<String>, Strin
     if let Ok(value) = key.extract::<&str>() {
         return split_etree_key_str(value);
     }
-    if let Ok(text) = key.getattr("text") {
-        if let Ok(value) = text.extract::<&str>() {
-            return split_etree_key_str(value);
+    match key.getattr("text") {
+        Ok(text) => {
+            if let Ok(value) = text.extract::<&str>() {
+                return split_etree_key_str(value);
+            }
         }
+        Err(err) if err.is_instance_of::<PyAttributeError>(key.py()) => {}
+        Err(err) => return Err(err),
     }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
         "Invalid etree key {:?}",
@@ -2727,10 +2731,14 @@ fn desc_filter_from_py_tag(tag: Option<&Bound<'_, PyAny>>) -> PyResult<DescFilte
     if let Ok(value) = tag.extract::<&str>() {
         return Ok(DescFilter::parse(Some(value)));
     }
-    if let Ok(text) = tag.getattr("text") {
-        if let Ok(value) = text.extract::<&str>() {
-            return Ok(DescFilter::parse(Some(value)));
+    match tag.getattr("text") {
+        Ok(text) => {
+            if let Ok(value) = text.extract::<&str>() {
+                return Ok(DescFilter::parse(Some(value)));
+            }
         }
+        Err(err) if err.is_instance_of::<PyAttributeError>(tag.py()) => {}
+        Err(err) => return Err(err),
     }
     Err(PyTypeError::new_err(format!("Invalid tag name {:?}", tag)))
 }

@@ -974,6 +974,30 @@ class TestStandalone:
         assert "Invalid etree key" in msg
         assert "tag" not in msg.lower()
 
+    def test_attribute_key_text_getter_errors_propagate(self):
+        """Non-AttributeError failures from key.text should be preserved."""
+
+        class BadQNameLike:
+            @property
+            def text(self):
+                raise RuntimeError("text exploded")
+
+        root = P.fromstring("<r/>")
+        with pytest.raises(RuntimeError, match="text exploded"):
+            root.get(BadQNameLike())
+
+    def test_tag_filter_text_getter_errors_propagate(self):
+        """Non-AttributeError failures from tag.text should be preserved."""
+
+        class BadQNameLike:
+            @property
+            def text(self):
+                raise RuntimeError("tag text exploded")
+
+        root = P.fromstring("<r><a/></r>")
+        with pytest.raises(RuntimeError, match="tag text exploded"):
+            root.fast_count(BadQNameLike())
+
     def test_fast_bulk_scans_match_iter_and_exact_attributes(self):
         root = P.fromstring(
             "<r>"

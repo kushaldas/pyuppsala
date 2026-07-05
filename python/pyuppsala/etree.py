@@ -2041,7 +2041,11 @@ def _normalize_iterparse_events(events):
 
 
 def iterparse(source, events=("end",), parser=None, tag=None):
-    """Incrementally parse ``source`` and yield ``(event, element)`` pairs."""
+    """Parse ``source`` and yield ``(event, element)`` pairs.
+
+    The current implementation reads the full input before native event parsing;
+    it does not provide lxml-style streaming I/O memory behavior.
+    """
     opts = parser._opts if parser is not None else {}
     kw = _parse_kwargs(opts)
     event_list = _normalize_iterparse_events(events)
