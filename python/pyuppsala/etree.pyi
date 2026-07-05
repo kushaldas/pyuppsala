@@ -81,16 +81,16 @@ class _Element:
     def fast_count(self, tag: Optional[_TagName] = None) -> int: ...
     def fast_has(self, tag: Optional[_TagName] = None) -> bool: ...
     def fast_sum_int_attr(
-        self, key: _TagName, tag: Optional[_TagName] = None
+        self, key: _KeyName, tag: Optional[_TagName] = None
     ) -> int: ...
     def fast_collect_attr(
-        self, key: _TagName, tag: Optional[_TagName] = None
+        self, key: _KeyName, tag: Optional[_TagName] = None
     ) -> list[str]: ...
     def fast_collect_grouped_text(
         self,
         group_tag: _TagName,
         item_tag: _TagName,
-        key: _TagName,
+        key: _KeyName,
         value_tag: _TagName,
     ) -> list[tuple[Optional[str], list[str]]]: ...
     # sequence protocol

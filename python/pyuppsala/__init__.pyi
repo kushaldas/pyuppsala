@@ -378,6 +378,14 @@ class Document:
     def discard_input(self) -> None:
         """Drop the retained source text used by input_text/source helpers."""
         ...
+    def postprocess_parse_options(
+        self,
+        remove_comments: bool,
+        remove_pis: bool,
+        strip_cdata: bool,
+    ) -> None:
+        """Apply etree XMLParser post-parse transforms natively."""
+        ...
     @property
     def doctype(self) -> Optional[str]:
         """The raw ``<!DOCTYPE ...>`` declaration preserved from the source, or None.
