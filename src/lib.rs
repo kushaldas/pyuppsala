@@ -125,11 +125,18 @@ fn validate_ncname(value: &str, what: &str) -> PyResult<()> {
     )
 }
 
+/// Validate string content that will be stored in XML text, attributes, or URI
+/// slots before serialization.
+///
+/// Python ``str`` values can carry code points that XML 1.0 cannot represent.
+/// Rejecting them at the binding boundary keeps the DOM and its own serialized
+/// output consistent with lxml-style API behavior. Rust ``char`` values are
+/// already Unicode scalar values, so surrogate code points are impossible here.
 fn check_xml_string_compatible(value: &str) -> PyResult<()> {
     if value.chars().any(|c| {
         matches!(
             c as u32,
-            0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xD800..=0xDFFF | 0xFFFE | 0xFFFF
+            0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xFFFE | 0xFFFF
         )
     }) {
         Err(PyValueError::new_err(
@@ -140,6 +147,15 @@ fn check_xml_string_compatible(value: &str) -> PyResult<()> {
     }
 }
 
+/// Return the Python ``repr(obj)`` text for error messages.
+fn py_repr_string(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    Ok(obj.repr()?.to_string_lossy().into_owned())
+}
+
+/// Split an etree key in Clark notation into ``(namespace_uri, local_name)``.
+///
+/// This helper is shared by tag-like values and attribute keys. ``{}local`` is
+/// normalized to the no-namespace case to match lxml behavior.
 fn split_etree_key_str(value: &str) -> PyResult<(Option<String>, String)> {
     if let Some(rest) = value.strip_prefix('{') {
         let Some((uri, local)) = rest.split_once('}') else {
@@ -164,6 +180,11 @@ fn split_etree_key_str(value: &str) -> PyResult<(Option<String>, String)> {
     }
 }
 
+/// Parse a Python etree key from a string or QName-like object.
+///
+/// Missing ``.text`` is treated as "not QName-like"; exceptions raised by a
+/// ``.text`` descriptor are propagated so user code is not hidden behind a
+/// generic type error.
 fn split_etree_key_py(key: &Bound<'_, PyAny>) -> PyResult<(Option<String>, String)> {
     if let Ok(value) = key.extract::<&str>() {
         return split_etree_key_str(value);
@@ -177,9 +198,10 @@ fn split_etree_key_py(key: &Bound<'_, PyAny>) -> PyResult<(Option<String>, Strin
         Err(err) if err.is_instance_of::<PyAttributeError>(key.py()) => {}
         Err(err) => return Err(err),
     }
+    let key_repr = py_repr_string(key)?;
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "Invalid etree key {:?}",
-        key
+        "Invalid etree key {}",
+        key_repr
     )))
 }
 
@@ -2721,6 +2743,11 @@ impl DescFilter {
     }
 }
 
+/// Convert an optional etree tag filter into the native descendant-walk filter.
+///
+/// Accepts ``None``, strings, and QName-like objects exposing string ``.text``.
+/// Missing ``.text`` means "not QName-like"; other ``.text`` access failures are
+/// returned unchanged.
 fn desc_filter_from_py_tag(tag: Option<&Bound<'_, PyAny>>) -> PyResult<DescFilter> {
     let Some(tag) = tag else {
         return Ok(DescFilter::All);
@@ -2740,7 +2767,11 @@ fn desc_filter_from_py_tag(tag: Option<&Bound<'_, PyAny>>) -> PyResult<DescFilte
         Err(err) if err.is_instance_of::<PyAttributeError>(tag.py()) => {}
         Err(err) => return Err(err),
     }
-    Err(PyTypeError::new_err(format!("Invalid tag name {:?}", tag)))
+    let tag_repr = py_repr_string(tag)?;
+    Err(PyTypeError::new_err(format!(
+        "Invalid tag name {}",
+        tag_repr
+    )))
 }
 
 #[derive(Debug)]

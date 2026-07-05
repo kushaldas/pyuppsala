@@ -974,6 +974,15 @@ class TestStandalone:
         assert "Invalid etree key" in msg
         assert "tag" not in msg.lower()
 
+        class ReprKey:
+            def __repr__(self):
+                return "<bad-key>"
+
+        with pytest.raises(TypeError) as excinfo:
+            root.get(ReprKey())
+        msg = str(excinfo.value)
+        assert "Invalid etree key <bad-key>" in msg
+
     def test_attribute_key_text_getter_errors_propagate(self):
         """Non-AttributeError failures from key.text should be preserved."""
 
@@ -997,6 +1006,18 @@ class TestStandalone:
         root = P.fromstring("<r><a/></r>")
         with pytest.raises(RuntimeError, match="tag text exploded"):
             root.fast_count(BadQNameLike())
+
+    def test_tag_filter_errors_use_python_repr(self):
+        """Invalid tag filters should use the Python repr in errors."""
+
+        class ReprTag:
+            def __repr__(self):
+                return "<bad-tag>"
+
+        root = P.fromstring("<r><a/></r>")
+        with pytest.raises(TypeError) as excinfo:
+            root.fast_count(ReprTag())
+        assert "Invalid tag name <bad-tag>" in str(excinfo.value)
 
     def test_fast_bulk_scans_match_iter_and_exact_attributes(self):
         root = P.fromstring(
