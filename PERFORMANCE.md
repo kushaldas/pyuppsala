@@ -124,12 +124,14 @@ lxml).
 
 ### Cycle 13 (2026-07-04) -- fastree bulk scans
 
-**pyuppsala: native pull-backed `iterparse` baseline.** `etree.iterparse()` now builds
-only the active subtree stack from uppsala pull events and yields cached `_Element`
-proxies. Parser options (`remove_comments`, `remove_pis`, `strip_cdata`) apply while the
-subtree is built, before skipped nodes allocate Python proxies. The iterator batches
-detached parsing work, so syntax scanning and subtree construction run with the GIL
-released; event tuple/proxy creation still happens attached.
+**pyuppsala: native pull-backed `iterparse` baseline.** `etree.iterparse()` reads the
+full input before iteration, collects owned pull-parser events, then replays those
+events into the backing document while yielding cached `_Element` proxies. Parser
+options (`remove_comments`, `remove_pis`, `strip_cdata`) apply during native replay,
+before skipped nodes allocate Python proxies. The upfront syntax scan and each replay
+batch run with the GIL released, but this is not a streaming-memory implementation by
+default: the document tree grows as events are replayed unless callers clear/detach
+completed elements or drop the iterator/document.
 
 `Element.clear()` is intentionally lxml-compatible: detached children and tail text
 remain valid if Python or low-level `Node` handles still reference them. In the current
