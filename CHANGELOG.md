@@ -27,6 +27,10 @@ Built against the uppsala 0.9.0 release from crates.io.
   and reparsing.
 - **`Element.clear(keep_tail=...)` now preserves tail text when requested**,
   matching the lxml-compatible clear semantics.
+- **`Element.clear()` keeps detached child payloads intact** when callers still
+  hold references, matching lxml/ElementTree behavior. Because the native DOM is
+  arena-backed, clearing unlinks those subtrees but does not scrub their text or
+  attributes for memory reclamation until the owning document is dropped.
 
 ## 0.8.0
 

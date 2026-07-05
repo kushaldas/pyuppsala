@@ -244,6 +244,17 @@ that text, and does not expose the intermediate elements. Use ``iter()``,
 string values, predicates, mutation, sibling/tail handling, or lxml-compatible
 source portability.
 
+``Element.clear()`` follows lxml/ElementTree held-reference semantics: it
+removes children, attributes, text, and optionally tail text from the element,
+but detached child nodes remain valid if Python or low-level ``Node`` handles
+still reference them. Because the native DOM is arena-backed, this also means
+``clear()`` unlinks detached subtrees but does not scrub their stored text,
+attributes, or namespace declarations for memory reclamation. In iterparse
+loops, use ``clear()`` to keep the visible tree small; drop the whole parsed
+document/iterator to release the arena. ``XMLParser(compact=True)`` only
+discards the retained source buffer after parsing, not payloads kept alive by
+detached nodes.
+
 Supported features
 ------------------
 

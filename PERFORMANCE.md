@@ -131,6 +131,12 @@ subtree is built, before skipped nodes allocate Python proxies. The iterator bat
 detached parsing work, so syntax scanning and subtree construction run with the GIL
 released; event tuple/proxy creation still happens attached.
 
+`Element.clear()` is intentionally lxml-compatible: detached children and tail text
+remain valid if Python or low-level `Node` handles still reference them. In the current
+arena-backed DOM that means `clear()` unlinks nodes but does not scrub detached subtree
+payloads for memory reclamation; memory is released when the owning document/iterator is
+dropped. `XMLParser(compact=True)` only drops the retained source buffer after parsing.
+
 **pyuppsala: Rust-bulk extension methods.** `_Element.fast_count(tag=None)`,
 `_Element.fast_sum_int_attr(key, tag=None)` and
 `_Element.fast_collect_attr(key, tag=None)` run the whole descendant walk under one

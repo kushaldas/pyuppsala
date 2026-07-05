@@ -1885,7 +1885,9 @@ impl ElementBase {
     ///
     /// Mirrors lxml's `clear(keep_tail=False)` shape. Detached children remain
     /// valid with their existing payloads so held references can be reused or
-    /// reattached elsewhere.
+    /// reattached elsewhere. This unlinks nodes but does not reclaim detached
+    /// subtree payload memory; that stays owned by the backing document until
+    /// the document is dropped or an internal cleanup path explicitly scrubs it.
     #[pyo3(signature = (*, keep_tail=false))]
     fn clear(slf: &Bound<'_, Self>, keep_tail: bool) -> PyResult<()> {
         let (doc, id) = {
