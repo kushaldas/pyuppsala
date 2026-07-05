@@ -144,12 +144,12 @@ fn split_etree_key_str(value: &str) -> PyResult<(Option<String>, String)> {
     if let Some(rest) = value.strip_prefix('{') {
         let Some((uri, local)) = rest.split_once('}') else {
             return Err(PyValueError::new_err(format!(
-                "Invalid tag name {:?}",
+                "Invalid etree key {:?}",
                 value
             )));
         };
         check_xml_string_compatible(uri)?;
-        validate_ncname(local, "tag")?;
+        validate_ncname(local, "etree key")?;
         Ok((
             if uri.is_empty() {
                 None
@@ -159,7 +159,7 @@ fn split_etree_key_str(value: &str) -> PyResult<(Option<String>, String)> {
             local.to_string(),
         ))
     } else {
-        validate_ncname(value, "tag")?;
+        validate_ncname(value, "etree key")?;
         Ok((None, value.to_string()))
     }
 }
@@ -174,7 +174,7 @@ fn split_etree_key_py(key: &Bound<'_, PyAny>) -> PyResult<(Option<String>, Strin
         }
     }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "Invalid tag name {:?}",
+        "Invalid etree key {:?}",
         key
     )))
 }

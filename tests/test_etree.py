@@ -958,6 +958,22 @@ class TestStandalone:
         assert el.get("k") is None
         assert el.keys() == ["{http://a}k"]
 
+    def test_attribute_key_errors_use_neutral_wording(self):
+        """Attribute-key validation errors should not describe keys as tags."""
+        root = P.fromstring("<r/>")
+
+        with pytest.raises(ValueError) as excinfo:
+            root.get("{urn")
+        msg = str(excinfo.value)
+        assert "Invalid etree key" in msg
+        assert "tag" not in msg.lower()
+
+        with pytest.raises(TypeError) as excinfo:
+            root.get(object())
+        msg = str(excinfo.value)
+        assert "Invalid etree key" in msg
+        assert "tag" not in msg.lower()
+
     def test_fast_bulk_scans_match_iter_and_exact_attributes(self):
         root = P.fromstring(
             "<r>"
