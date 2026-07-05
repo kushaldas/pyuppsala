@@ -936,6 +936,40 @@ class TestStandalone:
         assert a.items() == []
         assert P.tostring(root, encoding="unicode") == "<r><a/>after<c/></r>"
 
+    def test_clear_preserves_detached_child_payload(self):
+        """clear should not wipe data from children still referenced by callers."""
+        root = P.fromstring('<r><a x="1">t<b y="2">inner<c/>deep</b>tail</a></r>')
+        a = root[0]
+        b = a[0]
+        child = b[0]
+
+        a.clear()
+
+        assert b.getparent() is None
+        assert b.tag == "b"
+        assert b.get("y") == "2"
+        assert b.text == "inner"
+        assert child.tag == "c"
+        assert child.tail == "deep"
+
+        root.append(b)
+        assert P.tostring(root, encoding="unicode") == (
+            '<r><a/><b y="2">inner<c/>deep</b></r>'
+        )
+
+    def test_clear_preserves_detached_tail_node_payload(self):
+        """clear should detach following tail nodes without clearing their text."""
+        root = P.fromstring("<r><a/>tail<c/></r>")
+        a = root[0]
+        tail_node = a._node.next_sibling
+
+        assert tail_node.text == "tail"
+        a.clear()
+
+        assert a.tail is None
+        assert tail_node.parent is None
+        assert tail_node.text == "tail"
+
     def test_namespaced_attribute_delete_is_exact(self):
         # Two attributes share a local name in different namespaces; deleting one
         # via Clark notation must not remove the other.

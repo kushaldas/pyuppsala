@@ -378,7 +378,6 @@ fn clear_following_tail(doc: &mut UDocument<'static>, node: NodeId) {
         }
         sibling = doc.next_sibling(id);
         doc.detach(id);
-        release_detached_subtree_payload(doc, id);
     }
 }
 
@@ -386,7 +385,6 @@ fn clear_element_contents(doc: &mut UDocument<'static>, node: NodeId, keep_tail:
     let children = doc.children(node);
     for child in children {
         doc.detach(child);
-        release_detached_subtree_payload(doc, child);
     }
     if let Some(kind) = doc.node_kind_mut(node) {
         match kind {
@@ -1885,10 +1883,9 @@ impl ElementBase {
 
     /// Remove all children, attributes and text from this element.
     ///
-    /// Mirrors lxml's `clear(keep_tail=False)` shape. Descendant payloads are
-    /// dropped after unlinking so streaming `iterparse` users can release large
-    /// text and attribute values as they go; the arena slots themselves remain
-    /// reusable future work in the native DOM.
+    /// Mirrors lxml's `clear(keep_tail=False)` shape. Detached children remain
+    /// valid with their existing payloads so held references can be reused or
+    /// reattached elsewhere.
     #[pyo3(signature = (*, keep_tail=false))]
     fn clear(slf: &Bound<'_, Self>, keep_tail: bool) -> PyResult<()> {
         let (doc, id) = {
