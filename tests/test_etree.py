@@ -1835,6 +1835,16 @@ class TestIterparse:
         byte_events = list(P.iterparse(io.BytesIO(b"<r><a/></r>")))
         assert byte_events[-1][1].tag == "r"
 
+    def test_empty_namespace_clark_tag_filter(self):
+        """iterparse tag filters should treat '{}local' as no namespace."""
+        events = list(
+            P.iterparse(
+                io.BytesIO(b"<r xmlns:p='urn:p'><a/><p:a/><a/></r>"),
+                tag="{}a",
+            )
+        )
+        assert [elem.tag for event, elem in events] == ["a", "a"]
+
     def test_yielded_elements_can_be_cleared(self):
         seen = []
         for event, elem in P.iterparse(

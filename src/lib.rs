@@ -3471,7 +3471,12 @@ impl IterParse {
                     && tag.as_bytes().get(1 + ns.len()) == Some(&b'}')
                     && &tag[2 + ns.len()..] == name.local_name.as_ref()
             }
-            _ => tag == name.local_name.as_ref(),
+            _ => {
+                tag == name.local_name.as_ref()
+                    || tag
+                        .strip_prefix("{}")
+                        .is_some_and(|local| local == name.local_name.as_ref())
+            }
         }
     }
 }
