@@ -297,6 +297,14 @@ def _make_clark(namespace_uri, local):
 def _clark_of(tag):
     if isinstance(tag, QName):
         return tag.text
+    if not isinstance(tag, str):
+        try:
+            text = tag.text
+        except AttributeError:
+            raise TypeError("Invalid tag name %r" % (tag,)) from None
+        if isinstance(text, str):
+            return text
+        raise TypeError("Invalid tag name %r" % (tag,))
     return tag
 
 

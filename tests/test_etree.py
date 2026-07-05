@@ -1845,6 +1845,29 @@ class TestIterparse:
         )
         assert [elem.tag for event, elem in events] == ["a", "a"]
 
+    def test_qname_like_tag_filter(self):
+        """iterparse should accept QName-like tag filters with string .text."""
+
+        class QNameLike:
+            text = "a"
+
+        events = list(P.iterparse(io.BytesIO(b"<r><a/><b/><a/></r>"), tag=QNameLike()))
+        assert [elem.tag for event, elem in events] == ["a", "a"]
+
+    def test_qname_like_tag_filter_rejects_non_string_text(self):
+        """iterparse should reject QName-like tag filters with non-string .text."""
+
+        class BadQNameLike:
+            text = 42
+
+        with pytest.raises(TypeError, match="Invalid tag name"):
+            list(P.iterparse(io.BytesIO(b"<r><a/></r>"), tag=BadQNameLike()))
+
+    def test_iterparse_rejects_non_string_tag_filter(self):
+        """iterparse should reject tag filters without string or .text input."""
+        with pytest.raises(TypeError, match="Invalid tag name"):
+            list(P.iterparse(io.BytesIO(b"<r><a/></r>"), tag=object()))
+
     def test_yielded_elements_can_be_cleared(self):
         seen = []
         for event, elem in P.iterparse(
