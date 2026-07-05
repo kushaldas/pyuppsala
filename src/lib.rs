@@ -1773,7 +1773,8 @@ impl ElementBase {
     /// returning the Clark string directly, with no Python frame and no
     /// intermediate `QName`. Comment and processing-instruction nodes return the
     /// `Comment` / `ProcessingInstruction` factory (so `elem.tag is Comment`
-    /// identifies a comment, matching lxml); any other kind returns `None`.
+    /// identifies a comment, matching lxml); any other valid non-element kind
+    /// returns `None`.
     #[getter(tag)]
     fn get_tag(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Element fast path: return the interned Clark string from the
@@ -1808,6 +1809,7 @@ impl ElementBase {
                 non_element_kind = match guard.doc.node_kind(id) {
                     Some(NodeKind::Comment(_)) => 1,
                     Some(NodeKind::ProcessingInstruction(_)) => 2,
+                    None => 3,
                     _ => 0,
                 };
                 missed = None;
@@ -1831,6 +1833,7 @@ impl ElementBase {
         match non_element_kind {
             1 => registered_factory(py, &COMMENT_FACTORY),
             2 => registered_factory(py, &PI_FACTORY),
+            3 => Err(PyValueError::new_err("Invalid node")),
             _ => Ok(py.None()),
         }
     }

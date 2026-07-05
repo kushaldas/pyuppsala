@@ -664,6 +664,12 @@ class TestStandalone:
         with pytest.raises(TypeError):
             P.XMLParser(unexpected=True)
 
+    def test_tag_getter_rejects_invalid_node(self):
+        root = P.fromstring("<a/>")
+        root._id = 10**9
+        with pytest.raises(ValueError, match="Invalid node"):
+            root.tag
+
     def test_remove_comments(self):
         parser = P.XMLParser(remove_comments=True)
         root = P.fromstring("<a><!--x--><b/></a>", parser)
