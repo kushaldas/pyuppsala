@@ -375,6 +375,9 @@ class Document:
         Returns an empty string for programmatically constructed documents.
         """
         ...
+    def discard_input(self) -> None:
+        """Drop the retained source text used by input_text/source helpers."""
+        ...
     @property
     def doctype(self) -> Optional[str]:
         """The raw ``<!DOCTYPE ...>`` declaration preserved from the source, or None.

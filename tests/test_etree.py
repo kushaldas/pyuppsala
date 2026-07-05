@@ -7,6 +7,7 @@ covers pyuppsala-specific behavior (security limits, unsupported parser
 options, exception identity) that should not depend on lxml.
 """
 
+import io
 import sys
 
 import pytest
@@ -915,6 +916,26 @@ class TestStandalone:
         with pytest.raises(ValueError):
             root.index(b, 0, -2)  # range excludes index 1
 
+    def test_clear_removes_children_attributes_text_and_tail(self):
+        root = P.fromstring('<r><a x="1">t<b/>tail</a>after<c/></r>')
+        a = root[0]
+        a.clear()
+        assert a.text is None
+        assert a.tail is None
+        assert len(a) == 0
+        assert a.items() == []
+        assert P.tostring(root, encoding="unicode") == "<r><a/><c/></r>"
+
+    def test_clear_can_keep_tail(self):
+        root = P.fromstring('<r><a x="1">t<b/>tail</a>after<c/></r>')
+        a = root[0]
+        a.clear(keep_tail=True)
+        assert a.text is None
+        assert a.tail == "after"
+        assert len(a) == 0
+        assert a.items() == []
+        assert P.tostring(root, encoding="unicode") == "<r><a/>after<c/></r>"
+
     def test_namespaced_attribute_delete_is_exact(self):
         # Two attributes share a local name in different namespaces; deleting one
         # via Clark notation must not remove the other.
@@ -936,6 +957,62 @@ class TestStandalone:
         del el.attrib["k"]  # removes only the no-namespace one
         assert el.get("k") is None
         assert el.keys() == ["{http://a}k"]
+
+    def test_fast_bulk_scans_match_iter_and_exact_attributes(self):
+        root = P.fromstring(
+            "<r>"
+            "<item id='1'/>"
+            "<skip/>"
+            "<item id='2' xmlns:p='urn:p' p:id='20'/>"
+            "<!--comment--><?pi value?>"
+            "</r>"
+        )
+
+        assert root.fast_count() == len(list(root.iter()))
+        assert root.fast_count("item") == 2
+        assert root.fast_count(P.QName("item")) == 2
+        assert root.fast_count("*") == 4
+        assert root.fast_has("item") is True
+        assert root.fast_has(P.QName("item")) is True
+        assert root.fast_has("missing") is False
+        assert root.fast_has("*") is True
+        assert root.fast_sum_int_attr("id", "item") == 3
+        assert root.fast_sum_int_attr("missing", "item") == 0
+        assert root.fast_collect_attr("id", "item") == ["1", "2"]
+        assert root.fast_collect_attr("missing", "item") == []
+        assert root.fast_collect_attr(P.QName("urn:p", "id"), "item") == ["20"]
+
+    def test_fast_collect_grouped_text_matches_nested_iter_shape(self):
+        root = P.fromstring(
+            "<md:EntityDescriptor "
+            "xmlns:md='urn:oasis:names:tc:SAML:2.0:metadata' "
+            "xmlns:mdattr='urn:oasis:names:tc:SAML:metadata:attribute' "
+            "xmlns:saml='urn:oasis:names:tc:SAML:2.0:assertion'>"
+            "<md:Extensions>"
+            "<mdattr:EntityAttributes>"
+            "<saml:Attribute Name='category'>"
+            "<saml:AttributeValue> one </saml:AttributeValue>"
+            "<saml:AttributeValue>two</saml:AttributeValue>"
+            "</saml:Attribute>"
+            "<saml:Attribute>"
+            "<saml:AttributeValue> missing-name </saml:AttributeValue>"
+            "</saml:Attribute>"
+            "</mdattr:EntityAttributes>"
+            "</md:Extensions>"
+            "</md:EntityDescriptor>"
+        )
+
+        assert root.fast_collect_grouped_text(
+            "{urn:oasis:names:tc:SAML:metadata:attribute}EntityAttributes",
+            "{urn:oasis:names:tc:SAML:2.0:assertion}Attribute",
+            "Name",
+            "{urn:oasis:names:tc:SAML:2.0:assertion}AttributeValue",
+        ) == [("category", ["one", "two"]), (None, ["missing-name"])]
+
+    def test_fast_sum_int_attr_rejects_non_integer_values(self):
+        root = P.fromstring("<r><item n='1'/><item n='x'/></r>")
+        with pytest.raises(ValueError, match="not a valid integer"):
+            root.fast_sum_int_attr("n", "item")
 
     def test_constructed_xml_names_are_validated(self):
         # XML names are serialized as markup, so invalid names must be rejected
@@ -1618,3 +1695,97 @@ class TestFromstringMany:
         results = ET.fromstring_many([object(), "<r>\xe9</r>".encode("latin-1")], parser=p)
         assert isinstance(results[0], TypeError)
         assert results[1].text == "é"
+
+
+class TestIterparse:
+    def test_default_event_is_end(self):
+        events = list(P.iterparse(io.BytesIO(b"<r><a>1</a><b/></r>")))
+        assert [(event, elem.tag) for event, elem in events] == [
+            ("end", "a"),
+            ("end", "b"),
+            ("end", "r"),
+        ]
+        assert events[0][1].text == "1"
+        assert P.tostring(events[-1][1], encoding="unicode") == "<r><a>1</a><b/></r>"
+
+    def test_start_end_order(self):
+        events = list(P.iterparse(io.BytesIO(b"<r><a/></r>"), events=("start", "end")))
+        assert [(event, elem.tag) for event, elem in events] == [
+            ("start", "r"),
+            ("start", "a"),
+            ("end", "a"),
+            ("end", "r"),
+        ]
+
+    def test_namespace_events(self):
+        events = list(
+            P.iterparse(
+                io.BytesIO(b'<r xmlns="urn:d" xmlns:p="urn:p"><p:a/></r>'),
+                events=("start-ns", "end-ns"),
+            )
+        )
+        assert events[:2] == [("start-ns", (None, "urn:d")), ("start-ns", ("p", "urn:p"))]
+        assert events[-2:] == [("end-ns", None), ("end-ns", None)]
+
+    def test_comment_and_pi_events(self):
+        events = list(
+            P.iterparse(
+                io.BytesIO(b"<r><!--c--><?go x?></r>"),
+                events=("comment", "pi"),
+            )
+        )
+        assert events[0][0] == "comment"
+        assert events[0][1].tag is P.Comment
+        assert events[0][1].text == "c"
+        assert events[1][0] == "pi"
+        assert events[1][1].tag is P.ProcessingInstruction
+        assert events[1][1].text == "x"
+
+    def test_parser_options_apply_while_streaming(self):
+        parser = P.XMLParser(remove_comments=True, strip_cdata=True)
+        events = list(
+            P.iterparse(
+                io.BytesIO(b"<r>a<!--gone--><![CDATA[b]]>c</r>"),
+                events=("comment", "end"),
+                parser=parser,
+            )
+        )
+        assert [(event, elem.tag) for event, elem in events] == [("end", "r")]
+        assert events[0][1].text == "abc"
+        assert P.tostring(events[0][1], encoding="unicode") == "<r>abc</r>"
+
+    def test_strip_cdata_false_preserves_cdata_node(self):
+        parser = P.XMLParser(strip_cdata=False)
+        (event, root) = list(
+            P.iterparse(io.BytesIO(b"<r>a<![CDATA[b]]>c</r>"), parser=parser)
+        )[-1]
+        assert event == "end"
+        assert root.text == "abc"
+        assert P.tostring(root, encoding="unicode") == "<r>a<![CDATA[b]]>c</r>"
+
+    def test_sources_and_tag_filter(self, tmp_path):
+        path = tmp_path / "doc.xml"
+        path.write_bytes(b"<r><a/><b/><a/></r>")
+        assert [elem.tag for event, elem in P.iterparse(path, tag="a")] == ["a", "a"]
+
+        text_events = list(P.iterparse(io.StringIO("<r><a/></r>")))
+        assert text_events[-1][1].tag == "r"
+
+        byte_events = list(P.iterparse(io.BytesIO(b"<r><a/></r>")))
+        assert byte_events[-1][1].tag == "r"
+
+    def test_yielded_elements_can_be_cleared(self):
+        seen = []
+        for event, elem in P.iterparse(
+            io.BytesIO(b"<r><item><v>1</v></item><item><v>2</v></item></r>"),
+            tag="item",
+        ):
+            assert event == "end"
+            seen.append(elem[0].text)
+            elem.clear()
+            assert P.tostring(elem, encoding="unicode") == "<item/>"
+        assert seen == ["1", "2"]
+
+    def test_iterparse_syntax_error_is_etree_exception(self):
+        with pytest.raises(P.XMLSyntaxError):
+            list(P.iterparse(io.BytesIO(b"<r><a></r>")))

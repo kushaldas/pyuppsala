@@ -1,6 +1,10 @@
 # Changelog
 
 
+## 0.9.0
+
+Built against the uppsala 0.9.0 release from crates.io.
+
 ## 0.8.0
 
 Performance + feature release, built against uppsala 0.8. (An interim 0.7.2

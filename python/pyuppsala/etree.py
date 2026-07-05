@@ -39,6 +39,7 @@ __all__ = [
     "fromstringlist",
     "XML",
     "parse",
+    "iterparse",
     "tostring",
     "tounicode",
     "dump",
@@ -95,6 +96,8 @@ class XMLSyntaxError(LxmlError, SyntaxError):
 
 # ElementTree code commonly catches ``ParseError``.
 ParseError = XMLSyntaxError
+
+_u._register_etree_exceptions(XMLSyntaxError)
 
 
 class XPathError(LxmlError):
@@ -521,6 +524,19 @@ def _clone_node(dst, snode):
     return dst.doc.import_subtree(snode)
 
 
+def _standalone_clone(el):
+    """Return ``el`` as a detached subtree in a fresh document."""
+    dst = _DocHolder(_u.Document.empty())
+    return _copy_to_holder(el, dst)
+
+
+def _copy_to_holder(el, dst):
+    """Copy ``el`` as a detached subtree into ``dst`` and return its proxy."""
+    dnode = _clone_node(dst, el._node)
+    _copy_inherited_ns(dst, el._node, dnode)
+    return dst.proxy(dnode)
+
+
 def _copy_inherited_ns(dst, snode, dnode):
     """Declare on ``dnode`` the namespaces ``snode`` inherits from its ancestors.
 
@@ -845,30 +861,6 @@ class _Element(_u._ElementBase):
         self._holder.doc.set_namespace_declaration(self._node, pfx, ns)
         return pfx
 
-    def _attr_clark(self, a):
-        """Return an attribute's name in Clark ``{uri}local`` notation."""
-        n = a.name
-        return _make_clark(n.namespace_uri, n.local_name)
-
-    def get(self, key, default=None):
-        """Return the attribute value for ``key`` (str or QName), or ``default``.
-
-        A plain key matches the attribute with *no* namespace; a Clark
-        ``{uri}local`` key (or QName) matches that exact namespace. An attribute
-        in a different namespace that shares the local name is not returned.
-        """
-        ns, local = _split_key(key)
-        if ns is None:
-            # Plain key: match the no-namespace attribute exactly, rather than
-            # the first attribute with this local name in any namespace.
-            for a in self._node.attributes:
-                an = a.name
-                if an.local_name == local and an.namespace_uri is None:
-                    return a.value
-            return default
-        v = self._node.get_attribute(local, ns)
-        return v if v is not None else default
-
     def set(self, key, value):
         """Set attribute ``key`` (str or QName) to ``value``.
 
@@ -881,18 +873,6 @@ class _Element(_u._ElementBase):
         if ns:
             prefix = self._ensure_ns_prefix(ns)
         self._node.set_attribute(local, value, ns, prefix)
-
-    def keys(self):
-        """Return the attribute names (Clark notation) in document order."""
-        return [self._attr_clark(a) for a in self._node.attributes]
-
-    def values(self):
-        """Return the attribute values in document order."""
-        return [a.value for a in self._node.attributes]
-
-    def items(self):
-        """Return ``(name, value)`` attribute pairs in document order."""
-        return [(self._attr_clark(a), a.value) for a in self._node.attributes]
 
     # -- children / sequence protocol ------------------------------------
     # Only element/comment/PI children participate; text/CDATA are surfaced via
@@ -1188,31 +1168,16 @@ class _Element(_u._ElementBase):
     def __deepcopy__(self, memo):
         """Return a detached deep copy of this element and its subtree.
 
-        Serializing (with inherited namespace declarations) and reparsing yields
-        an independent element in a fresh document, matching lxml, where
-        ``copy.deepcopy(element)`` produces a standalone subtree. The copy carries
-        no parent and no tail.
+        The copy is imported natively into a fresh document and carries inherited
+        namespace declarations needed to serialize standalone. It has no parent
+        and no tail, matching lxml's subtree copy behavior.
         """
-        return fromstring(tostring(self, encoding="unicode"))
+        return _standalone_clone(self)
 
     # -- navigation -------------------------------------------------------
 
     # getparent() is provided natively by ElementBase (parent lookup + proxy
     # cache in one native call); do not shadow it here.
-
-    def getnext(self):
-        """Return the next sibling element (skipping text nodes), or None."""
-        n = self._node.next_sibling
-        while n is not None and n.kind in _TEXT_KINDS:
-            n = n.next_sibling
-        return self._holder.proxy(n) if n is not None else None
-
-    def getprevious(self):
-        """Return the previous sibling element (skipping text nodes), or None."""
-        n = self._node.previous_sibling
-        while n is not None and n.kind in _TEXT_KINDS:
-            n = n.previous_sibling
-        return self._holder.proxy(n) if n is not None else None
 
     def itersiblings(self, tag=None, preceding=False):
         """Yield following (or, with ``preceding=True``, preceding) sibling
@@ -1786,6 +1751,7 @@ class XMLParser:
             "namespace_aware": namespace_aware,
             "forbid_dtd": forbid_dtd,
             "forbid_entities": forbid_entities,
+            "compact": compact,
             # Honored for byte input: overrides the document's declared encoding
             # by decoding in Python before parsing (see fromstring).
             "encoding": encoding,
@@ -1814,6 +1780,19 @@ def _parse_kwargs(opts):
 
 def _postprocess(holder, opts):
     """Apply post-parse tree transforms requested by XMLParser options."""
+    native = getattr(holder.doc, "postprocess_parse_options", None)
+    if native is not None:
+        native(
+            bool(opts.get("remove_comments")),
+            bool(opts.get("remove_pis")),
+            bool(opts.get("strip_cdata", True)),
+        )
+        if opts.get("compact", True):
+            discard = getattr(holder.doc, "discard_input", None)
+            if discard is not None:
+                discard()
+        return
+
     root = holder.doc.document_element
     if root is None:
         return
@@ -1834,6 +1813,10 @@ def _postprocess(holder, opts):
         # Merge them so .text/.tail expose a single contiguous run, matching
         # lxml where the removed/converted node does not split plain text.
         _coalesce_text(holder, root)
+    if opts.get("compact", True):
+        discard = getattr(holder.doc, "discard_input", None)
+        if discard is not None:
+            discard()
 
 
 def _strip_kinds(holder, node, remove_comments, remove_pis):
@@ -2047,6 +2030,60 @@ def parse(source, parser=None, base_url=None):
             base_url = base_url.decode("utf-8", "replace")
     el._holder.base_url = base_url
     return _ElementTree(el._holder, el._node)
+
+
+def _normalize_iterparse_events(events):
+    if events is None:
+        return ["end"]
+    if isinstance(events, str):
+        return [events]
+    return list(events)
+
+
+def iterparse(source, events=("end",), parser=None, tag=None):
+    """Incrementally parse ``source`` and yield ``(event, element)`` pairs."""
+    opts = parser._opts if parser is not None else {}
+    kw = _parse_kwargs(opts)
+    event_list = _normalize_iterparse_events(events)
+    tag = _clark_of(tag) if tag is not None else None
+
+    data = _read_source(source)
+    holder = _DocHolder(_u.Document.empty())
+    if isinstance(source, (str, bytes, os.PathLike)):
+        base_url = os.fspath(source)
+        if isinstance(base_url, bytes):
+            base_url = base_url.decode("utf-8", "replace")
+        holder.base_url = base_url
+
+    common = {
+        **kw,
+        "remove_comments": opts.get("remove_comments", False),
+        "remove_pis": opts.get("remove_pis", False),
+        "strip_cdata": opts.get("strip_cdata", True),
+        "tag": tag,
+    }
+    encoding = opts.get("encoding")
+    try:
+        if isinstance(data, str):
+            native = _u.iterparse_text(data, holder, event_list, **common)
+        else:
+            data = bytes(data)
+            if encoding:
+                decoded = data.decode(encoding)
+                if decoded[:1] == "\ufeff":
+                    decoded = decoded[1:]
+                native = _u.iterparse_text(decoded, holder, event_list, **common)
+            else:
+                native = _u.iterparse_bytes(data, holder, event_list, **common)
+    except (LookupError, UnicodeDecodeError) as e:
+        raise XMLSyntaxError(str(e)) from e
+    except (
+        _u.XmlParseError,
+        _u.XmlWellFormednessError,
+        _u.XmlNamespaceError,
+    ) as e:
+        raise XMLSyntaxError(str(e)) from e
+    return native
 
 
 def _tostring_open_tag_end(text):
