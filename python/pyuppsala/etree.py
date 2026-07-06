@@ -36,6 +36,7 @@ __all__ = [
     "DocInfo",
     # I/O
     "fromstring",
+    "fromstring_many",
     "fromstringlist",
     "XML",
     "parse",
@@ -46,6 +47,7 @@ __all__ = [
     "indent",
     "iselement",
     # Search
+    "MAX_XPATH_NODE_VISITS",
     "XPath",
     "ETXPath",
     "XPathEvaluator",

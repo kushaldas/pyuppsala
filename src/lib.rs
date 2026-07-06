@@ -232,10 +232,11 @@ const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 ///
 /// Returns the normalized prefix (empty string mapped to `None`). A prefix is
 /// only meaningful alongside a namespace URI, so a prefix supplied without a
-/// namespace is rejected rather than being silently dropped. The XML
-/// Namespaces reserved bindings are enforced too, so a QName cannot use the
-/// `xmlns` prefix, rebind the `xml` prefix or XML namespace, or sit in the
-/// `xmlns` namespace - all of which would serialize to invalid XML.
+/// namespace is rejected rather than being silently dropped. The namespace URI
+/// must be XML-compatible text when present. The XML Namespaces reserved
+/// bindings are enforced too, so a QName cannot use the `xmlns` prefix, rebind
+/// the `xml` prefix or XML namespace, or sit in the `xmlns` namespace - all of
+/// which would serialize to invalid XML.
 fn validate_qname_parts<'a>(
     namespace_uri: Option<&str>,
     prefix: Option<&'a str>,
@@ -250,6 +251,7 @@ fn validate_qname_parts<'a>(
             }
         }
         Some(ns) => {
+            check_xml_string_compatible(ns)?;
             if prefix == Some("xmlns") {
                 return Err(PyValueError::new_err(
                     "the \"xmlns\" prefix is reserved and cannot be used as a name prefix",
@@ -275,11 +277,13 @@ fn validate_qname_parts<'a>(
     Ok(prefix)
 }
 
-/// Reject `xmlns` declarations that the XML Namespaces spec forbids: the
-/// reserved `xmlns` prefix, rebinding the `xml` prefix or XML namespace to
-/// anything else, and declaring the `xmlns` namespace at all. These would
-/// otherwise serialize to invalid XML or clobber the standard `xml` binding.
+/// Reject non-XML-compatible namespace declaration URIs and `xmlns`
+/// declarations that the XML Namespaces spec forbids: the reserved `xmlns`
+/// prefix, rebinding the `xml` prefix or XML namespace to anything else, and
+/// declaring the `xmlns` namespace at all. These would otherwise serialize to
+/// invalid XML or clobber the standard `xml` binding.
 fn validate_ns_declaration(prefix: Option<&str>, uri: &str) -> PyResult<()> {
+    check_xml_string_compatible(uri)?;
     if prefix == Some("xmlns") {
         return Err(PyValueError::new_err(
             "the \"xmlns\" prefix is reserved and cannot be declared",
@@ -763,7 +767,9 @@ impl Node {
         }
     }
 
-    /// Set an attribute value. Returns the previous value if any.
+    /// Set an attribute with XML-compatible value and namespace URI.
+    ///
+    /// Returns the previous value if any.
     #[pyo3(signature = (name, value, namespace_uri=None, prefix=None))]
     fn set_attribute(
         &self,
@@ -772,14 +778,15 @@ impl Node {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<Option<String>> {
-        validate_ncname(name, "attribute")?;
-        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(self.id) {
             Some(el) => {
+                validate_ncname(name, "attribute")?;
+                check_xml_string_compatible(value)?;
+                let prefix = validate_qname_parts(namespace_uri, prefix)?;
                 let qname = match (namespace_uri, prefix) {
                     (Some(ns), Some(p)) => {
                         UQName::full(p.to_string(), ns.to_string(), name.to_string())
@@ -1132,7 +1139,8 @@ impl Node {
     /// Set the content of a Text, CDATA, or Comment node in place.
     ///
     /// Raises ValueError for other node kinds. Used by the etree layer to assign
-    /// element `.text`/`.tail` and comment text without recreating nodes.
+    /// element `.text`/`.tail` and comment text without recreating nodes. The
+    /// content must be XML-compatible text.
     fn set_text(&self, content: &str) -> PyResult<()> {
         let mut guard = self
             .doc
@@ -1140,14 +1148,17 @@ impl Node {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.node_kind_mut(self.id) {
             Some(NodeKind::Text(t)) => {
+                check_xml_string_compatible(content)?;
                 *t = std::borrow::Cow::Owned(content.to_string());
                 Ok(())
             }
             Some(NodeKind::CData(t)) => {
+                check_xml_string_compatible(content)?;
                 *t = std::borrow::Cow::Owned(content.to_string());
                 Ok(())
             }
             Some(NodeKind::Comment(t)) => {
+                check_xml_string_compatible(content)?;
                 *t = std::borrow::Cow::Owned(content.to_string());
                 Ok(())
             }
@@ -1198,7 +1209,9 @@ impl Node {
         }
     }
 
-    /// Set the data of a ProcessingInstruction node. Raises ValueError otherwise.
+    /// Set the XML-compatible data of a ProcessingInstruction node.
+    ///
+    /// Raises ValueError otherwise.
     #[pyo3(signature = (data=None))]
     fn set_pi_data(&self, data: Option<&str>) -> PyResult<()> {
         let mut guard = self
@@ -1207,6 +1220,9 @@ impl Node {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.node_kind_mut(self.id) {
             Some(NodeKind::ProcessingInstruction(pi)) => {
+                if let Some(data) = data {
+                    check_xml_string_compatible(data)?;
+                }
                 pi.data = data.map(|d| std::borrow::Cow::Owned(d.to_string()));
                 Ok(())
             }
@@ -1218,8 +1234,9 @@ impl Node {
 
     /// Rename an element node's qualified name in place.
     ///
-    /// Raises ValueError if the node is not an element. Used by the etree layer
-    /// for `element.tag = ...` assignment.
+    /// Raises ValueError if the node is not an element. The namespace URI must
+    /// be XML-compatible text when present. Used by the etree layer for
+    /// `element.tag = ...` assignment.
     #[pyo3(signature = (local_name, namespace_uri=None, prefix=None))]
     fn set_qname(
         &self,
@@ -1227,14 +1244,14 @@ impl Node {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<()> {
-        validate_ncname(local_name, "element")?;
-        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(self.id) {
             Some(el) => {
+                validate_ncname(local_name, "element")?;
+                let prefix = validate_qname_parts(namespace_uri, prefix)?;
                 el.name = match (namespace_uri, prefix) {
                     (Some(ns), Some(p)) => {
                         UQName::full(p.to_string(), ns.to_string(), local_name.to_string())
@@ -3998,6 +4015,8 @@ impl Document {
     // -- Tree mutation -------------------------------------------------------
 
     /// Create a new element node (not yet attached to the tree).
+    ///
+    /// The namespace URI must be XML-compatible text when present.
     #[pyo3(signature = (local_name, namespace_uri=None, prefix=None))]
     fn create_element(
         &self,
@@ -4025,8 +4044,9 @@ impl Document {
         })
     }
 
-    /// Create a new text node (not yet attached to the tree).
+    /// Create a new text node from XML-compatible text (not yet attached to the tree).
     fn create_text(&self, text: &str) -> PyResult<Node> {
+        check_xml_string_compatible(text)?;
         let mut guard = self
             .inner
             .lock()
@@ -4038,8 +4058,9 @@ impl Document {
         })
     }
 
-    /// Create a new comment node (not yet attached to the tree).
+    /// Create a new comment node from XML-compatible text (not yet attached to the tree).
     fn create_comment(&self, text: &str) -> PyResult<Node> {
+        check_xml_string_compatible(text)?;
         let mut guard = self
             .inner
             .lock()
@@ -4051,8 +4072,9 @@ impl Document {
         })
     }
 
-    /// Create a new CDATA section node (not yet attached to the tree).
+    /// Create a new CDATA section node from XML-compatible text (not yet attached to the tree).
     fn create_cdata(&self, text: &str) -> PyResult<Node> {
+        check_xml_string_compatible(text)?;
         let mut guard = self
             .inner
             .lock()
@@ -4064,9 +4086,13 @@ impl Document {
         })
     }
 
-    /// Create a new processing instruction node (not yet attached to the tree).
+    /// Create a new processing instruction node with XML-compatible data (not yet
+    /// attached to the tree).
     fn create_processing_instruction(&self, target: &str, data: Option<&str>) -> PyResult<Node> {
         validate_pi_target(target)?;
+        if let Some(data) = data {
+            check_xml_string_compatible(data)?;
+        }
         let mut guard = self
             .inner
             .lock()
@@ -4156,7 +4182,8 @@ impl Document {
     /// Add or replace an `xmlns` declaration on an element node.
     ///
     /// `prefix=None` sets the default namespace (`xmlns="uri"`); otherwise sets
-    /// `xmlns:prefix="uri"`. Used by the etree layer so namespaced trees built
+    /// `xmlns:prefix="uri"`. The URI must be XML-compatible text. Used by the
+    /// etree layer so namespaced trees built
     /// in memory serialize with correct namespace declarations. Raises
     /// ValueError if `node` is not an element, or if the declaration is one the
     /// XML Namespaces spec reserves (the `xmlns` prefix, rebinding `xml`/the XML
@@ -4170,14 +4197,14 @@ impl Document {
         uri: &str,
     ) -> PyResult<()> {
         ensure_node_in_document(&self.inner, node, "node")?;
-        let prefix = validate_prefix(prefix)?;
-        validate_ns_declaration(prefix, uri)?;
         let mut guard = self
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(node.id) {
             Some(el) => {
+                let prefix = validate_prefix(prefix)?;
+                validate_ns_declaration(prefix, uri)?;
                 let p = prefix.unwrap_or("");
                 match el
                     .namespace_declarations

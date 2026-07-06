@@ -248,6 +248,64 @@ class TestDocument:
         with pytest.raises(ValueError):  # XML namespace under a different prefix
             el.set_attribute("a", "v", namespace_uri=self.XML_NS, prefix="other")
 
+    def test_native_mutators_reject_xml_incompatible_strings(self):
+        """Native DOM entry points must reject XML-incompatible stored strings."""
+        doc = Document.empty()
+        bad = "\x05"
+        bad_ns = f"urn:{bad}"
+
+        with pytest.raises(ValueError, match="XML compatible"):
+            doc.create_element("item", namespace_uri=bad_ns, prefix="p")
+        with pytest.raises(ValueError, match="XML compatible"):
+            doc.create_text(bad)
+        with pytest.raises(ValueError, match="XML compatible"):
+            doc.create_comment(bad)
+        with pytest.raises(ValueError, match="XML compatible"):
+            doc.create_cdata(bad)
+        with pytest.raises(ValueError, match="XML compatible"):
+            doc.create_processing_instruction("target", bad)
+        with pytest.raises(ValueError, match="XML compatible"):
+            QName("item", namespace_uri=bad_ns, prefix="p")
+
+        root = doc.create_element("root")
+        with pytest.raises(ValueError, match="XML compatible"):
+            doc.set_namespace_declaration(root, "p", bad_ns)
+        with pytest.raises(ValueError, match="XML compatible"):
+            root.set_attribute("key", bad)
+        with pytest.raises(ValueError, match="XML compatible"):
+            root.set_attribute("key", "value", namespace_uri=bad_ns, prefix="p")
+        with pytest.raises(ValueError, match="XML compatible"):
+            root.set_qname("item", namespace_uri=bad_ns, prefix="p")
+
+        text = doc.create_text("ok")
+        with pytest.raises(ValueError, match="XML compatible"):
+            text.set_text(bad)
+
+        pi = doc.create_processing_instruction("target", None)
+        with pytest.raises(ValueError, match="XML compatible"):
+            pi.set_pi_data(bad)
+
+    def test_native_wrong_kind_errors_precede_string_validation(self):
+        """Wrong node kind errors should win before validating unused strings."""
+        doc = Document.empty()
+        root = doc.create_element("root")
+        text = doc.create_text("ok")
+        bad = "\x05"
+        bad_ns = f"urn:{bad}"
+
+        with pytest.raises(ValueError, match="Node is not an element"):
+            text.set_attribute("key", bad)
+        with pytest.raises(ValueError, match="Node is not an element"):
+            text.set_attribute("key", "value", namespace_uri=bad_ns, prefix="p")
+        with pytest.raises(ValueError, match="Node is not an element"):
+            text.set_qname("item", namespace_uri=bad_ns, prefix="p")
+        with pytest.raises(ValueError, match="Node is not an element"):
+            doc.set_namespace_declaration(text, "p", bad_ns)
+        with pytest.raises(ValueError, match="Node is not a text, cdata, or comment node"):
+            root.set_text(bad)
+        with pytest.raises(ValueError, match="Node is not a processing instruction"):
+            root.set_pi_data(bad)
+
     def test_append_child(self):
         doc = parse("<root/>")
         child = doc.create_element("child")
