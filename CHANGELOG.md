@@ -1,6 +1,37 @@
 # Changelog
 
 
+## 0.9.0
+
+Built against the uppsala 0.9.0 release from crates.io.
+
+### Added
+
+- **Native `etree.iterparse()`** backed by Uppsala pull-parser events. The
+  compatibility wrapper yields lxml-style `(event, element)` pairs for start,
+  end, comment, PI, start-ns, and end-ns events.
+- **Native etree bulk scan helpers**: `_Element.fast_has()` and
+  `_Element.fast_collect_grouped_text()`, complementing the existing
+  `fast_count()`, `fast_sum_int_attr()`, and `fast_collect_attr()` helpers.
+  These methods keep fixed-shape scans in Rust and avoid materializing a Python
+  proxy for every matching descendant.
+
+### Changed
+
+- **`XMLParser(compact=True)` now discards retained source text** after etree
+  parse-time cleanup, lowering memory use for long-lived lxml-compatible trees.
+  Pass `compact=False` when source-inspection helpers must retain the decoded
+  input buffer.
+- **`copy.deepcopy(element)` now imports the subtree natively** into a fresh
+  document and copies inherited namespace declarations instead of serializing
+  and reparsing.
+- **`Element.clear(keep_tail=...)` now preserves tail text when requested**,
+  matching the lxml-compatible clear semantics.
+- **`Element.clear()` keeps detached child payloads intact** when callers still
+  hold references, matching lxml/ElementTree behavior. Because the native DOM is
+  arena-backed, clearing unlinks those subtrees but does not scrub their text or
+  attributes for memory reclamation until the owning document is dropped.
+
 ## 0.8.0
 
 Performance + feature release, built against uppsala 0.8. (An interim 0.7.2

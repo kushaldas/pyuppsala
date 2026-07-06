@@ -122,7 +122,71 @@ lxml).
   default-on `net` cargo feature: `maturin build --no-default-features` produces a
   network-free extension (verified to build and import; `pyuppsala._HAS_NET` reflects it).
 
+### Cycle 13 (2026-07-04) -- fastree bulk scans
+
+**pyuppsala: native pull-backed `iterparse` baseline.** `etree.iterparse()` reads the
+full input before iteration, collects owned pull-parser events, then replays those
+events into the backing document while yielding cached `_Element` proxies. Parser
+options (`remove_comments`, `remove_pis`, `strip_cdata`) apply during native replay,
+before skipped nodes allocate Python proxies. The upfront syntax scan and each replay
+batch run with the GIL released, but this is not a streaming-memory implementation by
+default: the document tree grows as events are replayed unless callers clear/detach
+completed elements or drop the iterator/document.
+
+`Element.clear()` is intentionally lxml-compatible: detached children and tail text
+remain valid if Python or low-level `Node` handles still reference them. In the current
+arena-backed DOM that means `clear()` unlinks nodes but does not scrub detached subtree
+payloads for memory reclamation; memory is released when the owning document/iterator is
+dropped. `XMLParser(compact=True)` only drops the retained source buffer after parsing.
+
+**pyuppsala: Rust-bulk extension methods.** `_Element.fast_count(tag=None)`,
+`_Element.fast_sum_int_attr(key, tag=None)` and
+`_Element.fast_collect_attr(key, tag=None)` run the whole descendant walk under one
+document lock with the GIL released. They reuse the same tag semantics as
+`Element.iter()`, but do not materialise one Python `_Element` per match. `fast_count`
+and `fast_sum_int_attr` allocate no per-node Python objects; `fast_collect_attr` still
+allocates the returned strings/list because that is the requested result.
+
+Current perf diagnosis: plain lxml-shaped Python loops remain slower mainly because
+every matching node crosses the extension boundary and often touches proxy creation,
+`.tag`, `.get()` or Python allocation. The bulk methods show the expected direction:
+when the loop body stays in Rust, pyuppsala is at or ahead of lxml for count/tag/sum
+work on the generated corpus.
+
 ## Current numbers
+
+### fastree generated corpus checkpoint
+
+Command: `uv run python benchmarks/fastree_bench.py --budget 0.35` after
+`uv run maturin develop --release`. Environment: CPython 3.14, lxml 6.1.1,
+pyuppsala `fastree` branch using local `../uppsala`.
+
+Ratio = pyuppsala / lxml wall; lower is better. `py fast` is the Rust-bulk extension
+method where one exists.
+
+corpus: 5,000 items, 0.58 MiB
+
+| operation | pyuppsala | py fast | lxml | py/lxml | fast/lxml |
+|---|---:|---:|---:|---:|---:|
+| `fromstring` | 9.840 ms | - | 8.513 ms | 1.16x | - |
+| `count iter(item)` | 2.046 ms | 0.297 ms | 0.600 ms | 3.41x | 0.50x |
+| `count iter()+tag` | 8.334 ms | 0.297 ms | 2.563 ms | 3.25x | 0.12x |
+| `sum int get(id)` | 3.684 ms | 0.376 ms | 1.893 ms | 1.95x | 0.20x |
+| `collect get(id)` | 3.276 ms | 0.708 ms | 1.429 ms | 2.29x | 0.50x |
+| `attrib items` | 4.696 ms | - | 2.871 ms | 1.64x | - |
+| `iterparse end tag clear` | 15.554 ms | - | 14.248 ms | 1.09x | - |
+
+corpus: 25,000 items, 2.98 MiB
+
+| operation | pyuppsala | py fast | lxml | py/lxml | fast/lxml |
+|---|---:|---:|---:|---:|---:|
+| `fromstring` | 64.418 ms | - | 47.021 ms | 1.37x | - |
+| `count iter(item)` | 12.089 ms | 3.867 ms | 3.491 ms | 3.46x | 1.11x |
+| `count iter()+tag` | 42.931 ms | 3.791 ms | 13.588 ms | 3.16x | 0.28x |
+| `sum int get(id)` | 20.792 ms | 4.558 ms | 11.076 ms | 1.88x | 0.41x |
+| `collect get(id)` | 20.859 ms | 6.308 ms | 8.243 ms | 2.53x | 0.77x |
+| `attrib items` | 27.314 ms | - | 17.503 ms | 1.56x | - |
+| `iterparse end tag clear` | 100.829 ms | - | 73.571 ms | 1.37x | - |
 
 ### vs lxml, per operation (dev box, `benchmarks/etree_bench.py`, 1,032-entity / 7.1 MB SAML aggregate)
 
@@ -174,6 +238,9 @@ uv run python benchmarks/etree_bench.py [--json out.json]
 # batch/parallel ingest (add --fetch for the HTTP rows against a local server)
 uv run python benchmarks/parallel_bench.py [--reps 3] [--fetch]
 
+# fastree Python-loop vs Rust-bulk microbenchmarks
+uv run python benchmarks/fastree_bench.py [--budget 0.35] [--json out.json]
+
 # serializer byte-compat gate: parse + serialize the corpus and diff against a golden copy
 # (regenerate goldens BEFORE a serializer change, compare AFTER)
 
@@ -181,7 +248,7 @@ uv run python benchmarks/parallel_bench.py [--reps 3] [--fetch]
 perf record -g -- .venv/bin/python <script>; perf report --no-children
 ```
 
-Suite gates: `uv run pytest tests/ -q` (403 tests, including the lxml-differential set
+Suite gates: `uv run pytest tests/ -q` (444 tests, including the lxml-differential set
 in `tests/test_etree.py`) and, in `../uppsala`, `cargo test`. Serializer changes must
 additionally keep golden serialization byte-identical, since consumers (pyFF) re-parse
 and sign fragments.

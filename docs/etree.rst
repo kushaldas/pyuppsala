@@ -114,6 +114,147 @@ resource caps, and template recursion uses the native
    them. Custom extension functions and XSLT access-control objects are not
    supported.
 
+Native fast scans
+-----------------
+
+The normal ``etree`` traversal APIs return live ``_Element`` proxies, matching
+lxml. That is the right default when you need to inspect elements, mutate the
+tree, run complex Python predicates, or keep code portable between lxml and
+pyuppsala.
+
+For large trees where the loop body is only a simple aggregate or fixed-shape
+extraction, pyuppsala also exposes native ``fast_*`` methods on ``_Element``.
+These are pyuppsala extensions, not lxml APIs. They run the full descendant walk
+in Rust under one document lock with the GIL released, and they avoid creating a
+Python proxy for every matching node.
+
+All ``fast_*`` methods use the same tag matching rules as ``Element.iter(tag)``:
+
+* ``tag=None`` scans this element and all descendants, including comments and
+  processing instructions.
+* ``tag="*"`` matches element nodes only.
+* ``tag="item"``, ``tag="{urn:example}item"``, and :class:`QName` match named
+  elements.
+* The current element is included, just like ``Element.iter()``.
+
+Use ``fast_count`` when a Python loop only counts matching nodes:
+
+.. code-block:: python
+
+    from pyuppsala import etree as ET
+
+    root = ET.fromstring(
+        "<catalog>"
+        "<book id='1' pages='412'/>"
+        "<book id='2' pages='271'/>"
+        "<magazine id='m1'/>"
+        "</catalog>"
+    )
+
+    # Equivalent to: sum(1 for _ in root.iter("book"))
+    assert root.fast_count("book") == 2
+
+    # "*" is an element-only wildcard and includes the root element.
+    assert root.fast_count("*") == 4
+
+Use ``fast_has`` when you only need to know whether a match exists. It stops as
+soon as the first match is found:
+
+.. code-block:: python
+
+    # Equivalent to: next(root.iter("book"), None) is not None
+    if root.fast_has("book"):
+        print("catalog has books")
+
+Use ``fast_sum_int_attr`` when every matching attribute value is expected to be
+an integer and the desired result is the sum. Missing attributes are skipped; a
+present non-integer value raises :class:`ValueError`.
+
+.. code-block:: python
+
+    # Equivalent to:
+    # sum(int(el.get("pages")) for el in root.iter("book")
+    #     if el.get("pages") is not None)
+    assert root.fast_sum_int_attr("pages", "book") == 683
+
+Use ``fast_collect_attr`` when the loop only gathers one attribute from matching
+elements. Missing attributes are skipped and the returned values are Python
+strings:
+
+.. code-block:: python
+
+    # Equivalent to:
+    # [el.get("id") for el in root.iter("book") if el.get("id") is not None]
+    assert root.fast_collect_attr("id", "book") == ["1", "2"]
+
+    nsroot = ET.fromstring(
+        "<r xmlns:p='urn:parts'>"
+        "<item p:code='A'/>"
+        "<item p:code='B'/>"
+        "</r>"
+    )
+    assert nsroot.fast_collect_attr(ET.QName("urn:parts", "code"), "item") == [
+        "A",
+        "B",
+    ]
+
+Use ``fast_collect_grouped_text`` for the SAML EntityAttributes-style nested
+shape: find each ``group_tag`` descendant, then each ``item_tag`` descendant
+inside that group, read ``key`` from the item, and collect stripped leading text
+from each ``value_tag`` descendant of that item. It returns one
+``(attribute_value_or_None, values)`` tuple per item.
+
+.. code-block:: python
+
+    root = ET.fromstring(
+        "<md:EntityDescriptor "
+        "xmlns:md='urn:oasis:names:tc:SAML:2.0:metadata' "
+        "xmlns:mdattr='urn:oasis:names:tc:SAML:metadata:attribute' "
+        "xmlns:saml='urn:oasis:names:tc:SAML:2.0:assertion'>"
+        "<md:Extensions>"
+        "<mdattr:EntityAttributes>"
+        "<saml:Attribute Name='category'>"
+        "<saml:AttributeValue> one </saml:AttributeValue>"
+        "<saml:AttributeValue>two</saml:AttributeValue>"
+        "</saml:Attribute>"
+        "<saml:Attribute>"
+        "<saml:AttributeValue> missing-name </saml:AttributeValue>"
+        "</saml:Attribute>"
+        "</mdattr:EntityAttributes>"
+        "</md:Extensions>"
+        "</md:EntityDescriptor>"
+    )
+
+    groups = root.fast_collect_grouped_text(
+        "{urn:oasis:names:tc:SAML:metadata:attribute}EntityAttributes",
+        "{urn:oasis:names:tc:SAML:2.0:assertion}Attribute",
+        "Name",
+        "{urn:oasis:names:tc:SAML:2.0:assertion}AttributeValue",
+    )
+
+    assert groups == [
+        ("category", ["one", "two"]),
+        (None, ["missing-name"]),
+    ]
+
+``fast_collect_grouped_text`` is deliberately narrower than XPath or a general
+Python loop: it reads leading text directly under each value element, strips
+that text, and does not expose the intermediate elements. Use ``iter()``,
+``findall()``, or ``xpath()`` instead when you need element proxies, recursive
+string values, predicates, mutation, sibling/tail handling, or lxml-compatible
+source portability.
+
+``Element.clear()`` follows lxml/ElementTree held-reference semantics: it
+removes children, attributes, text, and optionally tail text from the element,
+but detached child nodes remain valid if Python or low-level ``Node`` handles
+still reference them. Because the native DOM is arena-backed, this also means
+``clear()`` unlinks detached subtrees but does not scrub their stored text,
+attributes, or namespace declarations for memory reclamation. In iterparse
+loops, use ``clear()`` to keep the visible tree small; drop the whole parsed
+document/iterator to release the arena. ``XMLParser(compact=True)`` only
+discards the retained source buffer after parsing, not payloads kept alive by
+detached nodes.
+
 Supported features
 ------------------
 
@@ -133,7 +274,10 @@ Supported features
   declared encoding for byte input.
 - **Search**: ``find`` / ``findall`` / ``findtext`` / ``iterfind`` (ElementPath),
   ``iter`` / ``itertext``, and full ``.xpath()`` via Uppsala's XPath 1.0 engine,
-  plus :class:`XPath` / :class:`ETXPath` / :func:`XPathEvaluator`.
+  plus :class:`XPath` / :class:`ETXPath` / :func:`XPathEvaluator`. pyuppsala also
+  provides native bulk-scan extensions: ``fast_count``, ``fast_has``,
+  ``fast_sum_int_attr``, ``fast_collect_attr``, and
+  ``fast_collect_grouped_text``.
 - **Parser & validation**: :class:`XMLParser`, :func:`register_namespace`, and
   :class:`XMLSchema` (wrapping :class:`pyuppsala.XsdValidator`).
 - **XSLT**: :class:`XSLT` supports native XSLT 1.0 transforms with EXSLT regexp
@@ -200,8 +344,11 @@ than being ignored:
 - RelaxNG, Schematron, and DTD schema classes (only :class:`XMLSchema` /
   XSD is provided)
 
-Cosmetic options without an Uppsala equivalent (``compact``, ``collect_ids``,
-``no_network``, ``ns_clean``) are accepted and ignored.
+Cosmetic options without an Uppsala equivalent (``collect_ids``, ``no_network``,
+``ns_clean``) are accepted and ignored. ``compact=True`` is honored for etree
+parsing by discarding the retained source buffer after parse-time cleanup; pass
+``compact=False`` if you need source-inspection helpers to retain the decoded
+input text.
 
 .. note::
 

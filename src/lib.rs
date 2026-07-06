@@ -1,17 +1,20 @@
 use pyo3::create_exception;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyDict;
 
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use uppsala::dom::{Attribute as UAttribute, NodeId, NodeKind, QName as UQName, XmlWriteOptions};
 use uppsala::parser::Parser as UParser;
 use uppsala::parser::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_DEPTH, DEFAULT_MAX_ENTITY_EXPANSION};
+use uppsala::pull::{PullEvent as UPullEvent, PullParser as UPullParser};
 use uppsala::writer::XmlWriter as UXmlWriter;
 use uppsala::xpath::{XPathEvaluator as UXPathEvaluator, XPathValue as UXPathValue};
 use uppsala::xsd::XsdValidator as UXsdValidator;
-use uppsala::{Document as UDocument, XmlError};
+use uppsala::{Document as UDocument, XmlError, XmlResult};
 
 // ---------------------------------------------------------------------------
 // Custom Python exceptions
@@ -120,6 +123,93 @@ fn validate_ncname(value: &str, what: &str) -> PyResult<()> {
         |c| c != ':' && is_xml_name_start(c),
         |c| c != ':' && is_xml_name_char(c),
     )
+}
+
+/// Validate string content that will be stored in XML text, attributes, or URI
+/// slots before serialization.
+///
+/// Python ``str`` values can carry code points that XML 1.0 cannot represent.
+/// Rejecting them at the binding boundary keeps the DOM and its own serialized
+/// output consistent with lxml-style API behavior. Rust ``char`` values are
+/// already Unicode scalar values, so surrogate code points are impossible here.
+fn check_xml_string_compatible(value: &str) -> PyResult<()> {
+    if value.chars().any(|c| {
+        matches!(
+            c as u32,
+            0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xFFFE | 0xFFFF
+        )
+    }) {
+        Err(PyValueError::new_err(
+            "All strings must be XML compatible: Unicode or ASCII, no NULL bytes or control characters",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Return the Python ``repr(obj)`` text for error messages.
+fn py_repr_string(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    Ok(obj.repr()?.to_string_lossy().into_owned())
+}
+
+/// Split an etree key in Clark notation into ``(namespace_uri, local_name)``.
+///
+/// This helper is shared by tag-like values and attribute keys. ``{}local`` is
+/// normalized to the no-namespace case to match lxml behavior.
+fn split_etree_key_str(value: &str) -> PyResult<(Option<String>, String)> {
+    if let Some(rest) = value.strip_prefix('{') {
+        let Some((uri, local)) = rest.split_once('}') else {
+            return Err(PyValueError::new_err(format!(
+                "Invalid etree key {:?}",
+                value
+            )));
+        };
+        check_xml_string_compatible(uri)?;
+        validate_ncname(local, "etree key")?;
+        Ok((
+            if uri.is_empty() {
+                None
+            } else {
+                Some(uri.to_string())
+            },
+            local.to_string(),
+        ))
+    } else {
+        validate_ncname(value, "etree key")?;
+        Ok((None, value.to_string()))
+    }
+}
+
+/// Parse a Python etree key from a string or QName-like object.
+///
+/// Missing ``.text`` (or an ``AttributeError`` during lookup) is treated as "not QName-like".
+/// Other exceptions raised by a ``.text`` descriptor are propagated so user code is not hidden
+/// behind a generic type error
+fn split_etree_key_py(key: &Bound<'_, PyAny>) -> PyResult<(Option<String>, String)> {
+    if let Ok(value) = key.extract::<&str>() {
+        return split_etree_key_str(value);
+    }
+    match key.getattr("text") {
+        Ok(text) => {
+            if let Ok(value) = text.extract::<&str>() {
+                return split_etree_key_str(value);
+            }
+        }
+        Err(err) if err.is_instance_of::<PyAttributeError>(key.py()) => {}
+        Err(err) => return Err(err),
+    }
+    let key_repr = py_repr_string(key)?;
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "Invalid etree key {}",
+        key_repr
+    )))
+}
+
+fn clark_from_uqname(name: &UQName<'_>) -> String {
+    match name.namespace_uri.as_deref() {
+        Some(ns) if !ns.is_empty() => format!("{{{}}}{}", ns, name.local_name),
+        _ => name.local_name.to_string(),
+    }
 }
 
 fn validate_prefix(prefix: Option<&str>) -> PyResult<Option<&str>> {
@@ -253,6 +343,67 @@ struct DocWithInput {
 }
 
 type SharedDoc = Arc<Mutex<DocWithInput>>;
+
+fn release_detached_subtree_payload(doc: &mut UDocument<'static>, root: NodeId) {
+    let children = doc.children(root);
+    for child in children {
+        release_detached_subtree_payload(doc, child);
+    }
+    if let Some(kind) = doc.node_kind_mut(root) {
+        match kind {
+            NodeKind::Element(el) => {
+                el.attributes.clear();
+                el.namespace_declarations.clear();
+            }
+            NodeKind::Text(text) | NodeKind::CData(text) | NodeKind::Comment(text) => {
+                *text = Cow::Borrowed("");
+            }
+            NodeKind::ProcessingInstruction(pi) => {
+                pi.data = None;
+            }
+            NodeKind::Document | NodeKind::Attribute(_, _) => {}
+        }
+    }
+}
+
+fn clear_following_tail(doc: &mut UDocument<'static>, node: NodeId) {
+    let mut sibling = doc.next_sibling(node);
+    while let Some(id) = sibling {
+        let is_tail = matches!(
+            doc.node_kind(id),
+            Some(NodeKind::Text(_)) | Some(NodeKind::CData(_))
+        );
+        if !is_tail {
+            break;
+        }
+        sibling = doc.next_sibling(id);
+        doc.detach(id);
+    }
+}
+
+fn clear_element_contents(doc: &mut UDocument<'static>, node: NodeId, keep_tail: bool) {
+    let children = doc.children(node);
+    for child in children {
+        doc.detach(child);
+    }
+    if let Some(kind) = doc.node_kind_mut(node) {
+        match kind {
+            NodeKind::Element(el) => {
+                el.attributes.clear();
+            }
+            NodeKind::Comment(text) | NodeKind::Text(text) | NodeKind::CData(text) => {
+                *text = Cow::Borrowed("");
+            }
+            NodeKind::ProcessingInstruction(pi) => {
+                pi.data = None;
+            }
+            NodeKind::Document | NodeKind::Attribute(_, _) => {}
+        }
+    }
+    if !keep_tail {
+        clear_following_tail(doc, node);
+    }
+}
 
 /// Ensure a Python ``Node`` handle belongs to the receiver ``Document``.
 ///
@@ -581,6 +732,35 @@ impl Node {
                 .doc
                 .get_attribute(self.id, name)
                 .map(|s| s.to_string())),
+        }
+    }
+
+    /// Get an attribute value by exact namespace URI and local name.
+    ///
+    /// Unlike `get_attribute(name, None)`, which preserves the lower-level
+    /// pyuppsala API's historical local-name lookup, this treats `None` as
+    /// "no namespace". The etree layer needs that lxml-compatible behavior for
+    /// plain `elem.get("name")` reads.
+    #[pyo3(signature = (name, namespace_uri=None))]
+    fn get_attribute_exact(
+        &self,
+        name: &str,
+        namespace_uri: Option<&str>,
+    ) -> PyResult<Option<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        match guard.doc.element(self.id) {
+            Some(el) => Ok(el
+                .attributes
+                .iter()
+                .find(|a| {
+                    a.name.local_name.as_ref() == name
+                        && a.name.namespace_uri.as_deref() == namespace_uri
+                })
+                .map(|a| a.value.to_string())),
+            None => Ok(None),
         }
     }
 
@@ -1359,6 +1539,7 @@ static PI_FACTORY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static SET_TAG_CB: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static SET_TEXT_CB: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static SET_TAIL_CB: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static ETREE_XML_SYNTAX_ERROR: PyOnceLock<Py<pyo3::types::PyType>> = PyOnceLock::new();
 
 /// Register the etree helper callables the native `ElementBase` needs. Called
 /// once from `pyuppsala.etree` at import; subsequent calls are ignored. The
@@ -1378,6 +1559,16 @@ fn _register_element_helpers(
     let _ = SET_TAG_CB.set(py, set_tag);
     let _ = SET_TEXT_CB.set(py, set_text);
     let _ = SET_TAIL_CB.set(py, set_tail);
+    Ok(())
+}
+
+/// Register etree-layer exception classes used by native streaming APIs.
+#[pyfunction]
+fn _register_etree_exceptions(
+    py: Python<'_>,
+    xml_syntax_error: Py<pyo3::types::PyType>,
+) -> PyResult<()> {
+    let _ = ETREE_XML_SYNTAX_ERROR.set(py, xml_syntax_error);
     Ok(())
 }
 
@@ -1443,21 +1634,93 @@ fn _register_element_type(py: Python<'_>, element_type: Py<pyo3::types::PyType>)
 struct ElementBase {
     /// The Python `_DocHolder` that owns the document and the proxy cache.
     holder: Py<PyAny>,
-    /// The native `Node` handle this proxy currently points at.
-    node: Py<Node>,
+    /// Native document this proxy currently points into.
+    ///
+    /// Older versions stored a Python `Node` object here. That made every
+    /// transient `_Element` proxy allocate and later free an extra pyclass
+    /// wrapper during tree walks. Keeping the Rust handle directly removes that
+    /// allocation from the hot proxy-cache miss path; the public `_node`
+    /// property still materializes a `Node` object on demand for Python code.
+    doc: SharedDoc,
     /// The node's stable per-document id (mirrors `Node.node_id`).
     node_id: usize,
+}
+
+impl ElementBase {
+    fn node_handle(&self) -> Node {
+        Node {
+            doc: Arc::clone(&self.doc),
+            id: NodeId::new(self.node_id),
+        }
+    }
+
+    fn sibling_proxy(slf: &Bound<'_, Self>, next: bool) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        let (holder, sibling) = {
+            let cell = slf.borrow();
+            let guard = cell
+                .doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let mut sid = if next {
+                guard.doc.next_sibling(NodeId::new(cell.node_id))
+            } else {
+                guard.doc.previous_sibling(NodeId::new(cell.node_id))
+            };
+            while let Some(id) = sid {
+                match guard.doc.node_kind(id) {
+                    Some(NodeKind::Text(_)) | Some(NodeKind::CData(_)) => {
+                        sid = if next {
+                            guard.doc.next_sibling(id)
+                        } else {
+                            guard.doc.previous_sibling(id)
+                        };
+                    }
+                    _ => break,
+                }
+            }
+            (cell.holder.clone_ref(py), sid)
+        };
+        match sibling {
+            Some(id) => {
+                let holder = holder.bind(py).cast::<DocHolderBase>()?.clone();
+                Ok(Some(DocHolderBase::proxy_for_id(
+                    &holder,
+                    id.index(),
+                    None,
+                )?))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[pymethods]
 impl ElementBase {
     #[new]
-    fn new(holder: Py<PyAny>, node: Py<Node>, node_id: usize) -> Self {
-        ElementBase {
+    #[pyo3(signature = (holder, node=None, node_id=0))]
+    fn new(
+        py: Python<'_>,
+        holder: Py<PyAny>,
+        node: Option<Py<Node>>,
+        node_id: usize,
+    ) -> PyResult<Self> {
+        let (doc, id) = match node {
+            Some(node) => {
+                let node_ref = node.bind(py).borrow();
+                (Arc::clone(&node_ref.doc), node_ref.id.index())
+            }
+            None => {
+                let holder_ref = holder.bind(py).cast::<DocHolderBase>()?;
+                let doc = holder_ref.borrow().doc.clone_ref(py);
+                (Arc::clone(&doc.bind(py).borrow().inner), node_id)
+            }
+        };
+        Ok(ElementBase {
             holder,
-            node,
-            node_id,
-        }
+            doc,
+            node_id: id,
+        })
     }
 
     #[getter(_holder)]
@@ -1471,13 +1734,17 @@ impl ElementBase {
     }
 
     #[getter(_node)]
-    fn get_node(&self, py: Python<'_>) -> Py<Node> {
-        self.node.clone_ref(py)
+    fn get_node(&self, py: Python<'_>) -> PyResult<Py<Node>> {
+        Py::new(py, self.node_handle())
     }
 
     #[setter(_node)]
     fn set_node(&mut self, value: Py<Node>) {
-        self.node = value;
+        Python::attach(|py| {
+            let node = value.bind(py).borrow();
+            self.doc = Arc::clone(&node.doc);
+            self.node_id = node.id.index();
+        });
     }
 
     #[getter(_id)]
@@ -1495,8 +1762,8 @@ impl ElementBase {
     /// Counts natively without materialising the child list (see
     /// `Node.content_child_count`), since `list(elt)` asks for the length as a
     /// sizing hint before iterating.
-    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
-        self.node.bind(py).borrow().content_child_count()
+    fn __len__(&self) -> PyResult<usize> {
+        self.node_handle().content_child_count()
     }
 
     /// The element's tag in Clark `{uri}local` notation.
@@ -1506,28 +1773,30 @@ impl ElementBase {
     /// returning the Clark string directly, with no Python frame and no
     /// intermediate `QName`. Comment and processing-instruction nodes return the
     /// `Comment` / `ProcessingInstruction` factory (so `elem.tag is Comment`
-    /// identifies a comment, matching lxml); any other kind returns `None`.
+    /// identifies a comment, matching lxml); any other valid non-element kind
+    /// returns `None`.
     #[getter(tag)]
     fn get_tag(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let node_ref = self.node.bind(py).borrow();
         // Element fast path: return the interned Clark string from the
         // holder's tag table -- the same Py<PyString> for every element with
         // this qualified name, so repeated .tag reads allocate nothing and
         // equal tags compare by pointer identity first.
         //
         // The document mutex is held only while *reading* the name: a
-        // tag-table hit resolves under it too (hash lookup + piecewise
-        // compare + incref, no Python-object allocation), but on a miss the
+        // tag-table hit resolves under it too (short linear scan + incref, no
+        // Python-object allocation), but on a miss the
         // name is copied out and the lock released before any Python string
         // is created -- allocating can trigger GC/finalizers that re-enter
         // this document, which must not happen with the lock held.
         let missed: Option<(Option<String>, String)>;
+        let mut non_element_kind = 0u8;
         {
-            let guard = node_ref
+            let id = NodeId::new(self.node_id);
+            let guard = self
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            if let Some(e) = guard.doc.element(node_ref.id) {
+            if let Some(e) = guard.doc.element(id) {
                 let ns = e.name.namespace_uri.as_deref();
                 let local = &e.name.local_name;
                 if let Ok(holder) = self.holder.bind(py).cast::<DocHolderBase>() {
@@ -1537,6 +1806,12 @@ impl ElementBase {
                 }
                 missed = Some((ns.map(str::to_owned), local.to_string()));
             } else {
+                non_element_kind = match guard.doc.node_kind(id) {
+                    Some(NodeKind::Comment(_)) => 1,
+                    Some(NodeKind::ProcessingInstruction(_)) => 2,
+                    None => 3,
+                    _ => 0,
+                };
                 missed = None;
             }
         }
@@ -1555,10 +1830,10 @@ impl ElementBase {
             };
             return Ok(clark.into_pyobject(py)?.into_any().unbind());
         }
-        let kind = node_ref.kind()?;
-        match kind.as_str() {
-            "comment" => registered_factory(py, &COMMENT_FACTORY),
-            "processing_instruction" => registered_factory(py, &PI_FACTORY),
+        match non_element_kind {
+            1 => registered_factory(py, &COMMENT_FACTORY),
+            2 => registered_factory(py, &PI_FACTORY),
+            3 => Err(PyValueError::new_err("Invalid node")),
             _ => Ok(py.None()),
         }
     }
@@ -1580,8 +1855,8 @@ impl ElementBase {
     /// instead, matching lxml. For elements it is the leading Text/CDATA run (see
     /// `Node.leading_text_run`).
     #[getter(text)]
-    fn get_text(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        let node_ref = self.node.bind(py).borrow();
+    fn get_text(&self) -> PyResult<Option<String>> {
+        let node_ref = self.node_handle();
         match node_ref.kind()?.as_str() {
             "comment" => node_ref.comment_text(),
             "processing_instruction" => node_ref.pi_data(),
@@ -1599,14 +1874,236 @@ impl ElementBase {
     /// The text following this element's end tag, before the next sibling, or
     /// `None` -- the trailing Text/CDATA run (see `Node.tail_text_run`).
     #[getter(tail)]
-    fn get_tail(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        self.node.bind(py).borrow().tail_text_run()
+    fn get_tail(&self) -> PyResult<Option<String>> {
+        self.node_handle().tail_text_run()
     }
 
     /// Set trailing text, replacing the existing run. Cold; stays in Python.
     #[setter(tail)]
     fn set_tail(slf: Bound<'_, Self>, value: Bound<'_, PyAny>) -> PyResult<()> {
         call_setter(&SET_TAIL_CB, slf, value)
+    }
+
+    /// Remove all children, attributes and text from this element.
+    ///
+    /// Mirrors lxml's `clear(keep_tail=False)` shape. Detached children remain
+    /// valid with their existing payloads so held references can be reused or
+    /// reattached elsewhere. This unlinks nodes but does not reclaim detached
+    /// subtree payload memory; that stays owned by the backing document until
+    /// the document is dropped or an internal cleanup path explicitly scrubs it.
+    #[pyo3(signature = (*, keep_tail=false))]
+    fn clear(slf: &Bound<'_, Self>, keep_tail: bool) -> PyResult<()> {
+        let (doc, id) = {
+            let cell = slf.borrow();
+            (Arc::clone(&cell.doc), NodeId::new(cell.node_id))
+        };
+        let mut guard = doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        clear_element_contents(&mut guard.doc, id, keep_tail);
+        Ok(())
+    }
+
+    /// Return an attribute value by etree key, or `default` when absent.
+    ///
+    /// This is the hot lxml-compatible `_Element.get()` path. It parses Clark
+    /// notation / QName-like objects natively and treats a plain name as an
+    /// exact no-namespace lookup.
+    #[pyo3(signature = (key, default=None))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let (ns, local) = split_etree_key_py(&key)?;
+        let value = {
+            let guard = self
+                .doc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            guard.doc.element(NodeId::new(self.node_id)).and_then(|el| {
+                el.attributes
+                    .iter()
+                    .find(|a| {
+                        a.name.local_name.as_ref() == local
+                            && a.name.namespace_uri.as_deref() == ns.as_deref()
+                    })
+                    .map(|a| a.value.to_string())
+            })
+        };
+        match value {
+            Some(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            None => Ok(default.unwrap_or_else(|| py.None())),
+        }
+    }
+
+    /// Return attribute names in document order, in Clark notation.
+    fn keys(&self) -> PyResult<Vec<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard
+            .doc
+            .element(NodeId::new(self.node_id))
+            .map(|el| {
+                el.attributes
+                    .iter()
+                    .map(|a| clark_from_uqname(&a.name))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Return attribute values in document order.
+    fn values(&self) -> PyResult<Vec<String>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard
+            .doc
+            .element(NodeId::new(self.node_id))
+            .map(|el| el.attributes.iter().map(|a| a.value.to_string()).collect())
+            .unwrap_or_default())
+    }
+
+    /// Return `(name, value)` attribute pairs in document order.
+    fn items(&self) -> PyResult<Vec<(String, String)>> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard
+            .doc
+            .element(NodeId::new(self.node_id))
+            .map(|el| {
+                el.attributes
+                    .iter()
+                    .map(|a| (clark_from_uqname(&a.name), a.value.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Count nodes matching `Element.iter(tag)` semantics without creating
+    /// Python proxies for each match.
+    #[pyo3(signature = (tag=None))]
+    fn fast_count(&self, py: Python<'_>, tag: Option<Bound<'_, PyAny>>) -> PyResult<usize> {
+        let filter = desc_filter_from_py_tag(tag.as_ref())?;
+        let doc = Arc::clone(&self.doc);
+        let start = NodeId::new(self.node_id);
+        py.detach(move || {
+            let guard = doc.lock().map_err(|e| e.to_string())?;
+            let mut stack = vec![start];
+            let mut count = 0usize;
+            while advance_desc_walk(&guard.doc, &mut stack, &filter).is_some() {
+                count += 1;
+            }
+            Ok::<_, String>(count)
+        })
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Return whether any node matches `Element.iter(tag)` semantics without
+    /// scanning the rest of the subtree after the first match.
+    #[pyo3(signature = (tag=None))]
+    fn fast_has(&self, py: Python<'_>, tag: Option<Bound<'_, PyAny>>) -> PyResult<bool> {
+        let filter = desc_filter_from_py_tag(tag.as_ref())?;
+        let doc = Arc::clone(&self.doc);
+        let start = NodeId::new(self.node_id);
+        py.detach(move || {
+            let guard = doc.lock().map_err(|e| e.to_string())?;
+            let mut stack = vec![start];
+            Ok::<_, String>(advance_desc_walk(&guard.doc, &mut stack, &filter).is_some())
+        })
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Sum an integer attribute over matching elements without materialising
+    /// each matching element as a Python proxy.
+    #[pyo3(signature = (key, tag=None))]
+    fn fast_sum_int_attr(
+        &self,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        tag: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<i64> {
+        let (attr_ns, attr_local) = split_etree_key_py(&key)?;
+        let filter = desc_filter_from_py_tag(tag.as_ref())?;
+        let doc = Arc::clone(&self.doc);
+        let start = NodeId::new(self.node_id);
+        py.detach(move || {
+            let guard = doc
+                .lock()
+                .map_err(|e| BulkScanError::Runtime(e.to_string()))?;
+            sum_int_attr_detached(&guard.doc, start, &filter, attr_ns.as_deref(), &attr_local)
+        })
+        .map_err(BulkScanError::into_pyerr)
+    }
+
+    /// Collect attribute values from matching elements without materialising
+    /// each matching element as a Python proxy.
+    #[pyo3(signature = (key, tag=None))]
+    fn fast_collect_attr(
+        &self,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        tag: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<String>> {
+        let (attr_ns, attr_local) = split_etree_key_py(&key)?;
+        let filter = desc_filter_from_py_tag(tag.as_ref())?;
+        let doc = Arc::clone(&self.doc);
+        let start = NodeId::new(self.node_id);
+        py.detach(move || {
+            let guard = doc.lock().map_err(|e| e.to_string())?;
+            Ok::<_, String>(collect_attr_detached(
+                &guard.doc,
+                start,
+                &filter,
+                attr_ns.as_deref(),
+                &attr_local,
+            ))
+        })
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Collect `(attribute_value, descendant_text_values)` groups without
+    /// materialising the group/item/value elements as Python proxies.
+    ///
+    /// This is a general native shape for pyFF's hot SAML EntityAttributes loop:
+    /// for each `group_tag` descendant, find `item_tag` descendants, read
+    /// `key` from each item, then collect stripped leading text from
+    /// `value_tag` descendants of that item.
+    #[pyo3(signature = (group_tag, item_tag, key, value_tag))]
+    fn fast_collect_grouped_text(
+        &self,
+        py: Python<'_>,
+        group_tag: Bound<'_, PyAny>,
+        item_tag: Bound<'_, PyAny>,
+        key: Bound<'_, PyAny>,
+        value_tag: Bound<'_, PyAny>,
+    ) -> PyResult<Vec<(Option<String>, Vec<String>)>> {
+        let group_filter = desc_filter_from_py_tag(Some(&group_tag))?;
+        let item_filter = desc_filter_from_py_tag(Some(&item_tag))?;
+        let value_filter = desc_filter_from_py_tag(Some(&value_tag))?;
+        let (attr_ns, attr_local) = split_etree_key_py(&key)?;
+        let doc = Arc::clone(&self.doc);
+        let start = NodeId::new(self.node_id);
+        py.detach(move || {
+            let guard = doc.lock().map_err(|e| e.to_string())?;
+            Ok::<_, String>(collect_grouped_text_detached(
+                &guard.doc,
+                start,
+                &group_filter,
+                &item_filter,
+                attr_ns.as_deref(),
+                &attr_local,
+                &value_filter,
+            ))
+        })
+        .map_err(PyRuntimeError::new_err)
     }
 
     /// Mapping of in-scope prefixes to URIs (None key = default namespace).
@@ -1617,7 +2114,7 @@ impl ElementBase {
     /// the Python property frame plus the `dict(...)` call.
     #[getter(nsmap)]
     fn get_nsmap(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let pairs = self.node.bind(py).borrow().nsmap()?;
+        let pairs = self.node_handle().nsmap()?;
         let d = PyDict::new(py);
         for (prefix, uri) in pairs {
             d.set_item(prefix, uri)?;
@@ -1627,15 +2124,15 @@ impl ElementBase {
 
     /// The namespace prefix of this element's tag, or None.
     #[getter(prefix)]
-    fn get_prefix(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        let q = self.node.bind(py).borrow().tag()?;
+    fn get_prefix(&self) -> PyResult<Option<String>> {
+        let q = self.node_handle().tag()?;
         Ok(q.and_then(|qn| qn.prefix().map(|s| s.to_string())))
     }
 
     /// The 1-based source line of this element, or None for built nodes.
     #[getter(sourceline)]
-    fn get_sourceline(&self, py: Python<'_>) -> PyResult<Option<usize>> {
-        match self.node.bind(py).borrow().line() {
+    fn get_sourceline(&self) -> PyResult<Option<usize>> {
+        match self.node_handle().line() {
             Ok(0) => Ok(None),
             Ok(n) => Ok(Some(n)),
             Err(_) => Ok(None),
@@ -1658,12 +2155,13 @@ impl ElementBase {
             .cast::<DocHolderBase>()?
             .clone()
             .unbind();
-        let node = self.node.bind(py).borrow();
         Ok(ProxyDescendantIterator {
             holder,
-            doc: Arc::clone(&node.doc),
-            stack: vec![node.id],
+            doc: Arc::clone(&self.doc),
+            stack: vec![NodeId::new(self.node_id)],
             filter: DescFilter::parse(tag),
+            buffer: Vec::new(),
+            buffer_index: 0,
         })
     }
 
@@ -1674,12 +2172,12 @@ impl ElementBase {
         let py = slf.py();
         let (holder, parent_id) = {
             let cell = slf.borrow();
-            let node = cell.node.bind(py).borrow();
-            let guard = node
+            let id = NodeId::new(cell.node_id);
+            let guard = cell
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let pid = match guard.doc.parent(node.id) {
+            let pid = match guard.doc.parent(id) {
                 // The document node is not an element; its children are roots.
                 Some(p) if !matches!(guard.doc.node_kind(p), Some(NodeKind::Document)) => Some(p),
                 _ => None,
@@ -1700,6 +2198,16 @@ impl ElementBase {
         }
     }
 
+    /// Return the next sibling content node (skipping text/CDATA), or None.
+    fn getnext(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        ElementBase::sibling_proxy(slf, true)
+    }
+
+    /// Return the previous sibling content node (skipping text/CDATA), or None.
+    fn getprevious(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        ElementBase::sibling_proxy(slf, false)
+    }
+
     /// Native backing of `_Element.__iter__`: a lazy content-child iterator
     /// yielding identity-stable proxies one sibling hop at a time, so
     /// early-termination patterns (`next(iter(el))`) never pay for the whole
@@ -1712,17 +2220,16 @@ impl ElementBase {
             .cast::<DocHolderBase>()?
             .clone()
             .unbind();
-        let node = self.node.bind(py).borrow();
         let first = {
-            let guard = node
+            let guard = self
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            guard.doc.first_child(node.id)
+            guard.doc.first_child(NodeId::new(self.node_id))
         };
         Ok(ProxyChildIterator {
             holder,
-            doc: Arc::clone(&node.doc),
+            doc: Arc::clone(&self.doc),
             next: first,
         })
     }
@@ -1734,13 +2241,13 @@ impl ElementBase {
     fn _children_proxies(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let (holder, ids) = {
             let cell = slf.borrow();
-            let node = cell.node.bind(py).borrow();
-            let guard = node
+            let id = NodeId::new(cell.node_id);
+            let guard = cell
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let mut ids = Vec::new();
-            let mut child = guard.doc.first_child(node.id);
+            let mut child = guard.doc.first_child(id);
             while let Some(cid) = child {
                 match guard.doc.node_kind(cid) {
                     Some(NodeKind::Element(_))
@@ -1764,12 +2271,14 @@ impl ElementBase {
 // DocHolderBase -- native per-document identity proxy cache
 // ---------------------------------------------------------------------------
 
+const PROXY_SWEEP_MIN: usize = 4096;
+
 /// Subclassable native base for `pyuppsala.etree._DocHolder`.
 ///
 /// Owns one native `Document` plus the identity-stable proxy cache mapping
 /// `node_id -> weakref(_Element)`, so repeated lookups of the same underlying
 /// node return the *same* Python wrapper (`root[0] is root[0]`, matching
-/// lxml). Runs the entire hit path (dict lookup + weakref upgrade) and the
+/// lxml). Runs the entire hit path (indexed weakref lookup + upgrade) and the
 /// miss path (construct `_Element` via the registered type object, insert a
 /// callback-free weakref, opportunistic dead-entry sweep) in Rust; the pure
 /// Python version of this cache was ~0.5 s of the pyFF full-sign profile and
@@ -1782,70 +2291,132 @@ struct DocHolderBase {
     /// The owned native document (a `Document` pyclass instance).
     doc: Py<Document>,
     /// node_id -> callback-free weakref to the live `_Element` wrapper.
-    /// Callback-free deliberately: pyFF-style walks create a proxy per node
-    /// and drop it immediately, so a death callback per proxy would dominate;
-    /// dead entries are reclaimed by the bounded sweep below instead.
-    proxies: std::collections::HashMap<usize, Py<pyo3::types::PyWeakrefReference>>,
+    ///
+    /// Node ids are dense arena indexes, so a vector avoids hashing on every
+    /// traversal/proxy lookup. Empty slots are nodes that have never had a
+    /// proxy or whose dead weakref was swept.
+    proxies: Vec<Option<Py<pyo3::types::PyWeakrefReference>>>,
+    /// Compact list of slots that may contain a live proxy or unswept
+    /// tombstone. This keeps dead-weakref sweeps proportional to cache churn,
+    /// not to the highest node id reached during a document walk.
+    tracked_proxy_slots: Vec<usize>,
+    /// Per-node membership bit for `tracked_proxy_slots`.
+    ///
+    /// A slot can be tracked while `proxies[nid]` is `None` after explicit
+    /// cache surgery; the next sweep compacts those entries away. Keeping the
+    /// bit set until then prevents duplicate tracked-slot entries when the same
+    /// node id is removed and reinserted before a sweep.
+    proxy_slot_tracked: Vec<bool>,
+    /// Number of `Some` slots in `proxies` (live + not-yet-swept tombstones).
+    proxy_entries: usize,
     /// Cache size at which the next `proxy()` sweeps dead weakrefs; re-armed
-    /// after each sweep to `max(256, 2 * live)` so transient walks hold a
-    /// bounded number of tombstones and total sweep work stays O(nodes).
+    /// after each sweep to `max(PROXY_SWEEP_MIN, 2 * live)` so transient walks
+    /// hold a bounded number of tombstones without sweeping every few hundred
+    /// short-lived proxies.
     sweep_at: usize,
-    /// Interned Clark-notation tag strings, keyed by a hash of
-    /// `(namespace_uri, local_name)` with a bucket vec for collisions
-    /// (verified by piecewise comparison -- zero allocation on a hit). Every
-    /// element after the first with the same qualified name returns the same
-    /// `Py<PyString>`, so `.tag` reads stop allocating and equal tags become
-    /// pointer-identical (hitting CPython's str identity fast path in `==`).
-    /// A SAML tree has a few dozen unique QNames across tens of thousands of
-    /// nodes, so the table stays tiny; renames simply hash to a different
-    /// key, so there is nothing to invalidate.
-    tag_table: std::collections::HashMap<u64, Vec<Py<pyo3::types::PyString>>>,
+    /// Interned Clark-notation tag strings, keyed by the actual
+    /// `(namespace_uri, local_name)` pair.
+    ///
+    /// A document normally has a few dozen unique QNames. A tiny linear table is
+    /// cheaper than SipHashing the namespace/local strings on every `.tag` read.
+    tag_table: Vec<InternedTag>,
 }
 
-/// True if `s` is exactly the Clark notation `{ns}local` (or bare `local`
-/// when `ns` is None) -- the zero-allocation verify for tag-table hits.
-fn clark_eq(s: &str, ns: Option<&str>, local: &str) -> bool {
-    match ns {
-        Some(ns) => {
-            s.len() == ns.len() + local.len() + 2
-                && s.as_bytes()[0] == b'{'
-                && &s[1..1 + ns.len()] == ns
-                && s.as_bytes()[1 + ns.len()] == b'}'
-                && &s[2 + ns.len()..] == local
-        }
-        None => s == local,
+struct InternedTag {
+    ns: Option<String>,
+    local: String,
+    object: Py<pyo3::types::PyString>,
+}
+
+impl InternedTag {
+    fn matches(&self, ns: Option<&str>, local: &str) -> bool {
+        self.ns.as_deref() == ns && self.local == local
     }
 }
 
-/// Hash key for the tag table: mixes `(namespace_uri, local_name)`.
-fn tag_key(ns: Option<&str>, local: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    ns.hash(&mut h);
-    local.hash(&mut h);
-    h.finish()
+impl DocHolderBase {
+    fn sweep_dead(&mut self, py: Python<'_>) {
+        use pyo3::types::PyWeakrefMethods;
+        let mut live_entries = 0usize;
+        let tracked = std::mem::take(&mut self.tracked_proxy_slots);
+        self.tracked_proxy_slots
+            .reserve(tracked.len().min(self.proxy_entries));
+        for nid in tracked {
+            let keep = match self.proxies.get_mut(nid) {
+                Some(slot) => {
+                    if slot
+                        .as_ref()
+                        .is_some_and(|wref| wref.bind(py).upgrade().is_some())
+                    {
+                        live_entries += 1;
+                        true
+                    } else {
+                        *slot = None;
+                        false
+                    }
+                }
+                None => false,
+            };
+            if keep {
+                self.tracked_proxy_slots.push(nid);
+            } else if let Some(tracked) = self.proxy_slot_tracked.get_mut(nid) {
+                *tracked = false;
+            }
+        }
+        while self.proxies.last().is_some_and(Option::is_none)
+            && self
+                .proxy_slot_tracked
+                .last()
+                .is_some_and(|tracked| !*tracked)
+        {
+            self.proxies.pop();
+            self.proxy_slot_tracked.pop();
+        }
+        self.proxy_entries = live_entries;
+        self.sweep_at = std::cmp::max(PROXY_SWEEP_MIN, live_entries * 2);
+    }
+
+    fn remove_proxy_slot(&mut self, nid: usize) -> Option<Py<pyo3::types::PyWeakrefReference>> {
+        let slot = self.proxies.get_mut(nid)?;
+        let old = slot.take();
+        if old.is_some() {
+            self.proxy_entries = self.proxy_entries.saturating_sub(1);
+        }
+        old
+    }
+
+    fn insert_proxy_slot(&mut self, nid: usize, wref: Py<pyo3::types::PyWeakrefReference>) {
+        if nid >= self.proxies.len() {
+            self.proxies.resize_with(nid + 1, || None);
+            self.proxy_slot_tracked.resize(nid + 1, false);
+        }
+        if self.proxies[nid].is_none() {
+            self.proxy_entries += 1;
+        }
+        if !self.proxy_slot_tracked[nid] {
+            self.proxy_slot_tracked[nid] = true;
+            self.tracked_proxy_slots.push(nid);
+        }
+        self.proxies[nid] = Some(wref);
+    }
 }
 
 impl DocHolderBase {
     /// Look up the interned Clark tag for `(namespace_uri, local_name)`.
     ///
     /// Read-only companion to [`DocHolderBase::intern_tag`]: a hit costs a
-    /// hash lookup, a piecewise compare, and an incref -- no Python-object
-    /// allocation, no Python code -- so it is safe to call while the document
-    /// mutex (or a holder borrow) is held.
+    /// short linear scan over the document's unique tag names and an incref --
+    /// no Python-object allocation, no Python code -- so it is safe to call
+    /// while the document mutex (or a holder borrow) is held.
     fn lookup_tag(
         &self,
         py: Python<'_>,
         ns: Option<&str>,
         local: &str,
     ) -> PyResult<Option<Py<pyo3::types::PyString>>> {
-        if let Some(bucket) = self.tag_table.get(&tag_key(ns, local)) {
-            for s in bucket.iter() {
-                // to_str is fine here: interned tags are always valid UTF-8 we
-                // created ourselves, and reading a PyString runs no Python code.
-                if clark_eq(s.bind(py).to_str()?, ns, local) {
-                    return Ok(Some(s.clone_ref(py)));
-                }
+        for tag in &self.tag_table {
+            if tag.matches(ns, local) {
+                return Ok(Some(tag.object.clone_ref(py)));
             }
         }
         Ok(None)
@@ -1880,13 +2451,16 @@ impl DocHolderBase {
         // the same tag while we allocated. Returning the existing entry keeps
         // identity stable (exactly one object per unique tag).
         let mut cell = slf.borrow_mut();
-        let bucket = cell.tag_table.entry(tag_key(ns, local)).or_default();
-        for s in bucket.iter() {
-            if clark_eq(s.bind(py).to_str()?, ns, local) {
-                return Ok(s.clone_ref(py));
+        for tag in &cell.tag_table {
+            if tag.matches(ns, local) {
+                return Ok(tag.object.clone_ref(py));
             }
         }
-        bucket.push(obj.clone_ref(py));
+        cell.tag_table.push(InternedTag {
+            ns: ns.map(str::to_owned),
+            local: local.to_string(),
+            object: obj.clone_ref(py),
+        });
         Ok(obj)
     }
 
@@ -1909,11 +2483,11 @@ impl DocHolderBase {
         // Phase 1: cache hit under a short borrow. Upgrading a weakref reads
         // a pointer and increfs -- it runs no Python code, so holding the
         // borrow here is safe. On a hit the cached wrapper is returned as-is:
-        // its stored `Node` is just `(Arc, node_id)`, both invariant for the
+        // its stored Rust handle is just `(Arc, node_id)`, both invariant for the
         // life of the document, so no refresh is needed.
         {
             let cell = slf.borrow();
-            if let Some(wref) = cell.proxies.get(&nid) {
+            if let Some(Some(wref)) = cell.proxies.get(nid) {
                 if let Some(el) = wref.bind(py).upgrade() {
                     return Ok(el.unbind());
                 }
@@ -1922,22 +2496,9 @@ impl DocHolderBase {
             }
         }
         // Phase 2: miss -- construct outside any borrow.
-        let node_obj = match node {
-            Some(n) => n,
-            None => {
-                let shared = {
-                    let cell = slf.borrow();
-                    let doc = cell.doc.bind(py).borrow();
-                    Arc::clone(&doc.inner)
-                };
-                Py::new(
-                    py,
-                    Node {
-                        doc: shared,
-                        id: NodeId::new(nid),
-                    },
-                )?
-            }
+        let node_obj: Py<PyAny> = match node {
+            Some(n) => n.into_any(),
+            None => py.None(),
         };
         let eltype = ELEMENT_TYPE
             .get(py)
@@ -1949,10 +2510,9 @@ impl DocHolderBase {
         // Phase 3: insert + opportunistic sweep under a fresh borrow.
         {
             let mut cell = slf.borrow_mut();
-            cell.proxies.insert(nid, wref.unbind());
-            if cell.proxies.len() >= cell.sweep_at {
-                cell.proxies.retain(|_, r| r.bind(py).upgrade().is_some());
-                cell.sweep_at = std::cmp::max(256, cell.proxies.len() * 2);
+            cell.insert_proxy_slot(nid, wref.unbind());
+            if cell.proxy_entries >= cell.sweep_at {
+                cell.sweep_dead(py);
             }
         }
         Ok(el.unbind())
@@ -1965,9 +2525,12 @@ impl DocHolderBase {
     fn new(doc: Py<Document>) -> Self {
         DocHolderBase {
             doc,
-            proxies: std::collections::HashMap::new(),
-            sweep_at: 256,
-            tag_table: std::collections::HashMap::new(),
+            proxies: Vec::new(),
+            tracked_proxy_slots: Vec::new(),
+            proxy_slot_tracked: Vec::new(),
+            proxy_entries: 0,
+            sweep_at: PROXY_SWEEP_MIN,
+            tag_table: Vec::new(),
         }
     }
 
@@ -2016,9 +2579,8 @@ impl DocHolderBase {
         // Upfront dead sweep + emptiness fast path.
         {
             let mut cell = slf.borrow_mut();
-            cell.proxies.retain(|_, r| r.bind(py).upgrade().is_some());
-            cell.sweep_at = std::cmp::max(256, cell.proxies.len() * 2);
-            if cell.proxies.is_empty() {
+            cell.sweep_dead(py);
+            if cell.proxy_entries == 0 {
                 return Ok(());
             }
         }
@@ -2068,28 +2630,27 @@ impl DocHolderBase {
         let dst_shared = Arc::clone(&dnode.doc);
         let dst_obj: Py<PyAny> = dst.clone().unbind().into_any();
         for (sid, did) in pairs {
-            let wref = slf.borrow_mut().proxies.remove(&sid);
+            let wref = slf.borrow_mut().remove_proxy_slot(sid);
             let Some(wref) = wref else { continue };
             let Some(el) = wref.bind(py).upgrade() else {
                 continue; // dead tombstone: reclaimed by the remove above
             };
             let el_base = el.cast::<ElementBase>()?;
-            let new_node = Py::new(
-                py,
-                Node {
-                    doc: Arc::clone(&dst_shared),
-                    id: NodeId::new(did),
-                },
-            )?;
             {
                 let mut b = el_base.borrow_mut();
                 b.holder = dst_obj.clone_ref(py);
-                b.node = new_node;
+                b.doc = Arc::clone(&dst_shared);
                 b.node_id = did;
             }
             // The weakref still points at `el`; reuse it under the new key.
-            dst.borrow_mut().proxies.insert(did, wref);
-            if slf.borrow().proxies.is_empty() {
+            {
+                let mut dst_cell = dst.borrow_mut();
+                dst_cell.insert_proxy_slot(did, wref);
+                if dst_cell.proxy_entries >= dst_cell.sweep_at {
+                    dst_cell.sweep_dead(py);
+                }
+            }
+            if slf.borrow().proxy_entries == 0 {
                 // Every live source proxy has been moved; skip the rest of
                 // the (possibly large) subtree.
                 break;
@@ -2100,7 +2661,7 @@ impl DocHolderBase {
 
     /// Number of cache entries (live + not-yet-swept tombstones); for tests.
     fn _proxy_cache_len(&self) -> usize {
-        self.proxies.len()
+        self.proxy_entries
     }
 }
 
@@ -2184,6 +2745,274 @@ impl DescFilter {
     }
 }
 
+/// Convert an optional etree tag filter into the native descendant-walk filter.
+///
+/// Accepts ``None``, strings, and QName-like objects exposing string ``.text``.
+/// Missing ``.text`` means "not QName-like"; other ``.text`` access failures are
+/// returned unchanged.
+fn desc_filter_from_py_tag(tag: Option<&Bound<'_, PyAny>>) -> PyResult<DescFilter> {
+    let Some(tag) = tag else {
+        return Ok(DescFilter::All);
+    };
+    if tag.is_none() {
+        return Ok(DescFilter::All);
+    }
+    if let Ok(value) = tag.extract::<&str>() {
+        return Ok(DescFilter::parse(Some(value)));
+    }
+    match tag.getattr("text") {
+        Ok(text) => {
+            if let Ok(value) = text.extract::<&str>() {
+                return Ok(DescFilter::parse(Some(value)));
+            }
+        }
+        Err(err) if err.is_instance_of::<PyAttributeError>(tag.py()) => {}
+        Err(err) => return Err(err),
+    }
+    let tag_repr = py_repr_string(tag)?;
+    Err(PyTypeError::new_err(format!(
+        "Invalid tag name {}",
+        tag_repr
+    )))
+}
+
+#[derive(Debug)]
+enum BulkScanError {
+    Runtime(String),
+    Value(String),
+}
+
+impl BulkScanError {
+    fn into_pyerr(self) -> PyErr {
+        match self {
+            BulkScanError::Runtime(message) => PyRuntimeError::new_err(message),
+            BulkScanError::Value(message) => PyValueError::new_err(message),
+        }
+    }
+}
+
+fn matching_attr_value<'a>(
+    doc: &'a UDocument<'static>,
+    id: NodeId,
+    attr_ns: Option<&str>,
+    attr_local: &str,
+) -> Option<&'a str> {
+    doc.element(id).and_then(|el| {
+        el.attributes
+            .iter()
+            .find(|a| {
+                a.name.local_name.as_ref() == attr_local
+                    && a.name.namespace_uri.as_deref() == attr_ns
+            })
+            .map(|a| a.value.as_ref())
+    })
+}
+
+fn collect_attr_detached(
+    doc: &UDocument<'static>,
+    start: NodeId,
+    filter: &DescFilter,
+    attr_ns: Option<&str>,
+    attr_local: &str,
+) -> Vec<String> {
+    let mut stack = vec![start];
+    let mut values = Vec::new();
+    while let Some(id) = advance_desc_walk(doc, &mut stack, filter) {
+        if let Some(value) = matching_attr_value(doc, id, attr_ns, attr_local) {
+            values.push(value.to_string());
+        }
+    }
+    values
+}
+
+fn leading_text_run_detached(doc: &UDocument<'static>, id: NodeId) -> Option<String> {
+    let mut out: Option<String> = None;
+    let mut child = doc.first_child(id);
+    while let Some(cid) = child {
+        match doc.node_kind(cid) {
+            Some(NodeKind::Text(_)) | Some(NodeKind::CData(_)) => {
+                let s = doc.text_content(cid).unwrap_or("");
+                out.get_or_insert_with(String::new).push_str(s);
+                child = doc.next_sibling(cid);
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+fn collect_grouped_text_detached(
+    doc: &UDocument<'static>,
+    start: NodeId,
+    group_filter: &DescFilter,
+    item_filter: &DescFilter,
+    attr_ns: Option<&str>,
+    attr_local: &str,
+    value_filter: &DescFilter,
+) -> Vec<(Option<String>, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut group_stack = vec![start];
+    while let Some(group_id) = advance_desc_walk(doc, &mut group_stack, group_filter) {
+        let mut item_stack = vec![group_id];
+        while let Some(item_id) = advance_desc_walk(doc, &mut item_stack, item_filter) {
+            let key = matching_attr_value(doc, item_id, attr_ns, attr_local).map(str::to_string);
+            let mut values = Vec::new();
+            let mut value_stack = vec![item_id];
+            while let Some(value_id) = advance_desc_walk(doc, &mut value_stack, value_filter) {
+                if let Some(text) = leading_text_run_detached(doc, value_id) {
+                    values.push(text.trim().to_string());
+                }
+            }
+            out.push((key, values));
+        }
+    }
+    out
+}
+
+fn sum_int_attr_detached(
+    doc: &UDocument<'static>,
+    start: NodeId,
+    filter: &DescFilter,
+    attr_ns: Option<&str>,
+    attr_local: &str,
+) -> Result<i64, BulkScanError> {
+    let mut stack = vec![start];
+    let mut total = 0i64;
+    while let Some(id) = advance_desc_walk(doc, &mut stack, filter) {
+        let Some(value) = matching_attr_value(doc, id, attr_ns, attr_local) else {
+            continue;
+        };
+        let parsed = value.trim().parse::<i64>().map_err(|_| {
+            BulkScanError::Value(format!(
+                "attribute {} is not a valid integer: {:?}",
+                clark_key_from_parts(attr_ns, attr_local),
+                value
+            ))
+        })?;
+        total = total.checked_add(parsed).ok_or_else(|| {
+            BulkScanError::Value(format!(
+                "integer sum overflowed for attribute {}",
+                clark_key_from_parts(attr_ns, attr_local)
+            ))
+        })?;
+    }
+    Ok(total)
+}
+
+fn clark_key_from_parts(ns: Option<&str>, local: &str) -> String {
+    match ns {
+        Some(ns) if !ns.is_empty() => format!("{{{}}}{}", ns, local),
+        _ => local.to_string(),
+    }
+}
+
+fn desc_filter_matches(doc: &UDocument<'static>, id: NodeId, filter: &DescFilter) -> bool {
+    match filter {
+        DescFilter::All => matches!(
+            doc.node_kind(id),
+            Some(NodeKind::Element(_))
+                | Some(NodeKind::Comment(_))
+                | Some(NodeKind::ProcessingInstruction(_))
+        ),
+        DescFilter::Elements => {
+            matches!(doc.node_kind(id), Some(NodeKind::Element(_)))
+        }
+        DescFilter::Named { ns, local } => {
+            matches!(doc.element(id), Some(e) if e.name.matches(ns.as_deref(), local))
+        }
+    }
+}
+
+fn postprocess_parse_options_detached(
+    doc: &mut UDocument<'static>,
+    remove_comments: bool,
+    remove_pis: bool,
+    strip_cdata: bool,
+) {
+    let Some(root) = doc.document_element() else {
+        return;
+    };
+
+    if remove_comments || remove_pis || strip_cdata {
+        let mut stack = vec![root];
+        while let Some(parent) = stack.pop() {
+            let mut child = doc.first_child(parent);
+            while let Some(cid) = child {
+                let next = doc.next_sibling(cid);
+                let remove = matches!(
+                    doc.node_kind(cid),
+                    Some(NodeKind::Comment(_)) if remove_comments
+                ) || matches!(
+                    doc.node_kind(cid),
+                    Some(NodeKind::ProcessingInstruction(_)) if remove_pis
+                );
+                if remove {
+                    doc.remove_child(parent, cid);
+                    release_detached_subtree_payload(doc, cid);
+                    child = next;
+                    continue;
+                }
+
+                let cdata_text = if strip_cdata {
+                    match doc.node_kind(cid) {
+                        Some(NodeKind::CData(text)) => Some(text.to_string()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(text) = cdata_text {
+                    if let Some(kind) = doc.node_kind_mut(cid) {
+                        *kind = NodeKind::Text(Cow::Owned(text));
+                    }
+                }
+
+                if matches!(doc.node_kind(cid), Some(NodeKind::Element(_))) {
+                    stack.push(cid);
+                }
+                child = next;
+            }
+        }
+    }
+
+    if remove_comments || remove_pis || strip_cdata {
+        coalesce_text_subtree(doc, root);
+    }
+}
+
+fn coalesce_text_subtree(doc: &mut UDocument<'static>, root: NodeId) {
+    let mut stack = vec![root];
+    while let Some(parent) = stack.pop() {
+        let mut run_head: Option<NodeId> = None;
+        let mut child = doc.first_child(parent);
+        while let Some(cid) = child {
+            let next = doc.next_sibling(cid);
+            match doc.node_kind(cid) {
+                Some(NodeKind::Text(text)) => {
+                    let text = text.to_string();
+                    if let Some(head) = run_head {
+                        if let Some(NodeKind::Text(existing)) = doc.node_kind_mut(head) {
+                            existing.to_mut().push_str(&text);
+                        }
+                        doc.remove_child(parent, cid);
+                        release_detached_subtree_payload(doc, cid);
+                    } else {
+                        run_head = Some(cid);
+                    }
+                }
+                Some(NodeKind::Element(_)) => {
+                    run_head = None;
+                    stack.push(cid);
+                }
+                _ => {
+                    run_head = None;
+                }
+            }
+            child = next;
+        }
+    }
+}
+
 /// A lazy, native pre-order descendant iterator (see `Node::iter_descendants`).
 ///
 /// Holds an explicit stack of node ids. Each `__next__` acquires the document
@@ -2220,21 +3049,7 @@ fn advance_desc_walk(
         }
         stack[start..].reverse();
 
-        let matched = match filter {
-            DescFilter::All => matches!(
-                doc.node_kind(id),
-                Some(NodeKind::Element(_))
-                    | Some(NodeKind::Comment(_))
-                    | Some(NodeKind::ProcessingInstruction(_))
-            ),
-            DescFilter::Elements => {
-                matches!(doc.node_kind(id), Some(NodeKind::Element(_)))
-            }
-            DescFilter::Named { ns, local } => {
-                matches!(doc.element(id), Some(e) if e.name.matches(ns.as_deref(), local))
-            }
-        };
-        if matched {
+        if desc_filter_matches(doc, id, filter) {
             return Some(id);
         }
     }
@@ -2280,6 +3095,8 @@ struct ProxyDescendantIterator {
     doc: SharedDoc,
     stack: Vec<NodeId>,
     filter: DescFilter,
+    buffer: Vec<NodeId>,
+    buffer_index: usize,
 }
 
 #[pymethods]
@@ -2289,6 +3106,7 @@ impl ProxyDescendantIterator {
     }
 
     fn __next__(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        const BATCH_SIZE: usize = 128;
         let py = slf.py();
         // Find the next matching node id under the document lock, releasing
         // both the lock and the iterator borrow before touching the proxy
@@ -2302,12 +3120,33 @@ impl ProxyDescendantIterator {
                 doc,
                 stack,
                 filter,
+                buffer,
+                buffer_index,
             } = &mut *cell;
-            let guard = doc
-                .lock()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let id = advance_desc_walk(&guard.doc, stack, filter);
-            drop(guard);
+            let id = if *buffer_index < buffer.len() {
+                let id = buffer[*buffer_index];
+                *buffer_index += 1;
+                Some(id)
+            } else {
+                buffer.clear();
+                *buffer_index = 0;
+                let guard = doc
+                    .lock()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                while buffer.len() < BATCH_SIZE {
+                    let Some(id) = advance_desc_walk(&guard.doc, stack, filter) else {
+                        break;
+                    };
+                    buffer.push(id);
+                }
+                drop(guard);
+                if buffer.is_empty() {
+                    None
+                } else {
+                    *buffer_index = 1;
+                    Some(buffer[0])
+                }
+            };
             (holder.clone_ref(py), id)
         };
         match next_id {
@@ -2389,6 +3228,519 @@ impl ProxyChildIterator {
                 id.index(),
                 None,
             )?)),
+            None => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IterParse - native pull-parser backed etree.iterparse
+// ---------------------------------------------------------------------------
+
+const ITERPARSE_YIELD_BATCH: usize = 64;
+
+#[derive(Clone, Copy)]
+struct IterparseEventSet {
+    start: bool,
+    end: bool,
+    comment: bool,
+    pi: bool,
+    start_ns: bool,
+    end_ns: bool,
+}
+
+impl IterparseEventSet {
+    fn parse(events: Vec<String>) -> PyResult<Self> {
+        let mut set = IterparseEventSet {
+            start: false,
+            end: false,
+            comment: false,
+            pi: false,
+            start_ns: false,
+            end_ns: false,
+        };
+        for event in events {
+            match event.as_str() {
+                "start" => set.start = true,
+                "end" => set.end = true,
+                "comment" => set.comment = true,
+                "pi" => set.pi = true,
+                "start-ns" => set.start_ns = true,
+                "end-ns" => set.end_ns = true,
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "unsupported iterparse event: {}",
+                        event
+                    )));
+                }
+            }
+        }
+        Ok(set)
+    }
+}
+
+enum IterPullEvent {
+    StartNamespace {
+        prefix: Option<String>,
+        uri: String,
+    },
+    EndNamespace,
+    StartElement {
+        name: UQName<'static>,
+        attributes: Vec<uppsala::Attribute<'static>>,
+        namespace_declarations: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    },
+    EndElement {
+        name: UQName<'static>,
+    },
+    Text {
+        content: String,
+    },
+    CData {
+        content: String,
+    },
+    Comment {
+        content: String,
+    },
+    ProcessingInstruction {
+        pi: uppsala::ProcessingInstruction<'static>,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_iterparse_events(
+    input: &str,
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
+) -> XmlResult<VecDeque<IterPullEvent>> {
+    let mut parser = match namespace_aware {
+        Some(false) => UPullParser::with_namespace_aware(input, false),
+        _ => UPullParser::new(input),
+    };
+    if let Some(d) = max_depth {
+        parser = parser.with_max_depth(d);
+    }
+    if let Some(b) = max_entity_expansion {
+        parser = parser.with_max_entity_expansion(b);
+    }
+    if let Some(true) = forbid_dtd {
+        parser = parser.with_forbid_dtd(true);
+    }
+    if let Some(true) = forbid_entities {
+        parser = parser.with_forbid_entities(true);
+    }
+
+    let mut out = VecDeque::new();
+    while let Some(event) = parser.next_event()? {
+        match event {
+            UPullEvent::XmlDeclaration(_) | UPullEvent::Doctype(_) => {}
+            UPullEvent::StartNamespace { prefix, uri } => {
+                out.push_back(IterPullEvent::StartNamespace {
+                    prefix: prefix.map(|p| p.into_owned()),
+                    uri: uri.into_owned(),
+                });
+            }
+            UPullEvent::EndNamespace => out.push_back(IterPullEvent::EndNamespace),
+            UPullEvent::StartElement {
+                name,
+                attributes,
+                namespace_declarations,
+                ..
+            } => {
+                out.push_back(IterPullEvent::StartElement {
+                    name: name.into_static(),
+                    attributes: attributes.into_iter().map(|a| a.into_static()).collect(),
+                    namespace_declarations: namespace_declarations
+                        .into_iter()
+                        .map(|(p, u)| (Cow::Owned(p.into_owned()), Cow::Owned(u.into_owned())))
+                        .collect(),
+                });
+            }
+            UPullEvent::EndElement { name, .. } => {
+                out.push_back(IterPullEvent::EndElement {
+                    name: name.into_static(),
+                });
+            }
+            UPullEvent::Text { content, .. } => {
+                out.push_back(IterPullEvent::Text {
+                    content: content.into_owned(),
+                });
+            }
+            UPullEvent::CData { content, .. } => {
+                out.push_back(IterPullEvent::CData {
+                    content: content.into_owned(),
+                });
+            }
+            UPullEvent::Comment { content, .. } => {
+                out.push_back(IterPullEvent::Comment {
+                    content: content.into_owned(),
+                });
+            }
+            UPullEvent::ProcessingInstruction { pi, .. } => {
+                out.push_back(IterPullEvent::ProcessingInstruction {
+                    pi: pi.into_static(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[pyclass(name = "_IterParse")]
+struct IterParse {
+    holder: Py<PyAny>,
+    state: Arc<Mutex<IterParseState>>,
+}
+
+struct IterParseState {
+    input_events: VecDeque<IterPullEvent>,
+    doc: SharedDoc,
+    stack: Vec<NodeId>,
+    events: IterparseEventSet,
+    remove_comments: bool,
+    remove_pis: bool,
+    strip_cdata: bool,
+    tag: Option<String>,
+    root_id: Option<NodeId>,
+    pending: VecDeque<IterYield>,
+    done: bool,
+}
+
+enum IterYield {
+    Element {
+        event_name: &'static str,
+        id: NodeId,
+    },
+    Namespace {
+        prefix: Option<String>,
+        uri: String,
+    },
+    EndNamespace,
+}
+
+enum IterStepError {
+    Xml(XmlError),
+    Runtime(String),
+}
+
+impl IterStepError {
+    fn into_pyerr(self, py: Python<'_>) -> PyErr {
+        match self {
+            IterStepError::Xml(e) => match ETREE_XML_SYNTAX_ERROR.get(py) {
+                Some(cls) => PyErr::from_type(cls.bind(py).clone(), e.to_string()),
+                None => xml_error_to_pyerr(e),
+            },
+            IterStepError::Runtime(e) => PyRuntimeError::new_err(e),
+        }
+    }
+}
+
+type IterStepResult<T> = Result<T, IterStepError>;
+
+fn lock_iter_doc(doc: &SharedDoc) -> IterStepResult<std::sync::MutexGuard<'_, DocWithInput>> {
+    doc.lock()
+        .map_err(|e| IterStepError::Runtime(e.to_string()))
+}
+
+impl IterParse {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        input: String,
+        holder: Py<PyAny>,
+        events: Vec<String>,
+        max_depth: Option<u32>,
+        max_entity_expansion: Option<usize>,
+        namespace_aware: Option<bool>,
+        forbid_dtd: Option<bool>,
+        forbid_entities: Option<bool>,
+        remove_comments: bool,
+        remove_pis: bool,
+        strip_cdata: bool,
+        tag: Option<String>,
+    ) -> PyResult<Self> {
+        let event_set = IterparseEventSet::parse(events)?;
+        let doc = shared_doc_from_holder(py, &holder)?;
+        let input_events = py
+            .detach(move || {
+                collect_iterparse_events(
+                    &input,
+                    max_depth,
+                    max_entity_expansion,
+                    namespace_aware,
+                    forbid_dtd,
+                    forbid_entities,
+                )
+            })
+            .map_err(|e| IterStepError::Xml(e).into_pyerr(py))?;
+        Ok(IterParse {
+            holder,
+            state: Arc::new(Mutex::new(IterParseState {
+                input_events,
+                doc,
+                stack: Vec::new(),
+                events: event_set,
+                remove_comments,
+                remove_pis,
+                strip_cdata,
+                tag,
+                root_id: None,
+                pending: VecDeque::new(),
+                done: false,
+            })),
+        })
+    }
+
+    fn proxy_for(&self, py: Python<'_>, id: NodeId) -> PyResult<Py<PyAny>> {
+        let holder = self.holder.bind(py).cast::<DocHolderBase>()?;
+        DocHolderBase::proxy_for_id(holder, id.index(), None)
+    }
+
+    fn event_tuple(
+        py: Python<'_>,
+        event_name: &'static str,
+        value: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        Ok((event_name, value).into_pyobject(py)?.into_any().unbind())
+    }
+
+    fn namespace_tuple(py: Python<'_>, prefix: Option<String>, uri: String) -> PyResult<Py<PyAny>> {
+        Ok((prefix, uri).into_pyobject(py)?.into_any().unbind())
+    }
+
+    fn qname_matches_tag(name: &UQName<'_>, tag: Option<&str>) -> bool {
+        let Some(tag) = tag else {
+            return true;
+        };
+        if tag == "*" {
+            return true;
+        }
+        match name.namespace_uri.as_deref() {
+            Some(ns) if !ns.is_empty() => {
+                tag.len() == ns.len() + name.local_name.len() + 2
+                    && tag.as_bytes().first() == Some(&b'{')
+                    && &tag[1..1 + ns.len()] == ns
+                    && tag.as_bytes().get(1 + ns.len()) == Some(&b'}')
+                    && &tag[2 + ns.len()..] == name.local_name.as_ref()
+            }
+            _ => {
+                tag == name.local_name.as_ref()
+                    || tag
+                        .strip_prefix("{}")
+                        .is_some_and(|local| local == name.local_name.as_ref())
+            }
+        }
+    }
+}
+
+impl IterParseState {
+    fn append_text(&mut self, text: &str, cdata: bool) -> IterStepResult<()> {
+        let Some(parent) = self.stack.last().copied() else {
+            return Ok(());
+        };
+        let mut guard = lock_iter_doc(&self.doc)?;
+        if !cdata || self.strip_cdata {
+            if let Some(last) = guard.doc.last_child(parent) {
+                if let Some(NodeKind::Text(existing)) = guard.doc.node_kind_mut(last) {
+                    existing.to_mut().push_str(text);
+                    return Ok(());
+                }
+            }
+            let id = guard.doc.create_text(Cow::Owned(text.to_string()));
+            guard.doc.append_child(parent, id);
+        } else {
+            let id = guard.doc.create_cdata(Cow::Owned(text.to_string()));
+            guard.doc.append_child(parent, id);
+        }
+        Ok(())
+    }
+
+    fn append_comment(&mut self, text: &str) -> IterStepResult<NodeId> {
+        let mut guard = lock_iter_doc(&self.doc)?;
+        let id = guard.doc.create_comment(Cow::Owned(text.to_string()));
+        let parent = self
+            .stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| guard.doc.root());
+        guard.doc.append_child(parent, id);
+        Ok(id)
+    }
+
+    fn append_pi(&mut self, pi: uppsala::ProcessingInstruction<'static>) -> IterStepResult<NodeId> {
+        let mut guard = lock_iter_doc(&self.doc)?;
+        let id = guard.doc.create_processing_instruction(pi.target, pi.data);
+        let parent = self
+            .stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| guard.doc.root());
+        guard.doc.append_child(parent, id);
+        Ok(id)
+    }
+
+    fn append_start(
+        &mut self,
+        name: UQName<'static>,
+        attributes: Vec<uppsala::Attribute<'static>>,
+        namespace_declarations: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    ) -> IterStepResult<NodeId> {
+        let mut guard = lock_iter_doc(&self.doc)?;
+        let id = guard.doc.create_element(name);
+        if let Some(el) = guard.doc.element_mut(id) {
+            el.attributes = attributes;
+            el.namespace_declarations = namespace_declarations;
+        }
+        let parent = self
+            .stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| guard.doc.root());
+        guard.doc.append_child(parent, id);
+        Ok(id)
+    }
+
+    fn next_detached(&mut self) -> IterStepResult<Option<IterYield>> {
+        if let Some(yielded) = self.pending.pop_front() {
+            return Ok(Some(yielded));
+        }
+        if self.done {
+            return Ok(None);
+        }
+
+        while self.pending.len() < ITERPARSE_YIELD_BATCH {
+            let event = match self.input_events.pop_front() {
+                Some(event) => event,
+                None => {
+                    self.done = true;
+                    break;
+                }
+            };
+
+            match event {
+                IterPullEvent::StartNamespace { prefix, uri } => {
+                    if self.events.start_ns {
+                        self.pending.push_back(IterYield::Namespace { prefix, uri });
+                    }
+                }
+                IterPullEvent::EndNamespace => {
+                    if self.events.end_ns {
+                        self.pending.push_back(IterYield::EndNamespace);
+                    }
+                }
+                IterPullEvent::StartElement {
+                    name,
+                    attributes,
+                    namespace_declarations,
+                } => {
+                    let should_yield = self.events.start
+                        && IterParse::qname_matches_tag(&name, self.tag.as_deref());
+                    let id = self.append_start(name, attributes, namespace_declarations)?;
+                    if self.root_id.is_none() {
+                        self.root_id = Some(id);
+                    }
+                    self.stack.push(id);
+                    if should_yield {
+                        self.pending.push_back(IterYield::Element {
+                            event_name: "start",
+                            id,
+                        });
+                    }
+                }
+                IterPullEvent::EndElement { name } => {
+                    let id = self.stack.pop().ok_or_else(|| {
+                        IterStepError::Runtime("iterparse element stack underflow".to_string())
+                    })?;
+                    if self.events.end && IterParse::qname_matches_tag(&name, self.tag.as_deref()) {
+                        self.pending.push_back(IterYield::Element {
+                            event_name: "end",
+                            id,
+                        });
+                    }
+                }
+                IterPullEvent::Text { content } => {
+                    self.append_text(&content, false)?;
+                }
+                IterPullEvent::CData { content } => {
+                    self.append_text(&content, true)?;
+                }
+                IterPullEvent::Comment { content } => {
+                    if !self.remove_comments {
+                        let id = self.append_comment(&content)?;
+                        if self.events.comment {
+                            self.pending.push_back(IterYield::Element {
+                                event_name: "comment",
+                                id,
+                            });
+                        }
+                    }
+                }
+                IterPullEvent::ProcessingInstruction { pi } => {
+                    if !self.remove_pis {
+                        let id = self.append_pi(pi)?;
+                        if self.events.pi {
+                            self.pending.push_back(IterYield::Element {
+                                event_name: "pi",
+                                id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(self.pending.pop_front())
+    }
+}
+
+#[pymethods]
+impl IterParse {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        let state = {
+            let cell = slf.borrow();
+            Arc::clone(&cell.state)
+        };
+        let yielded = py
+            .detach(move || {
+                let mut state = state
+                    .lock()
+                    .map_err(|e| IterStepError::Runtime(e.to_string()))?;
+                state.next_detached()
+            })
+            .map_err(|e| e.into_pyerr(py))?;
+        match yielded {
+            None => Ok(None),
+            Some(IterYield::Element { event_name, id }) => {
+                let proxy = slf.borrow().proxy_for(py, id)?;
+                Ok(Some(IterParse::event_tuple(py, event_name, proxy)?))
+            }
+            Some(IterYield::Namespace { prefix, uri }) => {
+                let value = IterParse::namespace_tuple(py, prefix, uri)?;
+                Ok(Some(IterParse::event_tuple(py, "start-ns", value)?))
+            }
+            Some(IterYield::EndNamespace) => {
+                Ok(Some(IterParse::event_tuple(py, "end-ns", py.None())?))
+            }
+        }
+    }
+
+    #[getter]
+    fn root(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let root_id = self
+            .state
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            .root_id;
+        match root_id {
+            Some(id) => Ok(Some(self.proxy_for(py, id)?)),
             None => Ok(None),
         }
     }
@@ -2551,6 +3903,22 @@ impl Document {
         Ok(guard.input.clone())
     }
 
+    /// Drop the original decoded input buffer retained for source lookups.
+    ///
+    /// The DOM remains usable, but `input_text` becomes empty and `Node.source`
+    /// no longer returns source snippets. This is useful for lxml-compatible
+    /// etree parsing where callers want compact long-lived trees and do not use
+    /// pyuppsala's lower-level source-inspection helpers.
+    fn discard_input(&self) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        guard.input.clear();
+        guard.input.shrink_to_fit();
+        Ok(())
+    }
+
     /// The raw ``<!DOCTYPE ...>`` declaration preserved from the source, or None.
     ///
     /// Uppsala preserves the document type declaration verbatim (including the
@@ -2565,6 +3933,33 @@ impl Document {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard.doc.doctype.as_ref().map(|dt| dt.to_string()))
+    }
+
+    /// Apply etree XMLParser post-parse transforms natively.
+    ///
+    /// This is called immediately after parsing and before normal element
+    /// proxies are exposed, so it can rewrite/remove nodes without proxy-cache
+    /// repair. The work is pure Rust and may touch large trees, so it releases
+    /// the GIL while holding the document mutex.
+    fn postprocess_parse_options(
+        &self,
+        py: Python<'_>,
+        remove_comments: bool,
+        remove_pis: bool,
+        strip_cdata: bool,
+    ) -> PyResult<()> {
+        let doc = Arc::clone(&self.inner);
+        py.detach(move || {
+            let mut guard = doc.lock().map_err(|e| e.to_string())?;
+            postprocess_parse_options_detached(
+                &mut guard.doc,
+                remove_comments,
+                remove_pis,
+                strip_cdata,
+            );
+            Ok::<_, String>(())
+        })
+        .map_err(PyRuntimeError::new_err)
     }
 
     /// Find all elements with the given local tag name.
@@ -3561,6 +4956,86 @@ impl Xslt {
 // Module-level convenience functions
 // ---------------------------------------------------------------------------
 
+fn shared_doc_from_holder(py: Python<'_>, holder: &Py<PyAny>) -> PyResult<SharedDoc> {
+    let holder = holder.bind(py).cast::<DocHolderBase>()?;
+    let doc = holder.borrow().doc.clone_ref(py);
+    Ok(Arc::clone(&doc.bind(py).borrow().inner))
+}
+
+/// Create a native pull-backed iterparse iterator from decoded XML text.
+#[pyfunction]
+#[pyo3(signature = (xml, holder, events, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None, remove_comments=false, remove_pis=false, strip_cdata=true, tag=None))]
+#[allow(clippy::too_many_arguments)]
+fn iterparse_text(
+    py: Python<'_>,
+    xml: &str,
+    holder: Py<PyAny>,
+    events: Vec<String>,
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
+    remove_comments: bool,
+    remove_pis: bool,
+    strip_cdata: bool,
+    tag: Option<String>,
+) -> PyResult<IterParse> {
+    IterParse::new(
+        py,
+        xml.to_string(),
+        holder,
+        events,
+        max_depth,
+        max_entity_expansion,
+        namespace_aware,
+        forbid_dtd,
+        forbid_entities,
+        remove_comments,
+        remove_pis,
+        strip_cdata,
+        tag,
+    )
+}
+
+/// Create a native pull-backed iterparse iterator from XML bytes, using the
+/// same BOM/UTF-16 detection as parse_bytes.
+#[pyfunction]
+#[pyo3(signature = (data, holder, events, *, max_depth=None, max_entity_expansion=None, namespace_aware=None, forbid_dtd=None, forbid_entities=None, remove_comments=false, remove_pis=false, strip_cdata=true, tag=None))]
+#[allow(clippy::too_many_arguments)]
+fn iterparse_bytes(
+    py: Python<'_>,
+    data: &[u8],
+    holder: Py<PyAny>,
+    events: Vec<String>,
+    max_depth: Option<u32>,
+    max_entity_expansion: Option<usize>,
+    namespace_aware: Option<bool>,
+    forbid_dtd: Option<bool>,
+    forbid_entities: Option<bool>,
+    remove_comments: bool,
+    remove_pis: bool,
+    strip_cdata: bool,
+    tag: Option<String>,
+) -> PyResult<IterParse> {
+    let input = decode_xml_bytes(data)?;
+    IterParse::new(
+        py,
+        input,
+        holder,
+        events,
+        max_depth,
+        max_entity_expansion,
+        namespace_aware,
+        forbid_dtd,
+        forbid_entities,
+        remove_comments,
+        remove_pis,
+        strip_cdata,
+        tag,
+    )
+}
+
 /// Parse an XML string and return a Document.
 ///
 /// See ``Document.__init__`` for the keyword arguments that override the
@@ -4419,6 +5894,7 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Node>()?;
     m.add_class::<ElementBase>()?;
     m.add_class::<DocHolderBase>()?;
+    m.add_class::<IterParse>()?;
     m.add_class::<QName>()?;
     m.add_class::<Attribute>()?;
     m.add_class::<XPathEvaluator>()?;
@@ -4432,6 +5908,8 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(parse_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(parse_many, m)?)?;
+    m.add_function(wrap_pyfunction!(iterparse_text, m)?)?;
+    m.add_function(wrap_pyfunction!(iterparse_bytes, m)?)?;
     #[cfg(feature = "net")]
     {
         m.add_class::<FetchResult>()?;
@@ -4439,6 +5917,7 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(fetch_and_parse_many, m)?)?;
     }
     m.add_function(wrap_pyfunction!(_register_element_helpers, m)?)?;
+    m.add_function(wrap_pyfunction!(_register_etree_exceptions, m)?)?;
     m.add_function(wrap_pyfunction!(_register_element_type, m)?)?;
 
     // Default resource-limit constants (uppsala 0.4.0 / 0.5.0 hardening)
