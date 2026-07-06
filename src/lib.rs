@@ -183,8 +183,7 @@ fn split_etree_key_str(value: &str) -> PyResult<(Option<String>, String)> {
 /// Parse a Python etree key from a string or QName-like object.
 ///
 /// Missing ``.text`` (or an ``AttributeError`` during lookup) is treated as "not QName-like".
-/// Other exceptions raised by a ``.text`` descriptor are propagated so user code is not hidden
-/// behind a generic type error
+/// Non-``AttributeError`` lookup failures are propagated so user code is not hidden behind a generic type error.
 fn split_etree_key_py(key: &Bound<'_, PyAny>) -> PyResult<(Option<String>, String)> {
     if let Ok(value) = key.extract::<&str>() {
         return split_etree_key_str(value);
