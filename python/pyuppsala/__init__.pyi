@@ -67,6 +67,9 @@ class Node:
     def tag(self) -> Optional[QName]:
         """The tag name for element nodes, or None for other kinds."""
         ...
+    def clark_tag(self) -> Optional[str]:
+        """The element tag in Clark notation, or None for non-element nodes."""
+        ...
     @property
     def text(self) -> Optional[str]:
         """The text content for text/comment/cdata nodes, or None."""
@@ -102,12 +105,21 @@ class Node:
     def children(self) -> list[Node]:
         """The child nodes of this node."""
         ...
+    def content_children(self) -> list[Node]:
+        """Element/comment/processing-instruction children, excluding text and CDATA."""
+        ...
     @property
     def node_id(self) -> int:
         """A stable integer identity for this node within its Document."""
         ...
     def content_child_count(self) -> int:
         """Number of element/comment/PI children, counted without materialising them."""
+        ...
+    def leading_text_run(self) -> Optional[str]:
+        """The contiguous leading Text/CDATA run used by etree ``.text``."""
+        ...
+    def tail_text_run(self) -> Optional[str]:
+        """The contiguous following Text/CDATA run used by etree ``.tail``."""
         ...
     def iter_descendants(self, tag: Optional[str] = None) -> Iterator[Node]:
         """Lazy pre-order descendant iterator over this node and its subtree.
@@ -136,7 +148,10 @@ class Node:
         ...
     @property
     def namespace_declarations(self) -> list[tuple[Optional[str], str]]:
-        """In-scope (prefix, uri) namespace declarations; prefix is None for the default."""
+        """Namespace declarations attached to this element; prefix is None for the default."""
+        ...
+    def nsmap(self) -> list[tuple[Optional[str], str]]:
+        """In-scope namespace declarations as ordered ``(prefix, uri)`` pairs."""
         ...
     @property
     def comment_text(self) -> Optional[str]:
@@ -190,6 +205,14 @@ class Node:
         self, name: str, namespace_uri: Optional[str] = None
     ) -> Optional[str]:
         """Get an attribute value by local name."""
+        ...
+    def get_attribute_exact(
+        self, name: str, namespace_uri: Optional[str] = None
+    ) -> Optional[str]:
+        """Get an attribute by exact namespace URI and local name.
+
+        ``namespace_uri=None`` means the no-namespace attribute.
+        """
         ...
     def set_attribute(
         self,

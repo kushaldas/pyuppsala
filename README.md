@@ -22,6 +22,8 @@ This release is against `0.9` of Uppsala library.
 - **Automatic encoding detection** for UTF-8 and UTF-16 (LE/BE)
 - **lxml.etree-compatible API** via `pyuppsala.etree`, a near drop-in for much of
   `lxml.etree` backed by Uppsala's secure parser
+- **Native batch and fast etree paths** for parsing many documents and running
+  simple large-tree aggregates without one Python object per matched node
 
 Read the [full documentation](https://pyuppsala.rtfd.io)
 
@@ -186,6 +188,8 @@ for the supported and unsupported feature matrix.
 | `fetch_many(urls)` | Fetch many HTTP(S) or file URLs with body limits and per-item results (requires `pyuppsala._HAS_NET`) |
 | `fetch_and_parse_many(urls)` | Fetch many URLs and parse each response as XML (requires `pyuppsala._HAS_NET`) |
 | `pyuppsala.etree` | lxml.etree-compatible API (`Element`, `SubElement`, `fromstring`, `tostring`, `find`/`findall`, `XPath`, `XMLSchema`, ...) |
+| `etree.fromstring_many(items)` | Parse many documents into etree roots with per-item errors |
+| `_Element.fast_*()` | Native count/existence/attribute/text-group scans for large etree subtrees |
 
 ### Exceptions
 

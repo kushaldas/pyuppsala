@@ -76,6 +76,43 @@ default. Use :class:`~pyuppsala.etree.XMLParser` to adjust limits:
    explicit ``max_depth`` / ``max_entity_expansion`` values when you know the
    expected upper bound.
 
+Constructed names and string compatibility
+------------------------------------------
+
+The parser validates names and namespace bindings while reading XML. Code that
+builds or mutates XML has to meet the same bar before values enter the native
+DOM:
+
+* Element local names, attribute local names, namespace prefixes, and
+  processing-instruction targets must be valid XML names. Invalid names raise
+  :class:`ValueError` before they can be serialized as markup.
+* Namespace prefixes are validated as NCNames. ``register_namespace()`` rejects
+  the reserved ``xml`` and ``xmlns`` prefixes, and generated ``ns<N>`` prefixes
+  remain reserved for pyuppsala's serializer.
+* Prefix/URI pairs follow the XML Namespaces reserved bindings. A prefix
+  requires a namespace URI, ``xmlns`` cannot be used as an element or attribute
+  prefix, the ``xmlns`` namespace cannot be declared as ordinary data, and the
+  ``xml`` prefix can only be bound to the XML namespace.
+* String values stored as XML text, attribute values, namespace URIs, comments,
+  CDATA, or processing-instruction data must be XML 1.0 compatible. Illegal
+  C0 controls, NUL, surrogate code points, and U+FFFE/U+FFFF raise
+  :class:`ValueError`, matching lxml's "All strings must be XML compatible"
+  behavior.
+
+.. code-block:: python
+
+    from pyuppsala import etree as ET
+
+    try:
+        ET.Element('bad name')
+    except ValueError:
+        pass
+
+    try:
+        ET.Element("{urn:\x05bad}root")
+    except ValueError:
+        pass
+
 XPath and XInclude security defaults
 ------------------------------------
 
@@ -85,11 +122,17 @@ native per-evaluation node-visit budget
 (:data:`pyuppsala.DEFAULT_MAX_XPATH_NODE_VISITS`); raise
 ``pyuppsala.etree.MAX_XPATH_NODE_VISITS`` only for trusted large documents.
 
-XInclude processing is explicit: call ``tree.xinclude()`` or ``element.xinclude()``
-when you want to process ``xi:include`` elements. Remote ``http(s)``/``ftp``
-includes are blocked by default and require ``network_access=True``. Local file
-targets must stay under the including document's base directory after symlink
-resolution, and every include target is size-limited before buffering.
+XInclude processing is explicit: call ``tree.xinclude()`` or
+``element.xinclude()`` when you want to process ``xi:include`` elements.
+``parse="xml"`` splices in the referenced document's root element and
+``parse="text"`` inserts decoded text. ``xi:fallback`` is used when a resource
+cannot be loaded, matching lxml's usual fallback shape.
+
+Remote ``http(s)``/``ftp`` includes are blocked by default and require
+``network_access=True``. Local filesystem paths and ``file://`` URLs must stay
+under the including document's base directory after realpath/symlink
+resolution. Include targets are capped at 128 MiB before buffering, remote
+fetches use a 30 second timeout, and recursive processing has a depth guard.
 
 .. important::
 
@@ -114,8 +157,69 @@ resource caps, and template recursion uses the native
    them. Custom extension functions and XSLT access-control objects are not
    supported.
 
-Native fast scans
------------------
+Batch parsing
+-------------
+
+Use :func:`fromstring_many` when you need to parse many independent XML
+documents and then work with normal ``_Element`` roots. It wraps the native
+:func:`pyuppsala.parse_many` batch parser, releases the GIL during the batch,
+and uses native worker threads. The result list is index-aligned with the input:
+each item is either an ``_Element`` root or an exception object for that one
+input. A malformed item does not fail the whole batch.
+
+This is most useful for ingestion workloads such as federation metadata
+aggregators, message queues, or directory scans where the documents are
+independent and the next step still wants the lxml-style etree API.
+
+.. code-block:: python
+
+    from pyuppsala import etree as ET
+
+    parser = ET.XMLParser(remove_comments=True, forbid_dtd=True)
+    results = ET.fromstring_many(
+        ["<a id='1'/>", "<broken", b"<b><!--gone--><c/></b>"],
+        parser=parser,
+        max_threads=4,
+    )
+
+    roots = []
+    for result in results:
+        if isinstance(result, Exception):
+            print("bad item:", result)
+        else:
+            roots.append(result)
+
+Parser options apply per item. If ``XMLParser(encoding=...)`` is supplied,
+byte inputs are decoded with that override before entering the native batch.
+Wrong-typed items become per-slot :class:`TypeError` objects so the batch shape
+stays predictable.
+
+Iterparse
+---------
+
+:func:`iterparse` provides lxml-style event iteration for callers that already
+use ``for event, elem in etree.iterparse(...)``. It supports ``"start"``,
+``"end"``, ``"start-ns"``, ``"end-ns"``, ``"comment"``, and ``"pi"`` events,
+the same parser security options as :func:`fromstring`, and tag filters using
+strings, Clark notation, :class:`QName`, or QName-like objects with a string
+``.text`` attribute.
+
+The current implementation reads the full input before replaying native pull
+events. It is useful for compatibility and for code that clears completed
+elements to keep the visible tree small, but it is not a true streaming I/O
+memory profile like libxml2's incremental parser.
+
+.. code-block:: python
+
+    from pyuppsala import etree as ET
+
+    parser = ET.XMLParser(remove_comments=True, strip_cdata=True)
+    for event, elem in ET.iterparse("items.xml", events=("end",), parser=parser, tag="item"):
+        process(elem.get("id"), elem.text)
+        elem.clear()
+
+Native fast methods
+-------------------
 
 The normal ``etree`` traversal APIs return live ``_Element`` proxies, matching
 lxml. That is the right default when you need to inspect elements, mutate the
@@ -123,10 +227,36 @@ tree, run complex Python predicates, or keep code portable between lxml and
 pyuppsala.
 
 For large trees where the loop body is only a simple aggregate or fixed-shape
-extraction, pyuppsala also exposes native ``fast_*`` methods on ``_Element``.
-These are pyuppsala extensions, not lxml APIs. They run the full descendant walk
-in Rust under one document lock with the GIL released, and they avoid creating a
+extraction, pyuppsala exposes native ``fast_*`` methods on ``_Element``. These
+are pyuppsala extensions, not lxml APIs. They run the full descendant walk in
+Rust under one document lock with the GIL released, and they avoid creating a
 Python proxy for every matching node.
+
+Use them when the Python loop would otherwise do one of these simple patterns
+over a large subtree:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 36 36
+
+   * - Method
+     - Best fit
+     - Prefer normal etree APIs when
+   * - ``fast_count(tag=None)``
+     - Count matching nodes.
+     - You need the nodes themselves.
+   * - ``fast_has(tag=None)``
+     - Test whether a match exists and stop at the first match.
+     - You need to inspect or mutate the match.
+   * - ``fast_sum_int_attr(key, tag=None)``
+     - Sum integer attribute values over matching elements.
+     - Non-integer values should be skipped or custom parsed.
+   * - ``fast_collect_attr(key, tag=None)``
+     - Gather one attribute from matching elements.
+     - You need sibling context, element text, or custom predicates.
+   * - ``fast_collect_grouped_text(group_tag, item_tag, key, value_tag)``
+     - Extract fixed nested groups such as SAML EntityAttributes.
+     - You need general XPath semantics, recursive string values, or mutation.
 
 All ``fast_*`` methods use the same tag matching rules as ``Element.iter(tag)``:
 
@@ -135,7 +265,13 @@ All ``fast_*`` methods use the same tag matching rules as ``Element.iter(tag)``:
 * ``tag="*"`` matches element nodes only.
 * ``tag="item"``, ``tag="{urn:example}item"``, and :class:`QName` match named
   elements.
+* ``tag="{}item"`` matches no-namespace ``item`` elements, just like a bare
+  ``"item"``.
 * The current element is included, just like ``Element.iter()``.
+
+Attribute keys for ``fast_sum_int_attr``, ``fast_collect_attr``, and
+``fast_collect_grouped_text`` accept strings, Clark notation, :class:`QName`,
+or QName-like objects with a string ``.text`` attribute.
 
 Use ``fast_count`` when a Python loop only counts matching nodes:
 
@@ -265,16 +401,18 @@ Supported features
   ``addnext``/``addprevious``, ``nsmap``, ``prefix``, ``sourceline``.
 - **Factories**: :func:`Element`, :func:`SubElement`, :func:`Comment`,
   :func:`ProcessingInstruction` / ``PI``, :class:`QName`, :func:`ElementTree`.
-- **I/O**: :func:`fromstring` / ``XML``, :func:`fromstringlist`, :func:`parse`,
-  :func:`tostring` (``method="xml"`` only), :func:`tounicode`, :func:`dump`,
-  :func:`indent`. As in lxml, :func:`fromstring` takes in-memory XML while
-  :func:`parse` takes a filename/path or a file-like object (wrap in-memory
-  data in ``io.BytesIO`` to use it). Byte input is decoded by Uppsala (UTF-8
-  and UTF-16, with or without a BOM); ``XMLParser(encoding=...)`` overrides the
-  declared encoding for byte input.
+- **I/O**: :func:`fromstring` / ``XML``, :func:`fromstring_many`,
+  :func:`fromstringlist`, :func:`parse`, :func:`iterparse`, :func:`tostring`
+  (``method="xml"`` only), :func:`tounicode`, :func:`dump`, :func:`indent`.
+  As in lxml, :func:`fromstring` takes in-memory XML while :func:`parse` takes
+  a filename/path or a file-like object (wrap in-memory data in ``io.BytesIO``
+  to use it). Byte input is decoded by Uppsala (UTF-8 and UTF-16, with or
+  without a BOM); ``XMLParser(encoding=...)`` overrides the declared encoding
+  for byte input.
 - **Search**: ``find`` / ``findall`` / ``findtext`` / ``iterfind`` (ElementPath),
-  ``iter`` / ``itertext``, and full ``.xpath()`` via Uppsala's XPath 1.0 engine,
-  plus :class:`XPath` / :class:`ETXPath` / :func:`XPathEvaluator`. pyuppsala also
+  ``iter`` / ``itertext`` / ``iterdescendants`` / ``iterancestors`` /
+  ``itersiblings``, and full ``.xpath()`` via Uppsala's XPath 1.0 engine, plus
+  :class:`XPath` / :class:`ETXPath` / :func:`XPathEvaluator`. pyuppsala also
   provides native bulk-scan extensions: ``fast_count``, ``fast_has``,
   ``fast_sum_int_attr``, ``fast_collect_attr``, and
   ``fast_collect_grouped_text``.
@@ -293,6 +431,32 @@ Supported features
   element omits it. :func:`tostring` also accepts a ``doctype=<str>`` argument
   to inject a custom declaration, matching lxml. The DOCTYPE is preserved
   verbatim and not otherwise processed (no DTD validation or entity loading).
+
+ElementTree, schema, and transform helpers
+------------------------------------------
+
+``ElementTree(element)`` wraps an existing root. ``ElementTree(file=...)`` or
+``tree.parse(...)`` parse a source and preserve a base URL for later
+``xinclude()`` calls. The tree object supports ``getroot()``, ``docinfo``,
+``write()``, ``xinclude()``, ElementPath helpers (``find`` / ``findall`` /
+``findtext`` / ``iterfind``), ``iter()``, ``xpath()``, and ``getpath(element)``.
+
+.. code-block:: python
+
+    from pyuppsala import etree as ET
+
+    tree = ET.ElementTree(file="catalog.xml")
+    root = tree.getroot()
+    print(tree.getpath(root[0]))
+
+``XMLSchema`` exposes an ``error_log`` list. ``validate(tree)`` returns
+``False`` and stores validation errors there; ``assertValid(tree)`` raises
+``DocumentInvalid`` and attaches the same per-call log to the exception.
+
+``XSLT`` exposes an ``error_log`` list for transform failures and a
+``strparam(value)`` compatibility helper. Parameters are not implemented yet,
+so passing keyword parameters to a transform raises ``NotImplementedError``,
+but ``strparam`` is available for code paths that prepare values conditionally.
 
 Exceptions
 ----------
@@ -340,7 +504,7 @@ than being ignored:
 - ``tostring(method=...)`` other than ``"xml"`` (``"html"``, ``"text"``,
   ``"c14n"`` raise ``NotImplementedError``)
 - XPath variable binding (passing ``$name`` keyword arguments to ``.xpath()``)
-- ``iterparse``, C14N / ``canonicalize``
+- C14N / ``canonicalize``
 - RelaxNG, Schematron, and DTD schema classes (only :class:`XMLSchema` /
   XSD is provided)
 
@@ -362,13 +526,21 @@ API reference
 .. currentmodule:: pyuppsala.etree
 
 .. autofunction:: fromstring
+.. autofunction:: fromstring_many
+.. autofunction:: fromstringlist
 .. autofunction:: parse
+.. autofunction:: iterparse
 .. autofunction:: tostring
+.. autofunction:: tounicode
+.. autofunction:: dump
+.. autofunction:: indent
 .. autofunction:: Element
 .. autofunction:: SubElement
 .. autofunction:: Comment
 .. autofunction:: ProcessingInstruction
+.. autofunction:: ElementTree
 .. autofunction:: register_namespace
+.. autodata:: MAX_XPATH_NODE_VISITS
 .. autoclass:: QName
    :members:
 .. autoclass:: DocInfo

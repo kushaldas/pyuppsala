@@ -91,6 +91,17 @@ Security defaults and boundaries
 
 .. important::
 
+   Builder and mutation APIs validate XML output safety before data enters the
+   native DOM. Element names, attribute names, namespace prefixes, and
+   processing-instruction targets must be valid XML names. Namespace bindings
+   must obey the reserved ``xml``/``xmlns`` rules. Text, attribute values,
+   namespace URIs, comments, CDATA, and processing-instruction data must be XML
+   1.0 compatible; illegal controls and non-characters raise
+   :class:`ValueError` instead of being stored and later sanitized differently
+   during serialization.
+
+.. important::
+
     Network and filesystem fetch helpers (available only when built with the
     default-on ``net`` feature; check :data:`pyuppsala._HAS_NET`) buffer
     response bodies in memory and enforce ``max_body`` for every scheme,
@@ -98,6 +109,14 @@ Security defaults and boundaries
     attacker-controlled URLs without an application allowlist if SSRF or
     local-file reads are in scope; keep ``verify_tls=True`` unless you control
     the endpoint.
+
+.. data:: _HAS_NET
+   :type: bool
+
+   ``True`` when the extension was built with the default-on ``net`` feature
+   and therefore exports :class:`FetchResult`, :func:`fetch_many`, and
+   :func:`fetch_and_parse_many`. Network-free builds set this to ``False`` and
+   omit those helpers.
 
 Module-level functions
 ----------------------
@@ -359,6 +378,18 @@ Document
          empty = Document.empty()
          assert empty.input_text == ""
 
+   .. method:: discard_input() -> None
+
+      Drop the retained source text used by :attr:`input_text` and
+      node-level source helpers. After this, :attr:`input_text` is empty and
+      :attr:`Node.source` / :attr:`Node.source_range` no longer have source text
+      to report. This is useful for long-lived parsed trees where source
+      inspection is not needed after parse-time cleanup.
+
+      The etree compatibility layer calls this automatically for
+      ``XMLParser(compact=True)`` after parser options such as
+      ``remove_comments`` and ``strip_cdata`` have been applied.
+
    .. attribute:: doctype
       :type: str | None
 
@@ -413,6 +444,10 @@ Document
       use :meth:`append_child`, :meth:`insert_before`, or :meth:`insert_after`
       to place it.
 
+      ``local_name`` and ``prefix`` must be XML NCNames. A prefix requires a
+      namespace URI, and the reserved XML namespace bindings are enforced. The
+      ``namespace_uri`` string must be XML-compatible text.
+
       .. code-block:: python
 
          doc = Document.empty()
@@ -426,7 +461,7 @@ Document
 
    .. method:: create_text(text: str) -> Node
 
-      Create a new text node.
+      Create a new text node. ``text`` must be XML-compatible text.
 
       .. code-block:: python
 
@@ -438,7 +473,7 @@ Document
 
    .. method:: create_comment(text: str) -> Node
 
-      Create a new comment node.
+      Create a new comment node. ``text`` must be XML-compatible text.
 
       .. code-block:: python
 
@@ -449,7 +484,7 @@ Document
 
    .. method:: create_cdata(text: str) -> Node
 
-      Create a new CDATA section node.
+      Create a new CDATA section node. ``text`` must be XML-compatible text.
 
       .. code-block:: python
 
@@ -461,7 +496,9 @@ Document
 
    .. method:: create_processing_instruction(target: str, data: str | None = None) -> Node
 
-      Create a new processing instruction node.
+      Create a new processing instruction node. ``target`` must be a valid XML
+      name and cannot be the reserved ``xml`` target; ``data`` must be
+      XML-compatible text when provided.
 
       .. code-block:: python
 
@@ -576,13 +613,26 @@ Document
       sets the default namespace. The node must belong to this document.
 
       :raises ValueError: If *node* is foreign, is not an element, or attempts
-          to bind reserved XML namespace prefixes incorrectly.
+          to bind reserved XML namespace prefixes incorrectly. The ``xmlns``
+          prefix cannot be declared, the ``xmlns`` namespace cannot be
+          declared, and the ``xml`` prefix / XML namespace must use their
+          standard binding.
 
       .. code-block:: python
 
          doc = Document("<root/>")
          doc.set_namespace_declaration(doc.document_element, "p", "urn:test")
          print(doc.to_xml())  # '<root xmlns:p="urn:test"/>'
+
+   .. method:: postprocess_parse_options(remove_comments: bool, remove_pis: bool, strip_cdata: bool) -> None
+
+      Apply the same native post-parse transforms used by
+      :class:`pyuppsala.etree.XMLParser`: remove comments, remove processing
+      instructions, and optionally convert CDATA nodes to text while coalescing
+      adjacent text runs.
+
+      This is mainly a bridge for the etree layer. Application code usually
+      passes these options through :class:`pyuppsala.etree.XMLParser` instead.
 
    **Serialization**
 
@@ -685,6 +735,13 @@ Node
          print(root.tag.prefix)         # "ns"
          print(root.tag.prefixed_name)  # "ns:root"
 
+   .. method:: clark_tag() -> str | None
+
+      Return the element tag in Clark notation (``"{uri}local"``), or a bare
+      local name for no-namespace elements. Returns ``None`` for non-element
+      nodes. This is the native fast path used by the etree ``.tag`` property
+      to avoid constructing a :class:`QName` object for every tag access.
+
    .. attribute:: text
       :type: str | None
 
@@ -696,6 +753,14 @@ Node
          text_node = doc.document_element.children[0]
          print(text_node.text)  # "hello"
          print(doc.document_element.text)  # None (element, not text)
+
+   .. attribute:: attribute_value
+      :type: str | None
+
+      For attribute nodes returned by XPath attribute-axis selections, the
+      attribute's string value. Returns ``None`` for all other node kinds. The
+      etree layer uses this to return ``xpath("//@id")`` results as plain
+      strings.
 
    .. attribute:: text_content
       :type: str
@@ -760,6 +825,95 @@ Node
          for child in doc.document_element.children:
              print(child.tag.local_name)  # a, b, c
 
+   .. method:: content_children() -> list[Node]
+
+      Return only children that etree treats as element content: elements,
+      comments, and processing instructions. Text and CDATA children are
+      excluded because etree exposes them through ``.text`` and ``.tail``.
+
+   .. method:: content_child_count() -> int
+
+      Count content children without materialising them. This backs
+      ``len(etree_element)`` and avoids allocating a temporary child list on
+      hot whole-tree traversal paths.
+
+   .. attribute:: node_id
+      :type: int
+
+      Stable integer identity for this node within its owning
+      :class:`Document`. Node ids are document-scoped; do not compare ids from
+      different documents.
+
+   .. method:: iter_descendants(tag: str | None = None) -> Iterator[Node]
+
+      Native lazy pre-order walk over this node and its subtree. ``tag`` follows
+      etree/lxml ``Element.iter(tag)`` semantics: ``None`` yields elements,
+      comments, and processing instructions; ``"*"`` yields elements only; a
+      bare local name or Clark name yields matching elements. The starting node
+      is included when it matches.
+
+   .. attribute:: first_child
+      :type: Node | None
+
+      The first child node, or ``None``.
+
+   .. attribute:: last_child
+      :type: Node | None
+
+      The last child node, or ``None``.
+
+   .. attribute:: next_sibling
+      :type: Node | None
+
+      The next sibling node, or ``None``.
+
+   .. attribute:: previous_sibling
+      :type: Node | None
+
+      The previous sibling node, or ``None``.
+
+   .. attribute:: namespace_declarations
+      :type: list[tuple[str | None, str]]
+
+      Namespace declarations attached directly to this element. The prefix is
+      ``None`` for the default namespace. Declarations inherited from ancestors
+      are not included.
+
+   .. method:: nsmap() -> list[tuple[str | None, str]]
+
+      Return in-scope namespace declarations for this element, ordered
+      outermost ancestor first so that ``dict(node.nsmap())`` has inner
+      declarations overriding outer ones. This is the native backing for
+      ``pyuppsala.etree``'s ``_Element.nsmap`` property.
+
+   .. method:: leading_text_run() -> str | None
+
+      Return the contiguous Text/CDATA run at the beginning of this element's
+      children, concatenated as one string. This is the native backing for
+      etree ``.text`` and is faster than stepping through each child from
+      Python.
+
+   .. method:: tail_text_run() -> str | None
+
+      Return the contiguous Text/CDATA run immediately following this node,
+      concatenated as one string. This is the native backing for etree
+      ``.tail``.
+
+   .. attribute:: comment_text
+      :type: str | None
+
+      The content of a comment node, or ``None`` for other node kinds.
+
+   .. attribute:: pi_target
+      :type: str | None
+
+      The target of a processing-instruction node, or ``None``.
+
+   .. attribute:: pi_data
+      :type: str | None
+
+      The data of a processing-instruction node, or ``None``.
+
    .. attribute:: line
       :type: int
 
@@ -808,9 +962,29 @@ Node
          new_elem = doc.create_element("new")
          print(new_elem.source)  # None
 
+   .. method:: set_text(content: str) -> None
+
+      Replace the content of a Text, CDATA, or Comment node in place. Raises
+      :class:`ValueError` for other node kinds. ``content`` must be
+      XML-compatible text.
+
+   .. method:: set_pi_data(data: str | None = None) -> None
+
+      Replace the data of a processing-instruction node. Raises
+      :class:`ValueError` for other node kinds. ``data`` must be XML-compatible
+      text when provided.
+
+   .. method:: set_qname(local_name: str, namespace_uri: str | None = None, prefix: str | None = None) -> None
+
+      Rename an element node in place. ``local_name`` and ``prefix`` must be
+      XML NCNames, a prefix requires a namespace URI, and the reserved
+      ``xml``/``xmlns`` namespace bindings are enforced.
+
    .. method:: get_attribute(name: str, namespace_uri: str | None = None) -> str | None
 
       Get an attribute value by local name, optionally filtered by namespace.
+      With ``namespace_uri=None`` this preserves the historical pyuppsala
+      low-level behavior of looking up by local name.
 
       .. code-block:: python
 
@@ -824,9 +998,27 @@ Node
          # Missing attribute
          print(item.get_attribute("missing"))  # None
 
+   .. method:: get_attribute_exact(name: str, namespace_uri: str | None = None) -> str | None
+
+      Get an attribute by exact namespace URI and local name. Unlike
+      :meth:`get_attribute`, ``namespace_uri=None`` means the no-namespace
+      attribute only. This is the behavior used by the etree layer for
+      lxml-compatible plain ``elem.get("name")`` reads.
+
+      .. code-block:: python
+
+         doc = Document('<item xmlns:x="urn:x" x:k="namespaced" k="plain"/>')
+         item = doc.document_element
+
+         print(item.get_attribute_exact("k"))          # "plain"
+         print(item.get_attribute_exact("k", "urn:x")) # "namespaced"
+
    .. method:: set_attribute(name, value, namespace_uri=None, prefix=None) -> str | None
 
-      Set an attribute. Returns the previous value, or ``None``.
+      Set an attribute. Returns the previous value, or ``None``. ``name`` and
+      ``prefix`` must be XML NCNames, a prefix requires a namespace URI, the
+      reserved ``xml``/``xmlns`` namespace bindings are enforced, and ``value``
+      must be XML-compatible text.
 
       .. code-block:: python
 
@@ -1003,6 +1195,12 @@ QName
 .. class:: QName(local_name, namespace_uri=None, prefix=None)
 
    A qualified XML name.
+
+   ``local_name`` and ``prefix`` must be XML NCNames. If ``prefix`` is given,
+   ``namespace_uri`` must also be given. The reserved XML namespace bindings are
+   enforced: ``xmlns`` cannot be used as a name prefix, the ``xmlns`` namespace
+   cannot be used for normal element or attribute names, and the ``xml`` prefix
+   can only refer to ``http://www.w3.org/XML/1998/namespace``.
 
    .. code-block:: python
 

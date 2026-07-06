@@ -546,6 +546,93 @@ Node iteration patterns
     print(str(root))   # "<root><a/><b/><c/><d/><e/></root>"
     print(repr(root))  # "Node(<root>)"
 
+Fast native etree scans
+-----------------------
+
+The lxml-compatible etree API is the right default when you need element
+objects, custom Python predicates, mutation, sibling context, or code that must
+also run on lxml. When the loop body is only a simple aggregate over a large
+subtree, use pyuppsala's native ``fast_*`` extension methods to keep the walk
+inside Rust and avoid materialising one Python ``_Element`` proxy per match.
+
+.. code-block:: python
+
+    from pyuppsala import etree as ET
+
+    root = ET.fromstring(
+        "<catalog>"
+        "<book id='b1' pages='412'/>"
+        "<book id='b2' pages='271'/>"
+        "<magazine id='m1' pages='80'/>"
+        "</catalog>"
+    )
+
+    # Count matching elements without creating each matching _Element.
+    assert root.fast_count("book") == 2
+
+    # Stop at the first match when only existence matters.
+    assert root.fast_has("magazine") is True
+
+    # Sum integer attributes. Missing attributes are skipped; a present
+    # non-integer value raises ValueError.
+    assert root.fast_sum_int_attr("pages", "book") == 683
+
+    # Collect one attribute from all matching elements.
+    assert root.fast_collect_attr("id", "book") == ["b1", "b2"]
+
+For namespaced attributes or tags, use Clark notation or ``QName``:
+
+.. code-block:: python
+
+    from pyuppsala import etree as ET
+
+    root = ET.fromstring(
+        "<r xmlns:p='urn:parts'>"
+        "<item p:code='A'/>"
+        "<item p:code='B'/>"
+        "</r>"
+    )
+
+    assert root.fast_collect_attr(ET.QName("urn:parts", "code"), "item") == [
+        "A",
+        "B",
+    ]
+
+For fixed nested shapes, such as SAML EntityAttributes, use
+``fast_collect_grouped_text`` instead of a nested Python loop:
+
+.. code-block:: python
+
+    from pyuppsala import etree as ET
+
+    root = ET.fromstring(
+        "<md:EntityDescriptor "
+        "xmlns:md='urn:oasis:names:tc:SAML:2.0:metadata' "
+        "xmlns:mdattr='urn:oasis:names:tc:SAML:metadata:attribute' "
+        "xmlns:saml='urn:oasis:names:tc:SAML:2.0:assertion'>"
+        "<md:Extensions>"
+        "<mdattr:EntityAttributes>"
+        "<saml:Attribute Name='category'>"
+        "<saml:AttributeValue> one </saml:AttributeValue>"
+        "<saml:AttributeValue>two</saml:AttributeValue>"
+        "</saml:Attribute>"
+        "</mdattr:EntityAttributes>"
+        "</md:Extensions>"
+        "</md:EntityDescriptor>"
+    )
+
+    groups = root.fast_collect_grouped_text(
+        "{urn:oasis:names:tc:SAML:metadata:attribute}EntityAttributes",
+        "{urn:oasis:names:tc:SAML:2.0:assertion}Attribute",
+        "Name",
+        "{urn:oasis:names:tc:SAML:2.0:assertion}AttributeValue",
+    )
+    assert groups == [("category", ["one", "two"])]
+
+Use regular ``iter()``, ``findall()``, or ``xpath()`` when you need element
+objects, recursive text values, custom predicates, tail/sibling handling, or
+mutation.
+
 .. _resource-limits:
 
 Resource limits and hardening
