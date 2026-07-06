@@ -5,6 +5,9 @@ edition = "2021"
 description = "Python bindings for the Uppsala XML library"
 license = "BSD-2-Clause"
 repository = "https://github.com/kushaldas/pyuppsala"
+exclude = [
+    "fuzz/**",
+]
 
 [lib]
 name = "_pyuppsala"
