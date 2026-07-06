@@ -95,9 +95,8 @@ DOM:
   ``xml`` prefix can only be bound to the XML namespace.
 * String values stored as XML text, attribute values, namespace URIs, comments,
   CDATA, or processing-instruction data must be XML 1.0 compatible. Illegal
-  C0 controls, NUL, surrogate code points, and U+FFFE/U+FFFF raise
-  :class:`ValueError`, matching lxml's "All strings must be XML compatible"
-  behavior.
+  C0 controls, NUL, and U+FFFE/U+FFFF raise :class:`ValueError`, matching lxml's
+  "All strings must be XML compatible" behavior.
 
 .. code-block:: python
 
