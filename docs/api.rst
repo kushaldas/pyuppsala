@@ -96,7 +96,7 @@ Security defaults and boundaries
    processing-instruction targets must be valid XML names. Namespace bindings
    must obey the reserved ``xml``/``xmlns`` rules. Text, attribute values,
    namespace URIs, comments, CDATA, and processing-instruction data must be XML
-   1.0 compatible; illegal controls and non-characters raise
+   1.0 compatible; illegal C0 controls, NUL, and U+FFFE/U+FFFF raise
    :class:`ValueError` instead of being stored and later sanitized differently
    during serialization.
 
@@ -610,7 +610,8 @@ Document
    .. method:: set_namespace_declaration(node: Node, prefix: str | None, uri: str) -> None
 
       Add or replace an ``xmlns`` declaration on an element node. ``prefix=None``
-      sets the default namespace. The node must belong to this document.
+      sets the default namespace. ``uri`` must be XML-compatible text. The node
+      must belong to this document.
 
       :raises ValueError: If *node* is foreign, is not an element, or attempts
           to bind reserved XML namespace prefixes incorrectly. The ``xmlns``
@@ -977,8 +978,9 @@ Node
    .. method:: set_qname(local_name: str, namespace_uri: str | None = None, prefix: str | None = None) -> None
 
       Rename an element node in place. ``local_name`` and ``prefix`` must be
-      XML NCNames, a prefix requires a namespace URI, and the reserved
-      ``xml``/``xmlns`` namespace bindings are enforced.
+      XML NCNames, a prefix requires a namespace URI, ``namespace_uri`` must be
+      XML-compatible text, and the reserved ``xml``/``xmlns`` namespace bindings
+      are enforced.
 
    .. method:: get_attribute(name: str, namespace_uri: str | None = None) -> str | None
 
@@ -1016,9 +1018,9 @@ Node
    .. method:: set_attribute(name, value, namespace_uri=None, prefix=None) -> str | None
 
       Set an attribute. Returns the previous value, or ``None``. ``name`` and
-      ``prefix`` must be XML NCNames, a prefix requires a namespace URI, the
-      reserved ``xml``/``xmlns`` namespace bindings are enforced, and ``value``
-      must be XML-compatible text.
+      ``prefix`` must be XML NCNames, a prefix requires a namespace URI,
+      ``namespace_uri`` and ``value`` must be XML-compatible text, and the
+      reserved ``xml``/``xmlns`` namespace bindings are enforced.
 
       .. code-block:: python
 
@@ -1197,10 +1199,11 @@ QName
    A qualified XML name.
 
    ``local_name`` and ``prefix`` must be XML NCNames. If ``prefix`` is given,
-   ``namespace_uri`` must also be given. The reserved XML namespace bindings are
-   enforced: ``xmlns`` cannot be used as a name prefix, the ``xmlns`` namespace
-   cannot be used for normal element or attribute names, and the ``xml`` prefix
-   can only refer to ``http://www.w3.org/XML/1998/namespace``.
+   ``namespace_uri`` must also be given, and ``namespace_uri`` must be
+   XML-compatible text. The reserved XML namespace bindings are enforced:
+   ``xmlns`` cannot be used as a name prefix, the ``xmlns`` namespace cannot be
+   used for normal element or attribute names, and the ``xml`` prefix can only
+   refer to ``http://www.w3.org/XML/1998/namespace``.
 
    .. code-block:: python
 

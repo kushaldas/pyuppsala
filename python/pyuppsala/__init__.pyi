@@ -15,7 +15,7 @@ class XsdValidationError(Exception): ...
 # Classes
 
 class QName:
-    """A qualified XML name with optional namespace URI and prefix."""
+    """A qualified XML name with optional XML-compatible namespace URI and prefix."""
 
     def __init__(
         self,
@@ -166,10 +166,10 @@ class Node:
         """The data of a ProcessingInstruction node, or None."""
         ...
     def set_text(self, content: str) -> None:
-        """Set the content of a Text, CDATA, or Comment node in place."""
+        """Set XML-compatible content of a Text, CDATA, or Comment node in place."""
         ...
     def set_pi_data(self, data: Optional[str] = None) -> None:
-        """Set the data of a ProcessingInstruction node."""
+        """Set XML-compatible data of a ProcessingInstruction node."""
         ...
     def set_qname(
         self,
@@ -177,7 +177,7 @@ class Node:
         namespace_uri: Optional[str] = None,
         prefix: Optional[str] = None,
     ) -> None:
-        """Rename an element node's qualified name in place."""
+        """Rename an element node with an XML-compatible namespace URI."""
         ...
     @property
     def line(self) -> int:
@@ -221,7 +221,7 @@ class Node:
         namespace_uri: Optional[str] = None,
         prefix: Optional[str] = None,
     ) -> Optional[str]:
-        """Set an attribute value. Returns the previous value if any."""
+        """Set an attribute with XML-compatible value and namespace URI."""
         ...
     def remove_attribute(
         self, name: str, namespace_uri: Optional[str] = None
@@ -433,21 +433,27 @@ class Document:
         namespace_uri: Optional[str] = None,
         prefix: Optional[str] = None,
     ) -> Node:
-        """Create a new element node (not yet attached to the tree)."""
+        """Create a new element node with an XML-compatible namespace URI.
+
+        The node is not yet attached to the tree.
+        """
         ...
     def create_text(self, text: str) -> Node:
-        """Create a new text node (not yet attached to the tree)."""
+        """Create a new text node from XML-compatible text."""
         ...
     def create_comment(self, text: str) -> Node:
-        """Create a new comment node (not yet attached to the tree)."""
+        """Create a new comment node from XML-compatible text."""
         ...
     def create_cdata(self, text: str) -> Node:
-        """Create a new CDATA section node (not yet attached to the tree)."""
+        """Create a new CDATA section node from XML-compatible text."""
         ...
     def create_processing_instruction(
         self, target: str, data: Optional[str] = None
     ) -> Node:
-        """Create a new processing instruction node (not yet attached to the tree)."""
+        """Create a new processing instruction node with XML-compatible data.
+
+        The node is not yet attached to the tree.
+        """
         ...
     def append_child(self, parent: Node, child: Node) -> None:
         """Append a child node to a parent node."""
@@ -463,6 +469,7 @@ class Document:
         """Add or replace an ``xmlns`` declaration on an element node.
 
         ``prefix=None`` sets the default namespace (``xmlns="uri"``).
+        ``uri`` must be XML-compatible text.
         """
         ...
     def insert_before(self, parent: Node, new_child: Node, reference: Node) -> None:
