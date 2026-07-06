@@ -285,6 +285,27 @@ class TestDocument:
         with pytest.raises(ValueError, match="XML compatible"):
             pi.set_pi_data(bad)
 
+    def test_native_wrong_kind_errors_precede_string_validation(self):
+        """Wrong node kind errors should win before validating unused strings."""
+        doc = Document.empty()
+        root = doc.create_element("root")
+        text = doc.create_text("ok")
+        bad = "\x05"
+        bad_ns = f"urn:{bad}"
+
+        with pytest.raises(ValueError, match="Node is not an element"):
+            text.set_attribute("key", bad)
+        with pytest.raises(ValueError, match="Node is not an element"):
+            text.set_attribute("key", "value", namespace_uri=bad_ns, prefix="p")
+        with pytest.raises(ValueError, match="Node is not an element"):
+            text.set_qname("item", namespace_uri=bad_ns, prefix="p")
+        with pytest.raises(ValueError, match="Node is not an element"):
+            doc.set_namespace_declaration(text, "p", bad_ns)
+        with pytest.raises(ValueError, match="Node is not a text, cdata, or comment node"):
+            root.set_text(bad)
+        with pytest.raises(ValueError, match="Node is not a processing instruction"):
+            root.set_pi_data(bad)
+
     def test_append_child(self):
         doc = parse("<root/>")
         child = doc.create_element("child")

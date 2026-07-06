@@ -778,15 +778,15 @@ impl Node {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<Option<String>> {
-        validate_ncname(name, "attribute")?;
-        check_xml_string_compatible(value)?;
-        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(self.id) {
             Some(el) => {
+                validate_ncname(name, "attribute")?;
+                check_xml_string_compatible(value)?;
+                let prefix = validate_qname_parts(namespace_uri, prefix)?;
                 let qname = match (namespace_uri, prefix) {
                     (Some(ns), Some(p)) => {
                         UQName::full(p.to_string(), ns.to_string(), name.to_string())
@@ -1142,21 +1142,23 @@ impl Node {
     /// element `.text`/`.tail` and comment text without recreating nodes. The
     /// content must be XML-compatible text.
     fn set_text(&self, content: &str) -> PyResult<()> {
-        check_xml_string_compatible(content)?;
         let mut guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.node_kind_mut(self.id) {
             Some(NodeKind::Text(t)) => {
+                check_xml_string_compatible(content)?;
                 *t = std::borrow::Cow::Owned(content.to_string());
                 Ok(())
             }
             Some(NodeKind::CData(t)) => {
+                check_xml_string_compatible(content)?;
                 *t = std::borrow::Cow::Owned(content.to_string());
                 Ok(())
             }
             Some(NodeKind::Comment(t)) => {
+                check_xml_string_compatible(content)?;
                 *t = std::borrow::Cow::Owned(content.to_string());
                 Ok(())
             }
@@ -1212,15 +1214,15 @@ impl Node {
     /// Raises ValueError otherwise.
     #[pyo3(signature = (data=None))]
     fn set_pi_data(&self, data: Option<&str>) -> PyResult<()> {
-        if let Some(data) = data {
-            check_xml_string_compatible(data)?;
-        }
         let mut guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.node_kind_mut(self.id) {
             Some(NodeKind::ProcessingInstruction(pi)) => {
+                if let Some(data) = data {
+                    check_xml_string_compatible(data)?;
+                }
                 pi.data = data.map(|d| std::borrow::Cow::Owned(d.to_string()));
                 Ok(())
             }
@@ -1242,14 +1244,14 @@ impl Node {
         namespace_uri: Option<&str>,
         prefix: Option<&str>,
     ) -> PyResult<()> {
-        validate_ncname(local_name, "element")?;
-        let prefix = validate_qname_parts(namespace_uri, prefix)?;
         let mut guard = self
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(self.id) {
             Some(el) => {
+                validate_ncname(local_name, "element")?;
+                let prefix = validate_qname_parts(namespace_uri, prefix)?;
                 el.name = match (namespace_uri, prefix) {
                     (Some(ns), Some(p)) => {
                         UQName::full(p.to_string(), ns.to_string(), local_name.to_string())
@@ -4195,14 +4197,14 @@ impl Document {
         uri: &str,
     ) -> PyResult<()> {
         ensure_node_in_document(&self.inner, node, "node")?;
-        let prefix = validate_prefix(prefix)?;
-        validate_ns_declaration(prefix, uri)?;
         let mut guard = self
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match guard.doc.element_mut(node.id) {
             Some(el) => {
+                let prefix = validate_prefix(prefix)?;
+                validate_ns_declaration(prefix, uri)?;
                 let p = prefix.unwrap_or("");
                 match el
                     .namespace_declarations
