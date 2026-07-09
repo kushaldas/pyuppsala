@@ -208,11 +208,19 @@ dependencies = [
 
 [[package]]
 name = "pyuppsala"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "pyo3",
+ "pyuppsala-interop",
  "uppsala",
  "ureq",
+]
+
+[[package]]
+name = "pyuppsala-interop"
+version = "0.1.0"
+dependencies = [
+ "uppsala",
 ]
 
 [[package]]

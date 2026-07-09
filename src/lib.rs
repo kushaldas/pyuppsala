@@ -2,7 +2,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::PyDict;
+use pyo3::types::{PyCapsule, PyDict};
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -15,6 +15,8 @@ use uppsala::writer::XmlWriter as UXmlWriter;
 use uppsala::xpath::{XPathEvaluator as UXPathEvaluator, XPathValue as UXPathValue};
 use uppsala::xsd::XsdValidator as UXsdValidator;
 use uppsala::{Document as UDocument, XmlError, XmlResult};
+
+use pyuppsala_interop::{DocWithInput, DocumentCapsule, SharedDoc, DOCUMENT_CAPSULE_CNAME};
 
 // ---------------------------------------------------------------------------
 // Custom Python exceptions
@@ -334,18 +336,6 @@ fn writer_attr_refs(attrs: &Option<Vec<(String, String)>>) -> PyResult<Vec<(&str
 // ---------------------------------------------------------------------------
 // Shared document handle - allows multiple Python objects to reference one DOM
 // ---------------------------------------------------------------------------
-
-/// Wraps a Document alongside the original input text.
-///
-/// `into_static()` drops the original input reference from the Document,
-/// so we store it separately to support `input_text()`, `node_source()`,
-/// and `node_range()`.
-struct DocWithInput {
-    doc: UDocument<'static>,
-    input: String,
-}
-
-type SharedDoc = Arc<Mutex<DocWithInput>>;
 
 fn release_detached_subtree_payload(doc: &mut UDocument<'static>, root: NodeId) {
     let children = doc.children(root);
@@ -3933,6 +3923,19 @@ impl Document {
         guard.input.clear();
         guard.input.shrink_to_fit();
         Ok(())
+    }
+
+    /// Internal capsule used by extension modules that operate directly on the
+    /// native Uppsala document. Not part of the public Python API.
+    fn _bergshamra_document_capsule<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        PyCapsule::new_with_value(
+            py,
+            DocumentCapsule::new(Arc::clone(&self.inner)),
+            DOCUMENT_CAPSULE_CNAME,
+        )
     }
 
     /// The raw ``<!DOCTYPE ...>`` declaration preserved from the source, or None.
