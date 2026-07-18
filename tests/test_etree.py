@@ -8,6 +8,7 @@ options, exception identity) that should not depend on lxml.
 """
 
 import io
+import os
 import sys
 
 import pytest
@@ -494,6 +495,60 @@ class TestSchemaStandalone:
         a.error_log.append("x")
         assert a.error_log == ["x"]
         assert b.error_log == []
+
+    @pytest.mark.parametrize(
+        "path_mode", ["implicit", "explicit", "bytes_file", "bytes_base"]
+    )
+    def test_file_schema_with_circular_imports(self, tmp_path, path_mode):
+        a_path = tmp_path / "a.xsd"
+        b_path = tmp_path / "b.xsd"
+        a_path.write_text(
+            """\
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:a="urn:example:a"
+           xmlns:b="urn:example:b"
+           targetNamespace="urn:example:a"
+           elementFormDefault="qualified">
+  <xs:import namespace="urn:example:b" schemaLocation="b.xsd"/>
+  <xs:attributeGroup name="idAttributes">
+    <xs:attribute name="id" type="xs:ID" use="optional"/>
+  </xs:attributeGroup>
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="b:child" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="a:idAttributes"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"""
+        )
+        b_path.write_text(
+            """\
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:a="urn:example:a"
+           xmlns:b="urn:example:b"
+           targetNamespace="urn:example:b"
+           elementFormDefault="qualified">
+  <xs:import namespace="urn:example:a" schemaLocation="a.xsd"/>
+  <xs:element name="child" type="xs:string"/>
+</xs:schema>"""
+        )
+
+        kwargs = {
+            "implicit": {"file": a_path},
+            "explicit": {"file": a_path, "base_path": tmp_path},
+            "bytes_file": {"file": os.fsencode(a_path), "base_path": str(tmp_path)},
+            "bytes_base": {"file": str(a_path), "base_path": os.fsencode(tmp_path)},
+        }[path_mode]
+        schema = P.XMLSchema(**kwargs)
+        document = P.fromstring(
+            '<a:root xmlns:a="urn:example:a" xmlns:b="urn:example:b" id="root-id">'
+            "<b:child>value</b:child>"
+            "</a:root>"
+        )
+
+        assert schema.validate(document) is True
 
 
 @requires_lxml
