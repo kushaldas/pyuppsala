@@ -11,6 +11,11 @@
 - Added the separately publishable ``pyuppsala-interop`` crate containing the
   versioned capsule payload and shared document ownership types.
 
+### Changed
+
+- Declared Rust 1.77 as the minimum supported Rust version (MSRV) for both
+  ``pyuppsala`` and ``pyuppsala-interop``.
+
 ### Fixed
 
 - Fixed ``etree.XMLSchema(file=...)`` loading mutually importing schemas by
