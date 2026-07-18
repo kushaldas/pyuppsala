@@ -2364,10 +2364,12 @@ class XMLSchema:
     """
 
     def __init__(self, etree=None, *, file=None, base_path=None, lenient=False):
-        # ``base_path`` (a directory) lets the native validator resolve
-        # ``xsd:import``/``xsd:include`` ``schemaLocation`` references. When a
-        # filesystem ``file`` is given it defaults to that file's directory,
-        # matching lxml's resolution of relative imports against the schema file.
+        # ``base_path`` lets the native validator resolve ``xsd:import`` /
+        # ``xsd:include`` ``schemaLocation`` references. The native loader
+        # accepts either a schema file or a directory; a file is preferable when
+        # available because its canonical path also seeds composition-cycle
+        # detection.
+        schema_path = None
         if etree is not None:
             schema_xml = tostring(etree, encoding="unicode")
         elif file is not None:
@@ -2376,12 +2378,26 @@ class XMLSchema:
                 if isinstance(schema_xml, bytes):
                     schema_xml = schema_xml.decode("utf-8")
             else:
-                with open(file, "r", encoding="utf-8") as fh:
+                schema_path = os.fspath(file)
+                with open(schema_path, "r", encoding="utf-8") as fh:
                     schema_xml = fh.read()
                 if base_path is None:
-                    base_path = os.path.dirname(os.fspath(file))
+                    base_path = schema_path
         else:
             raise XMLSchemaParseError("XMLSchema requires an etree or file argument")
+        if base_path is not None:
+            base_path = os.fspath(base_path)
+            if schema_path is not None and os.path.isdir(base_path):
+                # Preserve an explicitly supplied resolution directory, but use
+                # the root schema inside it when it is the same file. This gives
+                # the native loader both the requested directory and the root
+                # document identity needed to short-circuit A -> B -> A cycles.
+                candidate = os.path.join(base_path, os.path.basename(schema_path))
+                try:
+                    if os.path.samefile(candidate, schema_path):
+                        base_path = candidate
+                except OSError:
+                    pass
         try:
             if base_path:
                 self._validator = _u.XsdValidator.from_file(schema_xml, base_path)

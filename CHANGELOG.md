@@ -1,6 +1,16 @@
 # Changelog
 
 
+## Unreleased
+
+### Fixed
+
+- Fixed ``etree.XMLSchema(file=...)`` loading mutually importing schemas by
+  preserving the root schema file identity for native composition-cycle
+  detection, including when its directory is passed explicitly as
+  ``base_path``.
+
+
 ## 0.9.0
 
 Built against the uppsala 0.9.0 release from crates.io.

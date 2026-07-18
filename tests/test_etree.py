@@ -495,6 +495,55 @@ class TestSchemaStandalone:
         assert a.error_log == ["x"]
         assert b.error_log == []
 
+    @pytest.mark.parametrize("explicit_base_path", [False, True])
+    def test_file_schema_with_circular_imports(self, tmp_path, explicit_base_path):
+        a_path = tmp_path / "a.xsd"
+        b_path = tmp_path / "b.xsd"
+        a_path.write_text(
+            """\
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:a="urn:example:a"
+           xmlns:b="urn:example:b"
+           targetNamespace="urn:example:a"
+           elementFormDefault="qualified">
+  <xs:import namespace="urn:example:b" schemaLocation="b.xsd"/>
+  <xs:attributeGroup name="idAttributes">
+    <xs:attribute name="id" type="xs:ID" use="optional"/>
+  </xs:attributeGroup>
+  <xs:element name="root">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="b:child" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attributeGroup ref="a:idAttributes"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"""
+        )
+        b_path.write_text(
+            """\
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:a="urn:example:a"
+           xmlns:b="urn:example:b"
+           targetNamespace="urn:example:b"
+           elementFormDefault="qualified">
+  <xs:import namespace="urn:example:a" schemaLocation="a.xsd"/>
+  <xs:element name="child" type="xs:string"/>
+</xs:schema>"""
+        )
+
+        kwargs = {"file": a_path}
+        if explicit_base_path:
+            kwargs["base_path"] = tmp_path
+        schema = P.XMLSchema(**kwargs)
+        document = P.fromstring(
+            '<a:root xmlns:a="urn:example:a" xmlns:b="urn:example:b" id="root-id">'
+            "<b:child>value</b:child>"
+            "</a:root>"
+        )
+
+        assert schema.validate(document) is True
+
 
 @requires_lxml
 class TestExtendedDifferential:
