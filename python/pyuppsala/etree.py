@@ -2378,9 +2378,7 @@ class XMLSchema:
                 if isinstance(schema_xml, bytes):
                     schema_xml = schema_xml.decode("utf-8")
             else:
-                schema_path = os.fspath(file)
-                if isinstance(schema_path, bytes):
-                    schema_path = schema_path.decode("utf-8", "replace")
+                schema_path = os.fsdecode(os.fspath(file))
                 with open(schema_path, "r", encoding="utf-8") as fh:
                     schema_xml = fh.read()
                 if base_path is None:
@@ -2388,9 +2386,7 @@ class XMLSchema:
         else:
             raise XMLSchemaParseError("XMLSchema requires an etree or file argument")
         if base_path is not None:
-            base_path = os.fspath(base_path)
-            if isinstance(base_path, bytes):
-                base_path = base_path.decode("utf-8", "replace")
+            base_path = os.fsdecode(os.fspath(base_path))
             if schema_path is not None and os.path.isdir(base_path):
                 # Preserve an explicitly supplied resolution directory, but use
                 # the root schema inside it when it is the same file. This gives
