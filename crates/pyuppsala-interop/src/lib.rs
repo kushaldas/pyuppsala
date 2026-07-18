@@ -10,7 +10,7 @@ pub const DOCUMENT_CAPSULE_NAME: &str = "pyuppsala.document_handle.v1";
 /// C-compatible form of [`DOCUMENT_CAPSULE_NAME`] for `PyCapsule` APIs.
 pub const DOCUMENT_CAPSULE_CNAME: &CStr = c"pyuppsala.document_handle.v1";
 
-/// Wraps an Uppsala document alongside the original decoded input text.
+/// Wraps a Uppsala document alongside the original decoded input text.
 pub struct DocWithInput {
     pub doc: uppsala::Document<'static>,
     pub input: String,

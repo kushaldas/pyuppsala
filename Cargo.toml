@@ -2,6 +2,7 @@
 name = "pyuppsala"
 version = "0.9.1"
 edition = "2021"
+rust-version = "1.77"
 description = "Python bindings for the Uppsala XML library"
 license = "BSD-2-Clause"
 repository = "https://github.com/kushaldas/pyuppsala"
