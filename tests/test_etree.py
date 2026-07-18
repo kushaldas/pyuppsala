@@ -8,6 +8,7 @@ options, exception identity) that should not depend on lxml.
 """
 
 import io
+import os
 import sys
 
 import pytest
@@ -495,8 +496,10 @@ class TestSchemaStandalone:
         assert a.error_log == ["x"]
         assert b.error_log == []
 
-    @pytest.mark.parametrize("explicit_base_path", [False, True])
-    def test_file_schema_with_circular_imports(self, tmp_path, explicit_base_path):
+    @pytest.mark.parametrize(
+        "path_mode", ["implicit", "explicit", "bytes_file", "bytes_base"]
+    )
+    def test_file_schema_with_circular_imports(self, tmp_path, path_mode):
         a_path = tmp_path / "a.xsd"
         b_path = tmp_path / "b.xsd"
         a_path.write_text(
@@ -532,9 +535,12 @@ class TestSchemaStandalone:
 </xs:schema>"""
         )
 
-        kwargs = {"file": a_path}
-        if explicit_base_path:
-            kwargs["base_path"] = tmp_path
+        kwargs = {
+            "implicit": {"file": a_path},
+            "explicit": {"file": a_path, "base_path": tmp_path},
+            "bytes_file": {"file": os.fsencode(a_path), "base_path": str(tmp_path)},
+            "bytes_base": {"file": str(a_path), "base_path": os.fsencode(tmp_path)},
+        }[path_mode]
         schema = P.XMLSchema(**kwargs)
         document = P.fromstring(
             '<a:root xmlns:a="urn:example:a" xmlns:b="urn:example:b" id="root-id">'
