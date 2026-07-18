@@ -1,5 +1,7 @@
 """Comprehensive tests for pyuppsala — Python bindings for the Uppsala XML library."""
 
+import ctypes
+
 import pytest
 import pyuppsala
 from pyuppsala import (
@@ -70,6 +72,24 @@ class TestParse:
 
 
 class TestDocument:
+    def test_bergshamra_document_capsule_contract(self):
+        doc = parse("<root/>")
+        capsule = doc._bergshamra_document_capsule()
+        capsule_name = b"pyuppsala.document_handle.v1"
+
+        get_name = ctypes.pythonapi.PyCapsule_GetName
+        get_name.argtypes = [ctypes.py_object]
+        get_name.restype = ctypes.c_char_p
+        get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+        get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        get_pointer.restype = ctypes.c_void_p
+
+        assert type(capsule).__name__ == "PyCapsule"
+        assert get_name(capsule) == capsule_name
+        payload = get_pointer(capsule, capsule_name)
+        assert payload is not None
+        assert ctypes.cast(payload, ctypes.POINTER(ctypes.c_uint32)).contents.value == 1
+
     def test_empty_document(self):
         doc = Document.empty()
         assert doc.document_element is None

@@ -1,7 +1,20 @@
 # Changelog
 
 
-## Unreleased
+## 0.9.1 [Unreleased]
+
+### Added
+
+- Added the internal ``_bergshamra_document_capsule()`` document handle for
+  native extension consumers that operate directly on the existing Uppsala
+  DOM.
+- Added the separately publishable ``pyuppsala-interop`` crate containing the
+  versioned capsule payload and shared document ownership types.
+
+### Changed
+
+- Declared Rust 1.77 as the minimum supported Rust version (MSRV) for both
+  ``pyuppsala`` and ``pyuppsala-interop``.
 
 ### Fixed
 
