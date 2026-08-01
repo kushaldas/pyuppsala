@@ -1928,15 +1928,18 @@ impl ElementBase {
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            guard.doc().element(NodeId::new(self.node_id)).and_then(|el| {
-                el.attributes
-                    .iter()
-                    .find(|a| {
-                        a.name.local_name.as_ref() == local
-                            && a.name.namespace_uri.as_deref() == ns.as_deref()
-                    })
-                    .map(|a| a.value.to_string())
-            })
+            guard
+                .doc()
+                .element(NodeId::new(self.node_id))
+                .and_then(|el| {
+                    el.attributes
+                        .iter()
+                        .find(|a| {
+                            a.name.local_name.as_ref() == local
+                                && a.name.namespace_uri.as_deref() == ns.as_deref()
+                        })
+                        .map(|a| a.value.to_string())
+                })
         };
         match value {
             Some(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
