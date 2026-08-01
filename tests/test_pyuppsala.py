@@ -75,7 +75,7 @@ class TestDocument:
     def test_bergshamra_document_capsule_contract(self):
         doc = parse("<root/>")
         capsule = doc._bergshamra_document_capsule()
-        capsule_name = b"pyuppsala.document_handle.v1"
+        capsule_name = b"pyuppsala.document_handle.v2"
 
         get_name = ctypes.pythonapi.PyCapsule_GetName
         get_name.argtypes = [ctypes.py_object]
@@ -88,7 +88,7 @@ class TestDocument:
         assert get_name(capsule) == capsule_name
         payload = get_pointer(capsule, capsule_name)
         assert payload is not None
-        assert ctypes.cast(payload, ctypes.POINTER(ctypes.c_uint32)).contents.value == 1
+        assert ctypes.cast(payload, ctypes.POINTER(ctypes.c_uint32)).contents.value == 2
 
     def test_empty_document(self):
         doc = Document.empty()

@@ -16,7 +16,7 @@ use uppsala::xpath::{XPathEvaluator as UXPathEvaluator, XPathValue as UXPathValu
 use uppsala::xsd::XsdValidator as UXsdValidator;
 use uppsala::{Document as UDocument, XmlError, XmlResult};
 
-use pyuppsala_interop::{DocWithInput, DocumentCapsule, SharedDoc, DOCUMENT_CAPSULE_CNAME};
+use pyuppsala_interop::{DocumentCapsule, OwnedDoc, SharedDoc, DOCUMENT_CAPSULE_CNAME};
 
 // ---------------------------------------------------------------------------
 // Custom Python exceptions
@@ -337,7 +337,7 @@ fn writer_attr_refs(attrs: &Option<Vec<(String, String)>>) -> PyResult<Vec<(&str
 // Shared document handle - allows multiple Python objects to reference one DOM
 // ---------------------------------------------------------------------------
 
-fn release_detached_subtree_payload(doc: &mut UDocument<'static>, root: NodeId) {
+fn release_detached_subtree_payload(doc: &mut UDocument<'_>, root: NodeId) {
     let children = doc.children(root);
     for child in children {
         release_detached_subtree_payload(doc, child);
@@ -359,7 +359,7 @@ fn release_detached_subtree_payload(doc: &mut UDocument<'static>, root: NodeId) 
     }
 }
 
-fn clear_following_tail(doc: &mut UDocument<'static>, node: NodeId) {
+fn clear_following_tail(doc: &mut UDocument<'_>, node: NodeId) {
     let mut sibling = doc.next_sibling(node);
     while let Some(id) = sibling {
         let is_tail = matches!(
@@ -374,7 +374,7 @@ fn clear_following_tail(doc: &mut UDocument<'static>, node: NodeId) {
     }
 }
 
-fn clear_element_contents(doc: &mut UDocument<'static>, node: NodeId, keep_tail: bool) {
+fn clear_element_contents(doc: &mut UDocument<'_>, node: NodeId, keep_tail: bool) {
     let children = doc.children(node);
     for child in children {
         doc.detach(child);
@@ -599,7 +599,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_kind(self.id) {
+        match guard.doc().node_kind(self.id) {
             Some(NodeKind::Document) => Ok("document".into()),
             Some(NodeKind::Element(_)) => Ok("element".into()),
             Some(NodeKind::Text(_)) => Ok("text".into()),
@@ -619,7 +619,7 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .element(self.id)
             .map(|el| QName::from_uqname(&el.name)))
     }
@@ -638,7 +638,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.element(self.id).map(|el| {
+        Ok(guard.doc().element(self.id).map(|el| {
             let q = &el.name;
             match &q.namespace_uri {
                 Some(ns) if !ns.is_empty() => format!("{{{}}}{}", ns, q.local_name),
@@ -654,7 +654,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.text_content(self.id).map(|s| s.to_string()))
+        Ok(guard.doc().text_content(self.id).map(|s| s.to_string()))
     }
 
     /// Recursively collected text content of this node and all descendants.
@@ -664,7 +664,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.text_content_deep(self.id))
+        Ok(guard.doc().text_content_deep(self.id))
     }
 
     /// For attribute nodes (e.g. from an XPath ``@name`` / attribute-axis
@@ -677,7 +677,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_kind(self.id) {
+        match guard.doc().node_kind(self.id) {
             Some(NodeKind::Attribute(_, value)) => Ok(Some(value.to_string())),
             _ => Ok(None),
         }
@@ -693,7 +693,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.element_text(self.id).map(|s| s.to_string()))
+        Ok(guard.doc().element_text(self.id).map(|s| s.to_string()))
     }
 
     /// The list of attributes for element nodes.
@@ -703,7 +703,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element(self.id) {
+        match guard.doc().element(self.id) {
             Some(el) => Ok(el.attributes.iter().map(Attribute::from_uattr).collect()),
             None => Ok(Vec::new()),
         }
@@ -718,11 +718,11 @@ impl Node {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         match namespace_uri {
             Some(ns) => Ok(guard
-                .doc
+                .doc()
                 .get_attribute_ns(self.id, ns, name)
                 .map(|s| s.to_string())),
             None => Ok(guard
-                .doc
+                .doc()
                 .get_attribute(self.id, name)
                 .map(|s| s.to_string())),
         }
@@ -744,7 +744,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element(self.id) {
+        match guard.doc().element(self.id) {
             Some(el) => Ok(el
                 .attributes
                 .iter()
@@ -772,7 +772,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element_mut(self.id) {
+        guard.with_doc_mut(|_input, doc| match doc.element_mut(self.id) {
             Some(el) => {
                 validate_ncname(name, "attribute")?;
                 check_xml_string_compatible(value)?;
@@ -788,7 +788,7 @@ impl Node {
                 Ok(old.map(|s| s.to_string()))
             }
             None => Err(PyValueError::new_err("Node is not an element")),
-        }
+        })
     }
 
     /// Remove an attribute. Returns the old value if any.
@@ -807,7 +807,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element_mut(self.id) {
+        guard.with_doc_mut(|_input, doc| match doc.element_mut(self.id) {
             Some(el) => {
                 let pos = el.attributes.iter().position(|a| {
                     a.name.local_name.as_ref() == name
@@ -816,7 +816,7 @@ impl Node {
                 Ok(pos.map(|i| el.attributes.remove(i).value.into_owned()))
             }
             None => Err(PyValueError::new_err("Node is not an element")),
-        }
+        })
     }
 
     /// The parent node, or None for the root.
@@ -826,7 +826,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.parent(self.id).map(|pid| Node {
+        Ok(guard.doc().parent(self.id).map(|pid| Node {
             doc: Arc::clone(&self.doc),
             id: pid,
         }))
@@ -840,7 +840,7 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .children(self.id)
             .into_iter()
             .map(|cid| Node {
@@ -865,10 +865,10 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mut out = Vec::new();
-        let mut child = guard.doc.first_child(self.id);
+        let mut child = guard.doc().first_child(self.id);
         while let Some(cid) = child {
             if matches!(
-                guard.doc.node_kind(cid),
+                guard.doc().node_kind(cid),
                 Some(NodeKind::Element(_))
                     | Some(NodeKind::Comment(_))
                     | Some(NodeKind::ProcessingInstruction(_))
@@ -878,7 +878,7 @@ impl Node {
                     id: cid,
                 });
             }
-            child = guard.doc.next_sibling(cid);
+            child = guard.doc().next_sibling(cid);
         }
         Ok(out)
     }
@@ -897,17 +897,17 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mut n = 0usize;
-        let mut child = guard.doc.first_child(self.id);
+        let mut child = guard.doc().first_child(self.id);
         while let Some(cid) = child {
             if matches!(
-                guard.doc.node_kind(cid),
+                guard.doc().node_kind(cid),
                 Some(NodeKind::Element(_))
                     | Some(NodeKind::Comment(_))
                     | Some(NodeKind::ProcessingInstruction(_))
             ) {
                 n += 1;
             }
-            child = guard.doc.next_sibling(cid);
+            child = guard.doc().next_sibling(cid);
         }
         Ok(n)
     }
@@ -926,13 +926,13 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mut out: Option<String> = None;
-        let mut child = guard.doc.first_child(self.id);
+        let mut child = guard.doc().first_child(self.id);
         while let Some(cid) = child {
-            match guard.doc.node_kind(cid) {
+            match guard.doc().node_kind(cid) {
                 Some(NodeKind::Text(_)) | Some(NodeKind::CData(_)) => {
-                    let s = guard.doc.text_content(cid).unwrap_or("");
+                    let s = guard.doc().text_content(cid).unwrap_or("");
                     out.get_or_insert_with(String::new).push_str(s);
-                    child = guard.doc.next_sibling(cid);
+                    child = guard.doc().next_sibling(cid);
                 }
                 _ => break,
             }
@@ -951,13 +951,13 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mut out: Option<String> = None;
-        let mut sib = guard.doc.next_sibling(self.id);
+        let mut sib = guard.doc().next_sibling(self.id);
         while let Some(sid) = sib {
-            match guard.doc.node_kind(sid) {
+            match guard.doc().node_kind(sid) {
                 Some(NodeKind::Text(_)) | Some(NodeKind::CData(_)) => {
-                    let s = guard.doc.text_content(sid).unwrap_or("");
+                    let s = guard.doc().text_content(sid).unwrap_or("");
                     out.get_or_insert_with(String::new).push_str(s);
-                    sib = guard.doc.next_sibling(sid);
+                    sib = guard.doc().next_sibling(sid);
                 }
                 _ => break,
             }
@@ -1009,7 +1009,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.first_child(self.id).map(|cid| Node {
+        Ok(guard.doc().first_child(self.id).map(|cid| Node {
             doc: Arc::clone(&self.doc),
             id: cid,
         }))
@@ -1022,7 +1022,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.last_child(self.id).map(|cid| Node {
+        Ok(guard.doc().last_child(self.id).map(|cid| Node {
             doc: Arc::clone(&self.doc),
             id: cid,
         }))
@@ -1035,7 +1035,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.next_sibling(self.id).map(|sid| Node {
+        Ok(guard.doc().next_sibling(self.id).map(|sid| Node {
             doc: Arc::clone(&self.doc),
             id: sid,
         }))
@@ -1048,7 +1048,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.previous_sibling(self.id).map(|sid| Node {
+        Ok(guard.doc().previous_sibling(self.id).map(|sid| Node {
             doc: Arc::clone(&self.doc),
             id: sid,
         }))
@@ -1066,7 +1066,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element(self.id) {
+        match guard.doc().element(self.id) {
             Some(el) => Ok(el
                 .namespace_declarations
                 .iter()
@@ -1101,10 +1101,10 @@ impl Node {
         let mut chain: Vec<NodeId> = Vec::new();
         let mut cur = Some(self.id);
         while let Some(id) = cur {
-            match guard.doc.node_kind(id) {
+            match guard.doc().node_kind(id) {
                 Some(NodeKind::Element(_)) => {
                     chain.push(id);
-                    cur = guard.doc.parent(id);
+                    cur = guard.doc().parent(id);
                 }
                 _ => break,
             }
@@ -1112,7 +1112,7 @@ impl Node {
         // Emit outermost first so a later (inner) entry wins under `dict(...)`.
         let mut pairs = Vec::new();
         for &id in chain.iter().rev() {
-            if let Some(NodeKind::Element(e)) = guard.doc.node_kind(id) {
+            if let Some(NodeKind::Element(e)) = guard.doc().node_kind(id) {
                 for (p, u) in &e.namespace_declarations {
                     let prefix = if p.is_empty() {
                         None
@@ -1136,7 +1136,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_kind_mut(self.id) {
+        guard.with_doc_mut(|_input, doc| match doc.node_kind_mut(self.id) {
             Some(NodeKind::Text(t)) => {
                 check_xml_string_compatible(content)?;
                 *t = std::borrow::Cow::Owned(content.to_string());
@@ -1155,7 +1155,7 @@ impl Node {
             _ => Err(PyValueError::new_err(
                 "Node is not a text, cdata, or comment node",
             )),
-        }
+        })
     }
 
     /// The content of a Comment node, or None for other node kinds.
@@ -1165,7 +1165,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_kind(self.id) {
+        match guard.doc().node_kind(self.id) {
             Some(NodeKind::Comment(t)) => Ok(Some(t.to_string())),
             _ => Ok(None),
         }
@@ -1178,7 +1178,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_kind(self.id) {
+        match guard.doc().node_kind(self.id) {
             Some(NodeKind::ProcessingInstruction(pi)) => Ok(Some(pi.target.to_string())),
             _ => Ok(None),
         }
@@ -1191,7 +1191,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_kind(self.id) {
+        match guard.doc().node_kind(self.id) {
             Some(NodeKind::ProcessingInstruction(pi)) => {
                 Ok(pi.data.as_ref().map(|d| d.to_string()))
             }
@@ -1208,7 +1208,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_kind_mut(self.id) {
+        guard.with_doc_mut(|_input, doc| match doc.node_kind_mut(self.id) {
             Some(NodeKind::ProcessingInstruction(pi)) => {
                 if let Some(data) = data {
                     check_xml_string_compatible(data)?;
@@ -1219,7 +1219,7 @@ impl Node {
             _ => Err(PyValueError::new_err(
                 "Node is not a processing instruction",
             )),
-        }
+        })
     }
 
     /// Rename an element node's qualified name in place.
@@ -1238,7 +1238,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element_mut(self.id) {
+        guard.with_doc_mut(|_input, doc| match doc.element_mut(self.id) {
             Some(el) => {
                 validate_ncname(local_name, "element")?;
                 let prefix = validate_qname_parts(namespace_uri, prefix)?;
@@ -1254,7 +1254,7 @@ impl Node {
                 Ok(())
             }
             None => Err(PyValueError::new_err("Node is not an element")),
-        }
+        })
     }
 
     /// The line number of this node in the source document (1-based).
@@ -1264,14 +1264,14 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let byte_pos = match guard.doc.node_range(self.id) {
+        let byte_pos = match guard.doc().node_range(self.id) {
             Some(r) => r.start,
             None => return Ok(1),
         };
-        if guard.input.is_empty() || byte_pos == 0 {
+        if guard.input().is_empty() || byte_pos == 0 {
             return Ok(1);
         }
-        Ok(guard.input.as_bytes()[..byte_pos]
+        Ok(guard.input().as_bytes()[..byte_pos]
             .iter()
             .filter(|&&b| b == b'\n')
             .count()
@@ -1285,14 +1285,14 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let byte_pos = match guard.doc.node_range(self.id) {
+        let byte_pos = match guard.doc().node_range(self.id) {
             Some(r) => r.start,
             None => return Ok(1),
         };
-        if guard.input.is_empty() || byte_pos == 0 {
+        if guard.input().is_empty() || byte_pos == 0 {
             return Ok(1);
         }
-        let bytes = &guard.input.as_bytes()[..byte_pos];
+        let bytes = &guard.input().as_bytes()[..byte_pos];
         Ok(match bytes.iter().rposition(|&b| b == b'\n') {
             Some(nl_pos) => byte_pos - nl_pos,
             None => byte_pos + 1,
@@ -1308,7 +1308,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.node_range(self.id).map(|r| (r.start, r.end)))
+        Ok(guard.doc().node_range(self.id).map(|r| (r.start, r.end)))
     }
 
     /// The original source text of this node, or None.
@@ -1320,9 +1320,9 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_range(self.id) {
-            Some(range) if range.end <= guard.input.len() => {
-                Ok(Some(guard.input[range].to_string()))
+        match guard.doc().node_range(self.id) {
+            Some(range) if range.end <= guard.input().len() => {
+                Ok(Some(guard.input()[range].to_string()))
             }
             _ => Ok(None),
         }
@@ -1336,7 +1336,7 @@ impl Node {
         let id = self.id;
         py.detach(|| {
             let guard = shared.lock().map_err(|e| e.to_string())?;
-            Ok::<_, String>(guard.doc.node_to_xml(id))
+            Ok::<_, String>(guard.doc().node_to_xml(id))
         })
         .map_err(PyRuntimeError::new_err)
     }
@@ -1358,7 +1358,7 @@ impl Node {
         let id = self.id;
         py.detach(|| {
             let guard = shared.lock().map_err(|e| e.to_string())?;
-            Ok::<_, String>(guard.doc.node_to_xml_with_options(id, &opts))
+            Ok::<_, String>(guard.doc().node_to_xml_with_options(id, &opts))
         })
         .map_err(PyRuntimeError::new_err)
     }
@@ -1370,7 +1370,7 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .get_elements_by_tag_name(name)
             .into_iter()
             .map(|nid| Node {
@@ -1387,7 +1387,7 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .get_elements_by_tag_name_ns(namespace_uri, name)
             .into_iter()
             .map(|nid| Node {
@@ -1408,7 +1408,7 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .first_child_element_by_name_ns(self.id, namespace_uri, local_name)
             .map(|nid| Node {
                 doc: Arc::clone(&self.doc),
@@ -1427,7 +1427,7 @@ impl Node {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .child_elements_by_name_ns(self.id, namespace_uri, local_name)
             .into_iter()
             .map(|nid| Node {
@@ -1445,7 +1445,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element(self.id) {
+        match guard.doc().element(self.id) {
             Some(el) => Ok(el.matches_name_ns(namespace_uri, local_name)),
             None => Ok(false),
         }
@@ -1456,7 +1456,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.node_kind(self.id) {
+        match guard.doc().node_kind(self.id) {
             Some(NodeKind::Element(el)) => Ok(format!("Node(<{}>)", el.name.prefixed_name())),
             Some(NodeKind::Text(t)) => {
                 let preview: String = t.chars().take(30).collect();
@@ -1487,7 +1487,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.children(self.id).len())
+        Ok(guard.doc().children(self.id).len())
     }
 
     /// Iterate over child nodes.
@@ -1496,7 +1496,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let children: Vec<NodeId> = guard.doc.children(self.id);
+        let children: Vec<NodeId> = guard.doc().children(self.id);
         Ok(NodeIterator {
             doc: Arc::clone(&self.doc),
             ids: children,
@@ -1510,7 +1510,7 @@ impl Node {
             .doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let children = guard.doc.children(self.id);
+        let children = guard.doc().children(self.id);
         let len = children.len() as isize;
         let idx = if index < 0 { len + index } else { index };
         if idx < 0 || idx >= len {
@@ -1669,17 +1669,17 @@ impl ElementBase {
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let mut sid = if next {
-                guard.doc.next_sibling(NodeId::new(cell.node_id))
+                guard.doc().next_sibling(NodeId::new(cell.node_id))
             } else {
-                guard.doc.previous_sibling(NodeId::new(cell.node_id))
+                guard.doc().previous_sibling(NodeId::new(cell.node_id))
             };
             while let Some(id) = sid {
-                match guard.doc.node_kind(id) {
+                match guard.doc().node_kind(id) {
                     Some(NodeKind::Text(_)) | Some(NodeKind::CData(_)) => {
                         sid = if next {
-                            guard.doc.next_sibling(id)
+                            guard.doc().next_sibling(id)
                         } else {
-                            guard.doc.previous_sibling(id)
+                            guard.doc().previous_sibling(id)
                         };
                     }
                     _ => break,
@@ -1802,7 +1802,7 @@ impl ElementBase {
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            if let Some(e) = guard.doc.element(id) {
+            if let Some(e) = guard.doc().element(id) {
                 let ns = e.name.namespace_uri.as_deref();
                 let local = &e.name.local_name;
                 if let Ok(holder) = self.holder.bind(py).cast::<DocHolderBase>() {
@@ -1812,7 +1812,7 @@ impl ElementBase {
                 }
                 missed = Some((ns.map(str::to_owned), local.to_string()));
             } else {
-                non_element_kind = match guard.doc.node_kind(id) {
+                non_element_kind = match guard.doc().node_kind(id) {
                     Some(NodeKind::Comment(_)) => 1,
                     Some(NodeKind::ProcessingInstruction(_)) => 2,
                     None => 3,
@@ -1906,7 +1906,7 @@ impl ElementBase {
         let mut guard = doc
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        clear_element_contents(&mut guard.doc, id, keep_tail);
+        guard.with_doc_mut(|_input, doc| clear_element_contents(doc, id, keep_tail));
         Ok(())
     }
 
@@ -1928,7 +1928,7 @@ impl ElementBase {
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            guard.doc.element(NodeId::new(self.node_id)).and_then(|el| {
+            guard.doc().element(NodeId::new(self.node_id)).and_then(|el| {
                 el.attributes
                     .iter()
                     .find(|a| {
@@ -1951,7 +1951,7 @@ impl ElementBase {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .element(NodeId::new(self.node_id))
             .map(|el| {
                 el.attributes
@@ -1969,7 +1969,7 @@ impl ElementBase {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .element(NodeId::new(self.node_id))
             .map(|el| el.attributes.iter().map(|a| a.value.to_string()).collect())
             .unwrap_or_default())
@@ -1982,7 +1982,7 @@ impl ElementBase {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .element(NodeId::new(self.node_id))
             .map(|el| {
                 el.attributes
@@ -2004,7 +2004,7 @@ impl ElementBase {
             let guard = doc.lock().map_err(|e| e.to_string())?;
             let mut stack = vec![start];
             let mut count = 0usize;
-            while advance_desc_walk(&guard.doc, &mut stack, &filter).is_some() {
+            while advance_desc_walk(guard.doc(), &mut stack, &filter).is_some() {
                 count += 1;
             }
             Ok::<_, String>(count)
@@ -2022,7 +2022,7 @@ impl ElementBase {
         py.detach(move || {
             let guard = doc.lock().map_err(|e| e.to_string())?;
             let mut stack = vec![start];
-            Ok::<_, String>(advance_desc_walk(&guard.doc, &mut stack, &filter).is_some())
+            Ok::<_, String>(advance_desc_walk(guard.doc(), &mut stack, &filter).is_some())
         })
         .map_err(PyRuntimeError::new_err)
     }
@@ -2044,7 +2044,7 @@ impl ElementBase {
             let guard = doc
                 .lock()
                 .map_err(|e| BulkScanError::Runtime(e.to_string()))?;
-            sum_int_attr_detached(&guard.doc, start, &filter, attr_ns.as_deref(), &attr_local)
+            sum_int_attr_detached(guard.doc(), start, &filter, attr_ns.as_deref(), &attr_local)
         })
         .map_err(BulkScanError::into_pyerr)
     }
@@ -2065,7 +2065,7 @@ impl ElementBase {
         py.detach(move || {
             let guard = doc.lock().map_err(|e| e.to_string())?;
             Ok::<_, String>(collect_attr_detached(
-                &guard.doc,
+                guard.doc(),
                 start,
                 &filter,
                 attr_ns.as_deref(),
@@ -2100,7 +2100,7 @@ impl ElementBase {
         py.detach(move || {
             let guard = doc.lock().map_err(|e| e.to_string())?;
             Ok::<_, String>(collect_grouped_text_detached(
-                &guard.doc,
+                guard.doc(),
                 start,
                 &group_filter,
                 &item_filter,
@@ -2183,9 +2183,9 @@ impl ElementBase {
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let pid = match guard.doc.parent(id) {
+            let pid = match guard.doc().parent(id) {
                 // The document node is not an element; its children are roots.
-                Some(p) if !matches!(guard.doc.node_kind(p), Some(NodeKind::Document)) => Some(p),
+                Some(p) if !matches!(guard.doc().node_kind(p), Some(NodeKind::Document)) => Some(p),
                 _ => None,
             };
             drop(guard);
@@ -2231,7 +2231,7 @@ impl ElementBase {
                 .doc
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            guard.doc.first_child(NodeId::new(self.node_id))
+            guard.doc().first_child(NodeId::new(self.node_id))
         };
         Ok(ProxyChildIterator {
             holder,
@@ -2253,15 +2253,15 @@ impl ElementBase {
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let mut ids = Vec::new();
-            let mut child = guard.doc.first_child(id);
+            let mut child = guard.doc().first_child(id);
             while let Some(cid) = child {
-                match guard.doc.node_kind(cid) {
+                match guard.doc().node_kind(cid) {
                     Some(NodeKind::Element(_))
                     | Some(NodeKind::Comment(_))
                     | Some(NodeKind::ProcessingInstruction(_)) => ids.push(cid.index()),
                     _ => {}
                 }
-                child = guard.doc.next_sibling(cid);
+                child = guard.doc().next_sibling(cid);
             }
             drop(guard);
             (cell.holder.clone_ref(py), ids)
@@ -2597,7 +2597,7 @@ impl DocHolderBase {
         {
             let src_shared = Arc::clone(&snode.doc);
             let dst_shared = Arc::clone(&dnode.doc);
-            let lock_err = |e: std::sync::PoisonError<std::sync::MutexGuard<'_, DocWithInput>>| {
+            let lock_err = |e: std::sync::PoisonError<std::sync::MutexGuard<'_, OwnedDoc>>| {
                 PyRuntimeError::new_err(e.to_string())
             };
             let (src_guard, dst_guard) = if Arc::ptr_eq(&src_shared, &dst_shared) {
@@ -2612,9 +2612,9 @@ impl DocHolderBase {
                 let d = dst_shared.lock().map_err(lock_err)?;
                 (s, Some(d))
             };
-            let sdoc = &src_guard.doc;
+            let sdoc = src_guard.doc();
             let ddoc = match &dst_guard {
-                Some(g) => &g.doc,
+                Some(g) => g.doc(),
                 None => sdoc,
             };
             // Children are cloned in document order, so a positional lock-step
@@ -2798,7 +2798,7 @@ impl BulkScanError {
 }
 
 fn matching_attr_value<'a>(
-    doc: &'a UDocument<'static>,
+    doc: &'a UDocument<'a>,
     id: NodeId,
     attr_ns: Option<&str>,
     attr_local: &str,
@@ -2815,7 +2815,7 @@ fn matching_attr_value<'a>(
 }
 
 fn collect_attr_detached(
-    doc: &UDocument<'static>,
+    doc: &UDocument<'_>,
     start: NodeId,
     filter: &DescFilter,
     attr_ns: Option<&str>,
@@ -2831,7 +2831,7 @@ fn collect_attr_detached(
     values
 }
 
-fn leading_text_run_detached(doc: &UDocument<'static>, id: NodeId) -> Option<String> {
+fn leading_text_run_detached(doc: &UDocument<'_>, id: NodeId) -> Option<String> {
     let mut out: Option<String> = None;
     let mut child = doc.first_child(id);
     while let Some(cid) = child {
@@ -2848,7 +2848,7 @@ fn leading_text_run_detached(doc: &UDocument<'static>, id: NodeId) -> Option<Str
 }
 
 fn collect_grouped_text_detached(
-    doc: &UDocument<'static>,
+    doc: &UDocument<'_>,
     start: NodeId,
     group_filter: &DescFilter,
     item_filter: &DescFilter,
@@ -2876,7 +2876,7 @@ fn collect_grouped_text_detached(
 }
 
 fn sum_int_attr_detached(
-    doc: &UDocument<'static>,
+    doc: &UDocument<'_>,
     start: NodeId,
     filter: &DescFilter,
     attr_ns: Option<&str>,
@@ -2912,7 +2912,7 @@ fn clark_key_from_parts(ns: Option<&str>, local: &str) -> String {
     }
 }
 
-fn desc_filter_matches(doc: &UDocument<'static>, id: NodeId, filter: &DescFilter) -> bool {
+fn desc_filter_matches(doc: &UDocument<'_>, id: NodeId, filter: &DescFilter) -> bool {
     match filter {
         DescFilter::All => matches!(
             doc.node_kind(id),
@@ -2930,7 +2930,7 @@ fn desc_filter_matches(doc: &UDocument<'static>, id: NodeId, filter: &DescFilter
 }
 
 fn postprocess_parse_options_detached(
-    doc: &mut UDocument<'static>,
+    doc: &mut UDocument<'_>,
     remove_comments: bool,
     remove_pis: bool,
     strip_cdata: bool,
@@ -2986,7 +2986,7 @@ fn postprocess_parse_options_detached(
     }
 }
 
-fn coalesce_text_subtree(doc: &mut UDocument<'static>, root: NodeId) {
+fn coalesce_text_subtree(doc: &mut UDocument<'_>, root: NodeId) {
     let mut stack = vec![root];
     while let Some(parent) = stack.pop() {
         let mut run_head: Option<NodeId> = None;
@@ -3039,7 +3039,7 @@ struct DescendantIterator {
 /// (yields cached `_Element` proxies). Children are pushed in reverse so
 /// they pop in document order, giving the pre-order sequence lxml produces.
 fn advance_desc_walk(
-    doc: &UDocument<'static>,
+    doc: &UDocument<'_>,
     stack: &mut Vec<NodeId>,
     filter: &DescFilter,
 ) -> Option<NodeId> {
@@ -3074,7 +3074,7 @@ impl DescendantIterator {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(
-            advance_desc_walk(&guard.doc, &mut self.stack, &self.filter).map(|id| Node {
+            advance_desc_walk(guard.doc(), &mut self.stack, &self.filter).map(|id| Node {
                 doc: Arc::clone(&self.doc),
                 id,
             }),
@@ -3140,7 +3140,7 @@ impl ProxyDescendantIterator {
                     .lock()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 while buffer.len() < BATCH_SIZE {
-                    let Some(id) = advance_desc_walk(&guard.doc, stack, filter) else {
+                    let Some(id) = advance_desc_walk(guard.doc(), stack, filter) else {
                         break;
                     };
                     buffer.push(id);
@@ -3213,8 +3213,8 @@ impl ProxyChildIterator {
             let mut cur = *next;
             let mut found = None;
             while let Some(cid) = cur {
-                cur = guard.doc.next_sibling(cid);
-                match guard.doc.node_kind(cid) {
+                cur = guard.doc().next_sibling(cid);
+                match guard.doc().node_kind(cid) {
                     Some(NodeKind::Element(_))
                     | Some(NodeKind::Comment(_))
                     | Some(NodeKind::ProcessingInstruction(_)) => {
@@ -3446,7 +3446,7 @@ impl IterStepError {
 
 type IterStepResult<T> = Result<T, IterStepError>;
 
-fn lock_iter_doc(doc: &SharedDoc) -> IterStepResult<std::sync::MutexGuard<'_, DocWithInput>> {
+fn lock_iter_doc(doc: &SharedDoc) -> IterStepResult<std::sync::MutexGuard<'_, OwnedDoc>> {
     doc.lock()
         .map_err(|e| IterStepError::Runtime(e.to_string()))
 }
@@ -3548,44 +3548,45 @@ impl IterParseState {
             return Ok(());
         };
         let mut guard = lock_iter_doc(&self.doc)?;
-        if !cdata || self.strip_cdata {
-            if let Some(last) = guard.doc.last_child(parent) {
-                if let Some(NodeKind::Text(existing)) = guard.doc.node_kind_mut(last) {
-                    existing.to_mut().push_str(text);
-                    return Ok(());
+        let merge_text = !cdata || self.strip_cdata;
+        guard.with_doc_mut(|_input, doc| {
+            if merge_text {
+                if let Some(last) = doc.last_child(parent) {
+                    if let Some(NodeKind::Text(existing)) = doc.node_kind_mut(last) {
+                        existing.to_mut().push_str(text);
+                        return;
+                    }
                 }
+                let id = doc.create_text(Cow::Owned(text.to_string()));
+                doc.append_child(parent, id);
+            } else {
+                let id = doc.create_cdata(Cow::Owned(text.to_string()));
+                doc.append_child(parent, id);
             }
-            let id = guard.doc.create_text(Cow::Owned(text.to_string()));
-            guard.doc.append_child(parent, id);
-        } else {
-            let id = guard.doc.create_cdata(Cow::Owned(text.to_string()));
-            guard.doc.append_child(parent, id);
-        }
+        });
         Ok(())
     }
 
     fn append_comment(&mut self, text: &str) -> IterStepResult<NodeId> {
         let mut guard = lock_iter_doc(&self.doc)?;
-        let id = guard.doc.create_comment(Cow::Owned(text.to_string()));
-        let parent = self
-            .stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| guard.doc.root());
-        guard.doc.append_child(parent, id);
-        Ok(id)
+        let parent = self.stack.last().copied();
+        Ok(guard.with_doc_mut(|_input, doc| {
+            let id = doc.create_comment(Cow::Owned(text.to_string()));
+            let parent = parent.unwrap_or_else(|| doc.root());
+            doc.append_child(parent, id);
+            id
+        }))
     }
 
     fn append_pi(&mut self, pi: uppsala::ProcessingInstruction<'static>) -> IterStepResult<NodeId> {
         let mut guard = lock_iter_doc(&self.doc)?;
-        let id = guard.doc.create_processing_instruction(pi.target, pi.data);
-        let parent = self
-            .stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| guard.doc.root());
-        guard.doc.append_child(parent, id);
-        Ok(id)
+        let parent = self.stack.last().copied();
+        Ok(guard.with_doc_mut(|_input, doc| {
+            let id = doc.create_processing_instruction(pi.target, pi.data);
+            let parent = parent.unwrap_or_else(|| doc.root());
+            doc.append_child(parent, id);
+            id
+        }))
     }
 
     fn append_start(
@@ -3595,18 +3596,17 @@ impl IterParseState {
         namespace_declarations: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     ) -> IterStepResult<NodeId> {
         let mut guard = lock_iter_doc(&self.doc)?;
-        let id = guard.doc.create_element(name);
-        if let Some(el) = guard.doc.element_mut(id) {
-            el.attributes = attributes;
-            el.namespace_declarations = namespace_declarations;
-        }
-        let parent = self
-            .stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| guard.doc.root());
-        guard.doc.append_child(parent, id);
-        Ok(id)
+        let parent = self.stack.last().copied();
+        Ok(guard.with_doc_mut(|_input, doc| {
+            let id = doc.create_element(name);
+            if let Some(el) = doc.element_mut(id) {
+                el.attributes = attributes;
+                el.namespace_declarations = namespace_declarations;
+            }
+            let parent = parent.unwrap_or_else(|| doc.root());
+            doc.append_child(parent, id);
+            id
+        }))
     }
 
     fn next_detached(&mut self) -> IterStepResult<Option<IterYield>> {
@@ -3814,10 +3814,10 @@ impl Document {
         // release the GIL for its duration: other Python threads keep running,
         // and N threads parsing concurrently genuinely use N cores. The PyErr
         // is only built after re-attaching.
-        let parsed = py.detach(|| parser.parse(&input).map(|d| d.into_static()));
-        let doc = parsed.map_err(xml_error_to_pyerr)?;
+        let parsed = py.detach(|| OwnedDoc::try_parse(input, |s| parser.parse(s)));
+        let owned = parsed.map_err(|(e, _input)| xml_error_to_pyerr(e))?;
         Ok(Document {
-            inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
+            inner: Arc::new(Mutex::new(owned)),
         })
     }
 
@@ -3852,22 +3852,18 @@ impl Document {
             forbid_dtd,
             forbid_entities,
         );
-        let parsed = py.detach(|| parser.parse(&input).map(|d| d.into_static()));
-        let doc = parsed.map_err(xml_error_to_pyerr)?;
+        let parsed = py.detach(|| OwnedDoc::try_parse(input, |s| parser.parse(s)));
+        let owned = parsed.map_err(|(e, _input)| xml_error_to_pyerr(e))?;
         Ok(Document {
-            inner: Arc::new(Mutex::new(DocWithInput { doc, input })),
+            inner: Arc::new(Mutex::new(owned)),
         })
     }
 
     /// Create a new empty document.
     #[staticmethod]
     fn empty() -> PyResult<Document> {
-        let doc = UDocument::new().into_static();
         Ok(Document {
-            inner: Arc::new(Mutex::new(DocWithInput {
-                doc,
-                input: String::new(),
-            })),
+            inner: Arc::new(Mutex::new(OwnedDoc::from_owned(UDocument::new()))),
         })
     }
 
@@ -3880,7 +3876,7 @@ impl Document {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Node {
             doc: Arc::clone(&self.inner),
-            id: guard.doc.root(),
+            id: guard.doc().root(),
         })
     }
 
@@ -3891,7 +3887,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.document_element().map(|id| Node {
+        Ok(guard.doc().document_element().map(|id| Node {
             doc: Arc::clone(&self.inner),
             id,
         }))
@@ -3906,22 +3902,16 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.input.clone())
+        Ok(guard.input().to_owned())
     }
 
-    /// Drop the original decoded input buffer retained for source lookups.
+    /// Compatibility no-op retained for API stability.
     ///
-    /// The DOM remains usable, but `input_text` becomes empty and `Node.source`
-    /// no longer returns source snippets. This is useful for lxml-compatible
-    /// etree parsing where callers want compact long-lived trees and do not use
-    /// pyuppsala's lower-level source-inspection helpers.
+    /// In the zero-copy document model the decoded input buffer *is* the
+    /// document's backing storage, so it cannot be dropped while the document
+    /// is alive. Unlike older releases, `input_text` and `Node.source` keep
+    /// working after this call.
     fn discard_input(&self) -> PyResult<()> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        guard.input.clear();
-        guard.input.shrink_to_fit();
         Ok(())
     }
 
@@ -3951,7 +3941,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.doc.doctype.as_ref().map(|dt| dt.to_string()))
+        Ok(guard.doc().doctype.as_ref().map(|dt| dt.to_string()))
     }
 
     /// Apply etree XMLParser post-parse transforms natively.
@@ -3970,12 +3960,9 @@ impl Document {
         let doc = Arc::clone(&self.inner);
         py.detach(move || {
             let mut guard = doc.lock().map_err(|e| e.to_string())?;
-            postprocess_parse_options_detached(
-                &mut guard.doc,
-                remove_comments,
-                remove_pis,
-                strip_cdata,
-            );
+            guard.with_doc_mut(|_input, doc| {
+                postprocess_parse_options_detached(doc, remove_comments, remove_pis, strip_cdata)
+            });
             Ok::<_, String>(())
         })
         .map_err(PyRuntimeError::new_err)
@@ -3988,7 +3975,7 @@ impl Document {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .get_elements_by_tag_name(name)
             .into_iter()
             .map(|nid| Node {
@@ -4005,7 +3992,7 @@ impl Document {
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(guard
-            .doc
+            .doc()
             .get_elements_by_tag_name_ns(namespace_uri, name)
             .into_iter()
             .map(|nid| Node {
@@ -4040,7 +4027,7 @@ impl Document {
             (Some(ns), None) => UQName::with_namespace(ns.to_string(), local_name.to_string()),
             _ => UQName::local(local_name.to_string()),
         };
-        let nid = guard.doc.create_element(qname);
+        let nid = guard.with_doc_mut(|_input, doc| doc.create_element(qname));
         Ok(Node {
             doc: Arc::clone(&self.inner),
             id: nid,
@@ -4054,7 +4041,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let nid = guard.doc.create_text(text.to_string());
+        let nid = guard.with_doc_mut(|_input, doc| doc.create_text(text.to_string()));
         Ok(Node {
             doc: Arc::clone(&self.inner),
             id: nid,
@@ -4068,7 +4055,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let nid = guard.doc.create_comment(text.to_string());
+        let nid = guard.with_doc_mut(|_input, doc| doc.create_comment(text.to_string()));
         Ok(Node {
             doc: Arc::clone(&self.inner),
             id: nid,
@@ -4082,7 +4069,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let nid = guard.doc.create_cdata(text.to_string());
+        let nid = guard.with_doc_mut(|_input, doc| doc.create_cdata(text.to_string()));
         Ok(Node {
             doc: Arc::clone(&self.inner),
             id: nid,
@@ -4100,10 +4087,12 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let nid = guard.doc.create_processing_instruction(
-            target.to_string(),
-            data.map(|s| std::borrow::Cow::Owned(s.to_string())),
-        );
+        let nid = guard.with_doc_mut(|_input, doc| {
+            doc.create_processing_instruction(
+                target.to_string(),
+                data.map(|s| std::borrow::Cow::Owned(s.to_string())),
+            )
+        });
         Ok(Node {
             doc: Arc::clone(&self.inner),
             id: nid,
@@ -4121,7 +4110,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        guard.doc.append_child(parent.id, child.id);
+        guard.with_doc_mut(|_input, doc| doc.append_child(parent.id, child.id));
         Ok(())
     }
 
@@ -4171,8 +4160,7 @@ impl Document {
             (src_guard, dst_guard)
         };
         let new_id = dst_guard
-            .doc
-            .import_subtree(&src_guard.doc, source.id)
+            .with_doc_mut(|_input, doc| doc.import_subtree(src_guard.doc(), source.id))
             .ok_or_else(|| {
                 PyValueError::new_err("cannot import this node (document root or attribute node)")
             })?;
@@ -4204,7 +4192,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        match guard.doc.element_mut(node.id) {
+        guard.with_doc_mut(|_input, doc| match doc.element_mut(node.id) {
             Some(el) => {
                 let prefix = validate_prefix(prefix)?;
                 validate_ns_declaration(prefix, uri)?;
@@ -4223,7 +4211,7 @@ impl Document {
                 Ok(())
             }
             None => Err(PyValueError::new_err("Node is not an element")),
-        }
+        })
     }
 
     /// Insert a child node before a reference node.
@@ -4238,9 +4226,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        guard
-            .doc
-            .insert_before(parent.id, new_child.id, reference.id);
+        guard.with_doc_mut(|_input, doc| doc.insert_before(parent.id, new_child.id, reference.id));
         Ok(())
     }
 
@@ -4256,9 +4242,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        guard
-            .doc
-            .insert_after(parent.id, new_child.id, reference.id);
+        guard.with_doc_mut(|_input, doc| doc.insert_after(parent.id, new_child.id, reference.id));
         Ok(())
     }
 
@@ -4273,7 +4257,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        guard.doc.remove_child(parent.id, child.id);
+        guard.with_doc_mut(|_input, doc| doc.remove_child(parent.id, child.id));
         Ok(())
     }
 
@@ -4290,9 +4274,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        guard
-            .doc
-            .replace_child(parent.id, new_child.id, old_child.id);
+        guard.with_doc_mut(|_input, doc| doc.replace_child(parent.id, new_child.id, old_child.id));
         Ok(())
     }
 
@@ -4307,7 +4289,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        guard.doc.detach(node.id);
+        guard.with_doc_mut(|_input, doc| doc.detach(node.id));
         Ok(())
     }
 
@@ -4321,7 +4303,7 @@ impl Document {
         let shared = Arc::clone(&self.inner);
         py.detach(|| {
             let guard = shared.lock().map_err(|e| e.to_string())?;
-            Ok::<_, String>(guard.doc.to_xml())
+            Ok::<_, String>(guard.doc().to_xml())
         })
         .map_err(PyRuntimeError::new_err)
     }
@@ -4347,7 +4329,7 @@ impl Document {
         let shared = Arc::clone(&self.inner);
         py.detach(|| {
             let guard = shared.lock().map_err(|e| e.to_string())?;
-            Ok::<_, String>(guard.doc.to_xml_with_options(&opts))
+            Ok::<_, String>(guard.doc().to_xml_with_options(&opts))
         })
         .map_err(PyRuntimeError::new_err)
     }
@@ -4362,7 +4344,7 @@ impl Document {
             let mut file =
                 std::fs::File::create(&path).map_err(|e| format!("Cannot create file: {}", e))?;
             guard
-                .doc
+                .doc()
                 .write_to(&mut file)
                 .map_err(|e| format!("Write error: {}", e))
         })
@@ -4377,7 +4359,7 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        guard.doc.prepare_xpath();
+        guard.with_doc_mut(|_input, doc| doc.prepare_xpath());
         Ok(())
     }
 
@@ -4392,10 +4374,10 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let root_el = guard.doc.document_element();
+        let root_el = guard.doc().document_element();
         match root_el {
             Some(id) => {
-                if let Some(el) = guard.doc.element(id) {
+                if let Some(el) = guard.doc().element(id) {
                     Ok(format!("Document(<{}>)", el.name.prefixed_name()))
                 } else {
                     Ok("Document(empty)".into())
@@ -4482,10 +4464,10 @@ impl XPathEvaluator {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let ctx_id = context_id.unwrap_or_else(|| inner_doc.doc.root());
+        let ctx_id = context_id.unwrap_or_else(|| inner_doc.doc().root());
         let result = self
             .inner
-            .evaluate(&inner_doc.doc, ctx_id, expr)
+            .evaluate(inner_doc.doc(), ctx_id, expr)
             .map_err(xml_error_to_pyerr)?;
         drop(inner_doc); // release lock before building Python objects
         xpath_value_to_py(py, &doc.inner, result)
@@ -4508,10 +4490,10 @@ impl XPathEvaluator {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let ctx_id = context_id.unwrap_or_else(|| inner_doc.doc.root());
+        let ctx_id = context_id.unwrap_or_else(|| inner_doc.doc().root());
         let nodes = self
             .inner
-            .select_nodes(&inner_doc.doc, ctx_id, expr)
+            .select_nodes(inner_doc.doc(), ctx_id, expr)
             .map_err(xml_error_to_pyerr)?;
         Ok(nodes
             .into_iter()
@@ -4656,7 +4638,7 @@ impl XsdValidator {
         let errors = py
             .detach(|| {
                 let inner_doc = shared.lock().map_err(|e| e.to_string())?;
-                Ok::<_, String>(validator.validate(&inner_doc.doc))
+                Ok::<_, String>(validator.validate(inner_doc.doc()))
             })
             .map_err(PyRuntimeError::new_err)?;
         Ok(errors
@@ -4698,7 +4680,7 @@ impl XsdValidator {
         let validator = &self.inner;
         py.detach(|| {
             let inner_doc = shared.lock().map_err(|e| e.to_string())?;
-            Ok::<_, String>(validator.validate(&inner_doc.doc).is_empty())
+            Ok::<_, String>(validator.validate(inner_doc.doc()).is_empty())
         })
         .map_err(PyRuntimeError::new_err)
     }
@@ -4979,6 +4961,30 @@ impl Xslt {
         })
         .map_err(xml_error_to_pyerr)
     }
+
+    /// Apply the stylesheet directly to a parsed `Document`, returning the
+    /// serialized result.
+    ///
+    /// Unlike `transform`, this never serializes or re-parses the source: the
+    /// stylesheet runs over the document's live DOM. For a large document
+    /// (e.g. a 100 MB SAML aggregate) that removes one full serialization and
+    /// one full parse per transform, and the corresponding transient arena.
+    /// The document is prepared for XPath as a side effect (same as calling
+    /// `Document.prepare_xpath()`); it is not otherwise mutated.
+    fn transform_document(&self, py: Python<'_>, document: &Document) -> PyResult<String> {
+        let shared = Arc::clone(&document.inner);
+        let sheet = &self.inner;
+        // The transform is pure Rust over the shared DOM; release the GIL and
+        // take the document mutex inside the detached closure (GIL -> doc
+        // mutex, never the reverse -- the project-wide lock rule).
+        py.detach(|| {
+            let mut guard = shared.lock().map_err(|e| e.to_string())?;
+            guard.with_doc_mut(|_input, doc| doc.prepare_xpath());
+            Ok::<_, String>(sheet.transform(guard.doc()))
+        })
+        .map_err(PyRuntimeError::new_err)?
+        .map_err(xml_error_to_pyerr)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5203,7 +5209,7 @@ fn parse_many(
     // Workers never touch the Python C-API: a failure is carried as a GIL-free
     // `BatchError` and only turned into a Python exception in the wrap-up loop
     // below, once the GIL is held again.
-    let results: Vec<std::sync::Mutex<Option<Result<DocWithInput, BatchError>>>> =
+    let results: Vec<std::sync::Mutex<Option<Result<OwnedDoc, BatchError>>>> =
         (0..n_items).map(|_| std::sync::Mutex::new(None)).collect();
     py.detach(|| {
         let next = AtomicUsize::new(0);
@@ -5233,7 +5239,7 @@ fn parse_many(
                         // error instead. AssertUnwindSafe is fine: on a panic
                         // the closure's only shared state (the result slot)
                         // is overwritten wholesale below.
-                        let parsed: Result<DocWithInput, BatchError> =
+                        let parsed: Result<OwnedDoc, BatchError> =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 let input = match &items[i] {
                                     BatchInput::Text(s) => s.clone(),
@@ -5241,11 +5247,8 @@ fn parse_many(
                                         decode_xml_bytes_raw(b).map_err(BatchError::Decode)?
                                     }
                                 };
-                                let doc = parser
-                                    .parse(&input)
-                                    .map_err(BatchError::Parse)?
-                                    .into_static();
-                                Ok(DocWithInput { doc, input })
+                                OwnedDoc::try_parse(input, |s| parser.parse(s))
+                                    .map_err(|(e, _input)| BatchError::Parse(e))
                             }))
                             .unwrap_or_else(|p| Err(BatchError::Panic(panic_message(p))));
                         // Tolerate a poisoned slot rather than panicking:
@@ -5393,7 +5396,7 @@ fn validate_fetch_floats(timeout: f64, connect_timeout: f64, retry_backoff: f64)
         ("connect_timeout", connect_timeout),
         ("retry_backoff", retry_backoff),
     ] {
-        if !v.is_finite() || v < 0.0 || v > MAX_FETCH_SECONDS {
+        if !v.is_finite() || !(0.0..=MAX_FETCH_SECONDS).contains(&v) {
             return Err(PyValueError::new_err(format!(
                 "{} must be a finite number of seconds in 0..={:e} (got {})",
                 name, MAX_FETCH_SECONDS, v
@@ -5737,11 +5740,9 @@ fn fetch_and_parse_many(
             // odd-length UTF-16, etc.) -- per-item failures are much easier
             // to debug with the real cause attached to the URL.
             let input = decode_xml_bytes_raw(&o.body).map_err(|e| format!("{}: {}", o.url, e))?;
-            let doc = parser
-                .parse(&input)
-                .map_err(|e| format!("{}: {}", o.url, e))?
-                .into_static();
-            Ok((o, DocWithInput { doc, input }))
+            let owned = OwnedDoc::try_parse(input, |s| parser.parse(s))
+                .map_err(|(e, _input)| format!("{}: {}", o.url, e))?;
+            Ok((o, owned))
         })
     });
     outs.into_iter()

@@ -399,7 +399,12 @@ class Document:
         """
         ...
     def discard_input(self) -> None:
-        """Drop the retained source text used by input_text/source helpers."""
+        """Compatibility no-op: the retained input is the document's backing store.
+
+        In the zero-copy model the decoded input cannot be freed while the
+        document is alive; ``input_text`` and ``Node.source`` keep working
+        after this call.
+        """
         ...
     def postprocess_parse_options(
         self,
@@ -705,6 +710,14 @@ class Xslt:
         (``str:``/``math:``/``set:``/``exsl:``); ``date:date-time()`` is always
         available. ``max_depth`` overrides the template-activation recursion cap
         (see ``DEFAULT_MAX_XSLT_DEPTH``).
+        """
+        ...
+    def transform_document(self, document: Document) -> str:
+        """Apply the stylesheet directly to a parsed ``Document``.
+
+        Never serializes or re-parses the source: the stylesheet runs over the
+        document's live DOM. The document is prepared for XPath as a side
+        effect (as by ``Document.prepare_xpath()``) but not otherwise mutated.
         """
         ...
     def transform(self, source_xml: str) -> str:
