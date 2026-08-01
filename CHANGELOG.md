@@ -1,7 +1,7 @@
 # Changelog
 
 
-## 0.9.1 [Unreleased]
+## 0.10.0 [Unreleased]
 
 ### Added
 
@@ -9,10 +9,29 @@
   native extension consumers that operate directly on the existing Uppsala
   DOM.
 - Added the separately publishable ``pyuppsala-interop`` crate containing the
-  versioned capsule payload and shared document ownership types.
+  versioned capsule payload and shared document ownership types
+  (``pyuppsala-interop`` 0.2.0 on crates.io).
+- Added ``XSLT.transform_document()`` and an automatic etree fast path: when
+  the transform input is the document's root element, the stylesheet runs over
+  the live DOM, skipping one full serialization and one full re-parse per
+  transform (ADR 0004).
+- Added ``etree.native_document()``, the bridge from an etree element/tree to
+  the owning native ``Document`` for extensions that operate on the live DOM.
 
 ### Changed
 
+- **Zero-copy retained-input documents** (ADR 0003): parsing no longer calls
+  ``into_static()``; the decoded input string becomes the document's backing
+  storage and node data borrows from it. On an 83 MB eduGAIN aggregate this
+  cuts parse retained memory from +342 MiB to +178 MiB, removes the transient
+  double-arena peak, and lowers whole-lifecycle peak memory by roughly 14%.
+- ``Document.discard_input()`` is now a documented no-op: the input buffer is
+  the document's backing storage and cannot be freed while the document is
+  alive. Unlike older releases, ``input_text`` and ``Node.source`` keep
+  working after the call.
+- The native document-handle capsule ABI moved to v2
+  (``pyuppsala.document_handle.v2``); extension consumers must build against
+  ``pyuppsala-interop`` 0.2.0.
 - Declared Rust 1.77 as the minimum supported Rust version (MSRV) for both
   ``pyuppsala`` and ``pyuppsala-interop``.
 

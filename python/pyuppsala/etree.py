@@ -2240,6 +2240,28 @@ def tounicode(element_or_tree, **kwargs):
     return tostring(element_or_tree, **kwargs)
 
 
+def native_document(element_or_tree):
+    """Return the native :class:`pyuppsala.Document` owning ``element_or_tree``.
+
+    This is the pyuppsala-specific bridge for extensions that operate on the
+    live DOM instead of a serialized string (for example pybergshamra's
+    ``sign_enveloped_document``/``verify_document``, which reach the shared
+    document through ``Document._bergshamra_document_capsule()``). The returned
+    Document is the same object every proxy of the tree shares; native
+    mutations through it are immediately visible to the etree proxies.
+
+    Raises ``TypeError`` for objects that are not pyuppsala elements or trees.
+    """
+    if isinstance(element_or_tree, _ElementTree):
+        element_or_tree = element_or_tree.getroot()
+    if not isinstance(element_or_tree, _Element):
+        raise TypeError(
+            "expected a pyuppsala element or tree, got %s"
+            % type(element_or_tree).__name__
+        )
+    return element_or_tree._holder.doc
+
+
 def dump(elem, *, pretty_print=True, **kwargs):
     """Write a debug serialization of ``elem`` to stdout.
 
@@ -2558,14 +2580,49 @@ class XSLT:
             raise NotImplementedError(
                 "XSLT parameters are not yet supported: %s" % names
             )
-        source_xml = tostring(_input, encoding="unicode")
         try:
-            result = self._native.transform(source_xml)
+            native_doc = self._whole_document_source(_input)
+            if native_doc is not None:
+                # Fast path: run the stylesheet over the live DOM. This skips
+                # serializing the source to a string and the engine's re-parse
+                # of that string -- for a large document that is one full
+                # serialization plus one full parse (and its transient arena)
+                # saved per transform.
+                result = self._native.transform_document(native_doc)
+            else:
+                source_xml = tostring(_input, encoding="unicode")
+                result = self._native.transform(source_xml)
         except _XSLT_NATIVE_ERRORS as e:
             self.error_log = [_XSLTLogEntry(str(e))]
             raise XSLTApplyError(str(e)) from e
         self.error_log = []
         return _XSLTResultTree(result)
+
+    @staticmethod
+    def _whole_document_source(_input):
+        """Return the owning native ``Document`` when transforming ``_input``
+        is equivalent to transforming its whole document, else ``None``.
+
+        The string path serializes exactly the input element (or tree), so the
+        engine never sees a DOCTYPE or document-level comments/PIs. The
+        document path would. To keep the output identical, the fast path is
+        used only when the input is the document's root element (or its tree)
+        and the root element is the document's sole top-level node.
+        """
+        if isinstance(_input, _ElementTree):
+            el = _input.getroot()
+        elif isinstance(_input, _Element):
+            el = _input
+        else:
+            return None
+        if el is None or el.getparent() is not None:
+            return None
+        doc = el._holder.doc
+        if doc.doctype is not None:
+            return None
+        if len(doc.root.children) != 1:
+            return None
+        return doc
 
     @staticmethod
     def strparam(value):

@@ -1524,6 +1524,92 @@ class TestXSLT:
         assert issubclass(P.XSLTApplyError, P.XSLTError)
         assert issubclass(P.XSLTError, P.LxmlError)
 
+    # -- transform_document fast path -------------------------------------
+    #
+    # The facade routes a whole-document input through the native
+    # ``transform_document`` fast path only when the output is provably
+    # identical to the string path (see ``_whole_document_source``). These
+    # tests pin both the guard's disqualifiers and the output equivalence.
+
+    def test_transform_document_fast_path_matches_string_path(self):
+        t = P.XSLT(P.fromstring(TIDY_XSLT))
+        src = P.fromstring(XSLT_DOC)
+        assert P.XSLT._whole_document_source(src) is not None
+        fast = str(t(src))
+        slow = t._native.transform(P.tostring(src, encoding="unicode"))
+        assert fast == slow
+
+    def test_whole_document_source_accepts_root_element_and_tree(self):
+        root = P.fromstring(XSLT_DOC)
+        doc = P.XSLT._whole_document_source(root)
+        assert doc is not None
+        assert P.XSLT._whole_document_source(root.getroottree()) is doc
+
+    def test_whole_document_source_rejects_non_root_element(self):
+        root = P.fromstring(XSLT_DOC)
+        assert P.XSLT._whole_document_source(root[0]) is None
+
+    def test_whole_document_source_rejects_non_pyuppsala_input(self):
+        assert P.XSLT._whole_document_source("<root/>") is None
+        assert P.XSLT._whole_document_source(None) is None
+
+    def test_whole_document_source_rejects_doctype(self):
+        # The string path never serializes the DOCTYPE, so the document path
+        # (which would expose it to the engine) must not be used.
+        root = P.fromstring("<!DOCTYPE root><root/>")
+        assert P.XSLT._whole_document_source(root) is None
+
+    def test_whole_document_source_rejects_document_level_comment(self):
+        root = P.fromstring("<!--top--><root/>")
+        assert P.XSLT._whole_document_source(root) is None
+
+    def test_whole_document_source_rejects_document_level_pi(self):
+        root = P.fromstring("<?pi data?><root/>")
+        assert P.XSLT._whole_document_source(root) is None
+
+    def test_transform_falls_back_for_document_level_comment(self):
+        # A disqualified input must produce exactly the string-path output.
+        t = P.XSLT(P.fromstring(TIDY_XSLT))
+        src = P.fromstring("<!--top-->" + XSLT_DOC)
+        assert P.XSLT._whole_document_source(src) is None
+        out = str(t(src))
+        slow = t._native.transform(P.tostring(src, encoding="unicode"))
+        assert out == slow
+
+
+class TestNativeDocument:
+    """Tests for the ``native_document()`` extension bridge."""
+
+    def test_same_document_for_tree_and_elements(self):
+        root = P.fromstring("<root><child/></root>")
+        tree = root.getroottree()
+        doc = P.native_document(root)
+        assert P.native_document(tree) is doc
+        # Any proxy of the same tree shares the one native Document.
+        assert P.native_document(root[0]) is doc
+
+    def test_returns_native_document(self):
+        import pyuppsala
+
+        doc = P.native_document(P.fromstring("<root/>"))
+        assert isinstance(doc, pyuppsala.Document)
+        assert doc.document_element is not None
+
+    def test_mutations_via_native_document_visible_to_proxies(self):
+        root = P.fromstring("<root/>")
+        doc = P.native_document(root)
+        child = doc.create_element("child")
+        doc.append_child(doc.document_element, child)
+        assert [c.tag for c in root] == ["child"]
+
+    def test_rejects_foreign_inputs(self):
+        with pytest.raises(TypeError):
+            P.native_document("<root/>")
+        with pytest.raises(TypeError):
+            P.native_document(None)
+        with pytest.raises(TypeError):
+            P.native_document(42)
+
 
 class TestSmartStringsCompat:
     """lxml's smart_strings kwarg is accepted and ignored (pyFF passes it)."""

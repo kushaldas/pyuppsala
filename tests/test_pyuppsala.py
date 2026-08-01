@@ -75,7 +75,7 @@ class TestDocument:
     def test_bergshamra_document_capsule_contract(self):
         doc = parse("<root/>")
         capsule = doc._bergshamra_document_capsule()
-        capsule_name = b"pyuppsala.document_handle.v1"
+        capsule_name = b"pyuppsala.document_handle.v2"
 
         get_name = ctypes.pythonapi.PyCapsule_GetName
         get_name.argtypes = [ctypes.py_object]
@@ -88,7 +88,7 @@ class TestDocument:
         assert get_name(capsule) == capsule_name
         payload = get_pointer(capsule, capsule_name)
         assert payload is not None
-        assert ctypes.cast(payload, ctypes.POINTER(ctypes.c_uint32)).contents.value == 1
+        assert ctypes.cast(payload, ctypes.POINTER(ctypes.c_uint32)).contents.value == 2
 
     def test_empty_document(self):
         doc = Document.empty()
@@ -1683,6 +1683,19 @@ class TestSourceTracking:
         doc = parse(xml)
         item = doc.document_element.children[0]
         assert item.source == '<item id="1">hello</item>'
+
+    def test_discard_input_is_noop_keeps_input_text_and_source(self):
+        # Zero-copy contract: the retained input is the document's backing
+        # storage, so discard_input() must NOT clear it. This guards against
+        # reintroducing the old input-freeing behavior, which would now
+        # invalidate the DOM's borrowed text.
+        xml = "<root><child>text</child></root>"
+        doc = parse(xml)
+        doc.discard_input()
+        assert doc.input_text == xml
+        child = doc.document_element.children[0]
+        assert child.source == "<child>text</child>"
+        assert doc.document_element.source_range is not None
 
 
 class TestNamespaceSearch:
