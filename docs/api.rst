@@ -369,6 +369,12 @@ Document
       The original input text that was parsed to create this document.
       Returns an empty string for programmatically constructed documents.
 
+      Since 0.10.0 the retained input is also the document's backing storage:
+      parsed node names, attribute values, and text borrow directly from this
+      string instead of holding per-node copies (the *zero-copy* document
+      model). Reading it costs one string copy; retaining the document keeps
+      the input alive.
+
       .. code-block:: python
 
          xml = "<root>hello</root>"
@@ -380,15 +386,15 @@ Document
 
    .. method:: discard_input() -> None
 
-      Drop the retained source text used by :attr:`input_text` and
-      node-level source helpers. After this, :attr:`input_text` is empty and
-      :attr:`Node.source` / :attr:`Node.source_range` no longer have source text
-      to report. This is useful for long-lived parsed trees where source
-      inspection is not needed after parse-time cleanup.
+      Compatibility no-op retained for API stability.
 
-      The etree compatibility layer calls this automatically for
-      ``XMLParser(compact=True)`` after parser options such as
-      ``remove_comments`` and ``strip_cdata`` have been applied.
+      Before 0.10.0 this dropped the retained source text. Under the
+      zero-copy document model the decoded input **is** the document's
+      backing storage, so it cannot be released while the document is alive.
+      Unlike older releases, :attr:`input_text`, :attr:`Node.source`, and
+      :attr:`Node.source_range` keep working after this call. To reclaim the
+      memory, drop the document (or copy the needed subtree into a fresh
+      document first).
 
    .. attribute:: doctype
       :type: str | None
@@ -1765,6 +1771,26 @@ Xslt
 
          sheet = Xslt(stylesheet_xml, exslt=False)
          result = sheet.transform("<root/>")
+
+   .. method:: transform_document(document: Document) -> str
+
+      Apply the compiled stylesheet directly to a parsed :class:`Document`
+      and return the serialized result.
+
+      Unlike :meth:`transform`, this never serializes or re-parses the
+      source: the stylesheet runs over the document's live DOM. For a large
+      document (for example a 100 MB SAML aggregate) that removes one full
+      serialization and one full parse per transform, plus the corresponding
+      transient memory. The document is prepared for XPath as a side effect
+      (as by :meth:`Document.prepare_xpath`) but is not otherwise mutated.
+
+      Note that the document path exposes the *whole* document to the engine,
+      including any DOCTYPE and document-level comments or processing
+      instructions, whereas :meth:`transform` sees exactly the string it is
+      given. The :class:`pyuppsala.etree.XSLT` facade picks between the two
+      automatically and only uses this path when the results are identical.
+
+      .. versionadded:: 0.10.0
 
 XsdRegex
 --------

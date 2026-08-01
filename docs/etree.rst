@@ -386,9 +386,9 @@ still reference them. Because the native DOM is arena-backed, this also means
 ``clear()`` unlinks detached subtrees but does not scrub their stored text,
 attributes, or namespace declarations for memory reclamation. In iterparse
 loops, use ``clear()`` to keep the visible tree small; drop the whole parsed
-document/iterator to release the arena. ``XMLParser(compact=True)`` only
-discards the retained source buffer after parsing, not payloads kept alive by
-detached nodes.
+document/iterator to release the arena. Since 0.10.0 the retained source
+buffer is the document's backing storage (the zero-copy model), so it is
+released together with the document rather than separately.
 
 Supported features
 ------------------
@@ -457,6 +457,21 @@ ElementTree, schema, and transform helpers
 so passing keyword parameters to a transform raises ``NotImplementedError``,
 but ``strparam`` is available for code paths that prepare values conditionally.
 
+When the transform input is a document's root element (or its tree), ``XSLT``
+runs the stylesheet directly over the live DOM via
+:meth:`pyuppsala.Xslt.transform_document`, skipping one full serialization
+and one full re-parse per transform. The fast path is used only when the
+output is provably identical to the string path -- inputs with a DOCTYPE,
+document-level comments or processing instructions, or a non-root element
+fall back to the string path automatically.
+
+``native_document(element_or_tree)`` returns the native
+:class:`pyuppsala.Document` that owns an etree element or tree. It is the
+bridge for extensions that operate on the live DOM instead of a serialized
+string (for example pybergshamra's document-native XML-DSig signing and
+verification); native mutations made through it are immediately visible to
+the etree proxies.
+
 Exceptions
 ----------
 
@@ -508,10 +523,11 @@ than being ignored:
   XSD is provided)
 
 Cosmetic options without an Uppsala equivalent (``collect_ids``, ``no_network``,
-``ns_clean``) are accepted and ignored. ``compact=True`` is honored for etree
-parsing by discarding the retained source buffer after parse-time cleanup; pass
-``compact=False`` if you need source-inspection helpers to retain the decoded
-input text.
+``ns_clean``) are accepted and ignored. ``compact=True`` is accepted for lxml
+compatibility but has been a no-op since 0.10.0: under the zero-copy document
+model the decoded input is the document's backing storage and cannot be
+released while the tree is alive, so source-inspection helpers keep working
+regardless of this flag.
 
 .. note::
 
@@ -538,6 +554,7 @@ API reference
 .. autofunction:: Comment
 .. autofunction:: ProcessingInstruction
 .. autofunction:: ElementTree
+.. autofunction:: native_document
 .. autofunction:: register_namespace
 .. autodata:: MAX_XPATH_NODE_VISITS
 .. autoclass:: QName
