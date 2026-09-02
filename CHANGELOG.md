@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.11.0 [2026-09-02]
+
+### Added
+
+- Added an internal owned-XML document replacement hook for sibling Python
+  extensions. Replacement imports the parsed tree into the existing arena,
+  preserving the document element id for live root views while detaching old
+  descendant handles.
+
+### Changed
+
+- Updated ``uppsala`` 0.9.0 -> 0.10.0.
+- Removed the separately published ``pyuppsala-interop`` crate and the native
+  document capsule. The zero-copy ``OwnedDoc`` implementation now lives
+  inside pyuppsala, and sibling extensions exchange owned XML strings instead
+  of dereferencing Rust data owned by another shared library.
+
+### Fixed
+
+- Removed the cross-extension Rust DOM access that could call code or drop
+  values after the producing shared library had been unloaded, causing
+  downstream segmentation faults.
+
 
 ## 0.10.0 [2026-08-01]
 

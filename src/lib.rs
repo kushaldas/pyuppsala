@@ -2,7 +2,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyCapsule, PyDict};
+use pyo3::types::PyDict;
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -16,7 +16,54 @@ use uppsala::xpath::{XPathEvaluator as UXPathEvaluator, XPathValue as UXPathValu
 use uppsala::xsd::XsdValidator as UXsdValidator;
 use uppsala::{Document as UDocument, XmlError, XmlResult};
 
-use pyuppsala_interop::{DocumentCapsule, OwnedDoc, SharedDoc, DOCUMENT_CAPSULE_CNAME};
+type NativeDoc<'a> = UDocument<'a>;
+
+self_cell::self_cell!(
+    /// Self-referential zero-copy storage for a document borrowing its input.
+    struct DocCell {
+        owner: String,
+        #[covariant]
+        dependent: NativeDoc,
+    }
+);
+
+/// An Uppsala document that owns the input backing its borrowed DOM strings.
+struct OwnedDoc {
+    cell: DocCell,
+}
+
+impl OwnedDoc {
+    fn try_parse<E>(
+        input: String,
+        parse: impl for<'a> FnOnce(&'a str) -> Result<NativeDoc<'a>, E>,
+    ) -> Result<Self, (E, String)> {
+        match DocCell::try_new_or_recover(input, |owner| parse(owner.as_str())) {
+            Ok(cell) => Ok(Self { cell }),
+            Err((owner, error)) => Err((error, owner)),
+        }
+    }
+
+    fn from_owned(doc: NativeDoc<'static>) -> Self {
+        Self {
+            cell: DocCell::new(String::new(), |_owner| doc),
+        }
+    }
+
+    fn input(&self) -> &str {
+        self.cell.borrow_owner().as_str()
+    }
+
+    fn doc(&self) -> &NativeDoc<'_> {
+        self.cell.borrow_dependent()
+    }
+
+    fn with_doc_mut<R>(&mut self, f: impl for<'a> FnOnce(&'a str, &mut NativeDoc<'a>) -> R) -> R {
+        self.cell
+            .with_dependent_mut(|owner, doc| f(owner.as_str(), doc))
+    }
+}
+
+type SharedDoc = Arc<Mutex<OwnedDoc>>;
 
 // ---------------------------------------------------------------------------
 // Custom Python exceptions
@@ -3918,17 +3965,20 @@ impl Document {
         Ok(())
     }
 
-    /// Internal capsule used by extension modules that operate directly on the
-    /// native Uppsala document. Not part of the public Python API.
-    fn _bergshamra_document_capsule<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyCapsule>> {
-        PyCapsule::new_with_value(
-            py,
-            DocumentCapsule::new(Arc::clone(&self.inner)),
-            DOCUMENT_CAPSULE_CNAME,
-        )
+    /// Replace this document from owned XML returned by a sibling extension.
+    ///
+    /// The new tree is imported into the existing arena. The document element
+    /// id is preserved for live root views; old descendant handles are detached.
+    fn _replace_xml(&self, py: Python<'_>, xml: &str) -> PyResult<()> {
+        let input = xml.to_string();
+        let replacement = py.detach(|| OwnedDoc::try_parse(input, |s| UParser::new().parse(s)));
+        let replacement = replacement.map_err(|(error, _input)| xml_error_to_pyerr(error))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        guard.with_doc_mut(|_input, doc| doc.replace_tree_from(replacement.doc()));
+        Ok(())
     }
 
     /// The raw ``<!DOCTYPE ...>`` declaration preserved from the source, or None.

@@ -212,58 +212,6 @@ jobs:
         if-no-files-found: "error"
         compression-level: 0
 
-  publish_interop_crate:
-    name: Publish pyuppsala-interop to crates.io
-    runs-on: ubuntu-latest
-    # Same GitHub environment as the PyPI publish job: one "pypi" environment
-    # gates every registry upload (PyPI trusted publishing and crates.io OIDC
-    # trusted publishing both reference it).
-    environment: pypi
-    permissions:
-      contents: read
-      id-token: write
-    defaults:
-      run:
-        working-directory: crates/pyuppsala-interop
-    steps:
-    - uses: actions/checkout@v7
-
-    - uses: dtolnay/rust-toolchain@stable
-
-    - name: Authenticate with crates.io
-      id: auth
-      uses: rust-lang/crates-io-auth-action@v1
-
-    # pyuppsala-interop is versioned independently of the pyuppsala package
-    # tag (see CLAUDE.md), so most pyuppsala releases won't bump it. Skip
-    # instead of failing on "already uploaded" when this version is already
-    # published, so a routine pyuppsala release doesn't need an interop bump.
-    - name: Check if this version is already published
-      id: check
-      run: |
-        version=$(grep -m 1 '^version' Cargo.toml | sed -E 's/version *= *"(.+)"/\1/')
-        status=$(curl -s -o /dev/null -w '%{http_code}' \
-          -H "User-Agent: pyuppsala-release-workflow (github.com/kushaldas/pyuppsala)" \
-          "https://crates.io/api/v1/crates/pyuppsala-interop/${version}")
-        if [ "$status" = "200" ]; then
-          echo "pyuppsala-interop ${version} is already published, skipping"
-          echo "skip=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-        fi
-
-    # `--dry-run` always when unskipped; real `publish` only on tag push so
-    # manual workflow_dispatch runs can sanity-check without uploading.
-    - name: Verify publishable package
-      if: steps.check.outputs.skip == 'false'
-      run: cargo publish --dry-run
-
-    - name: Publish to crates.io
-      if: steps.check.outputs.skip == 'false' && github.event_name == 'push'
-      env:
-        CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      run: cargo publish
-
   publish:
     runs-on: ubuntu-latest
     needs: [manylinux_x86_64, macos_aarch64, windows_amd64, windows_aarch64]
