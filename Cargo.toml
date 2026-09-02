@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py310"] }
-uppsala = "0.10.0"
+uppsala = "0.10.1"
 self_cell = "1.2"
 # HTTP client for the native fetch_many / fetch_and_parse_many APIs. Optional
 # behind the default-on `net` feature so distro packagers can build a

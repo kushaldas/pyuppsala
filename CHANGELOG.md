@@ -11,7 +11,7 @@
 
 ### Changed
 
-- Updated ``uppsala`` 0.9.0 -> 0.10.0.
+- Updated ``uppsala`` 0.9.0 -> 0.10.1.
 - Removed the separately published ``pyuppsala-interop`` crate and the native
   document capsule. The zero-copy ``OwnedDoc`` implementation now lives
   inside pyuppsala, and sibling extensions exchange owned XML strings instead
