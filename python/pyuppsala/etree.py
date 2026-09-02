@@ -2243,12 +2243,14 @@ def tounicode(element_or_tree, **kwargs):
 def native_document(element_or_tree):
     """Return the native :class:`pyuppsala.Document` owning ``element_or_tree``.
 
-    This is the pyuppsala-specific bridge for extensions that operate on the
-    live DOM instead of a serialized string (for example pybergshamra's
-    ``sign_enveloped_document``/``verify_document``, which reach the shared
-    document through ``Document._bergshamra_document_capsule()``). The returned
-    Document is the same object every proxy of the tree shares; native
-    mutations through it are immediately visible to the etree proxies.
+    This returns the same Document object shared by every proxy of the tree.
+    It can be passed to document-aware Python APIs such as pybergshamra's
+    ``sign_enveloped_document``/``verify_document``; sibling extensions
+    exchange owned XML with it and never access its Rust-owned DOM directly.
+    They serialize the outbound document with
+    ``to_xml_with_options(include_doctype=True)`` so a preserved DOCTYPE is not
+    lost. Mutations through the returned Document are immediately visible to
+    the etree proxies.
 
     Raises ``TypeError`` for objects that are not pyuppsala elements or trees.
     """

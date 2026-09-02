@@ -1,7 +1,5 @@
 """Comprehensive tests for pyuppsala — Python bindings for the Uppsala XML library."""
 
-import ctypes
-
 import pytest
 import pyuppsala
 from pyuppsala import (
@@ -72,23 +70,40 @@ class TestParse:
 
 
 class TestDocument:
-    def test_bergshamra_document_capsule_contract(self):
-        doc = parse("<root/>")
-        capsule = doc._bergshamra_document_capsule()
-        capsule_name = b"pyuppsala.document_handle.v2"
+    def test_owned_xml_replacement_preserves_root_and_detaches_descendants(self):
+        doc = parse("<old><child/></old>")
+        old_root = doc.document_element
+        old_child = old_root.children[0]
 
-        get_name = ctypes.pythonapi.PyCapsule_GetName
-        get_name.argtypes = [ctypes.py_object]
-        get_name.restype = ctypes.c_char_p
-        get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
-        get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
-        get_pointer.restype = ctypes.c_void_p
+        doc._replace_xml("<new><value>42</value></new>")
 
-        assert type(capsule).__name__ == "PyCapsule"
-        assert get_name(capsule) == capsule_name
-        payload = get_pointer(capsule, capsule_name)
-        assert payload is not None
-        assert ctypes.cast(payload, ctypes.POINTER(ctypes.c_uint32)).contents.value == 2
+        assert doc.to_xml() == "<new><value>42</value></new>"
+        assert old_root.node_id == doc.document_element.node_id
+        assert old_root.tag.local_name == "new"
+        assert old_root.parent.kind == "document"
+        assert old_child.parent is None
+        assert doc.input_text == "<old><child/></old>"
+
+    def test_owned_xml_replacement_round_trips_doctype(self):
+        doc = parse('<!DOCTYPE root SYSTEM "r.dtd"><root/>')
+        old_root = doc.document_element
+        outbound = doc.to_xml_with_options(include_doctype=True)
+        replacement = outbound.replace("<root/>", "<root><Signature/></root>")
+
+        doc._replace_xml(replacement)
+
+        assert doc.document_element.node_id == old_root.node_id
+        assert doc.doctype == '<!DOCTYPE root SYSTEM "r.dtd">'
+        assert doc.to_xml_with_options(include_doctype=True) == replacement
+
+    def test_owned_xml_replacement_rejects_dropped_doctype(self):
+        original = '<!DOCTYPE root SYSTEM "r.dtd"><root/>'
+        doc = parse(original)
+
+        with pytest.raises(ValueError, match="include_doctype=True"):
+            doc._replace_xml(doc.to_xml())
+
+        assert doc.to_xml_with_options(include_doctype=True) == original
 
     def test_empty_document(self):
         doc = Document.empty()
