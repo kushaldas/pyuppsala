@@ -30,8 +30,10 @@ zero-copy retained-input model from ADR 0003 remains unchanged inside this
 extension.
 
 Document-aware sibling extensions exchange owned XML through
-`Document.to_xml()`. A mutating operation computes its complete result in the
-consumer and, only after it succeeds, passes the result to the internal
+`Document.to_xml_with_options(include_doctype=True)`. The default
+`Document.to_xml()` deliberately omits a preserved DOCTYPE and is not a
+lossless document boundary. A mutating operation computes its complete result
+in the consumer and, only after it succeeds, passes the result to the internal
 `Document._replace_xml()` hook. Pyuppsala parses that XML into memory it owns
 and replaces the current tree through Uppsala's safe document API.
 
@@ -55,5 +57,7 @@ replacement hook must require that version or newer.
   boundary rather than exported Rust-native ownership.
 - Replacement is applied only after the consumer has completed successfully,
   so an operation error leaves the original pyuppsala document unchanged.
+- The serialized handoff includes a preserved DOCTYPE, so a mutation that only
+  changes the document tree does not silently discard document metadata.
 - `Document._replace_xml()` remains an internal integration hook rather than a
   general public mutation API.

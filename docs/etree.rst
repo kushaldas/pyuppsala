@@ -469,8 +469,10 @@ fall back to the string path automatically.
 :class:`pyuppsala.Document` that owns an etree element or tree. It is the
 object to pass to document-aware APIs such as pybergshamra's XML-DSig signing
 and verification functions. Sibling extensions exchange owned XML rather than
-accessing its Rust-owned DOM directly; mutations made through the returned
-Document are immediately visible to the etree proxies.
+accessing its Rust-owned DOM directly. The outbound handoff uses
+``Document.to_xml_with_options(include_doctype=True)`` so preserved document
+metadata is not lost; mutations made through the returned Document are
+immediately visible to the etree proxies.
 
 Exceptions
 ----------

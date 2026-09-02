@@ -84,6 +84,27 @@ class TestDocument:
         assert old_child.parent is None
         assert doc.input_text == "<old><child/></old>"
 
+    def test_owned_xml_replacement_round_trips_doctype(self):
+        doc = parse('<!DOCTYPE root SYSTEM "r.dtd"><root/>')
+        old_root = doc.document_element
+        outbound = doc.to_xml_with_options(include_doctype=True)
+        replacement = outbound.replace("<root/>", "<root><Signature/></root>")
+
+        doc._replace_xml(replacement)
+
+        assert doc.document_element.node_id == old_root.node_id
+        assert doc.doctype == '<!DOCTYPE root SYSTEM "r.dtd">'
+        assert doc.to_xml_with_options(include_doctype=True) == replacement
+
+    def test_owned_xml_replacement_rejects_dropped_doctype(self):
+        original = '<!DOCTYPE root SYSTEM "r.dtd"><root/>'
+        doc = parse(original)
+
+        with pytest.raises(ValueError, match="include_doctype=True"):
+            doc._replace_xml(doc.to_xml())
+
+        assert doc.to_xml_with_options(include_doctype=True) == original
+
     def test_empty_document(self):
         doc = Document.empty()
         assert doc.document_element is None

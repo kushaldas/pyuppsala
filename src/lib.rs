@@ -3967,6 +3967,10 @@ impl Document {
 
     /// Replace this document from owned XML returned by a sibling extension.
     ///
+    /// Callers must use `to_xml_with_options(include_doctype=True)` for the
+    /// outbound half of this boundary. The default `to_xml()` deliberately
+    /// omits a preserved DOCTYPE and is therefore not a lossless handoff.
+    ///
     /// The new tree is imported into the existing arena. The document element
     /// id is preserved for live root views; old descendant handles are detached.
     fn _replace_xml(&self, py: Python<'_>, xml: &str) -> PyResult<()> {
@@ -3977,6 +3981,11 @@ impl Document {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        if guard.doc().doctype.is_some() && replacement.doc().doctype.is_none() {
+            return Err(PyValueError::new_err(
+                "replacement XML omitted the document DOCTYPE; serialize with include_doctype=True",
+            ));
+        }
         guard.with_doc_mut(|_input, doc| doc.replace_tree_from(replacement.doc()));
         Ok(())
     }

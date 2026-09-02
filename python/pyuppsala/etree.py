@@ -2247,8 +2247,10 @@ def native_document(element_or_tree):
     It can be passed to document-aware Python APIs such as pybergshamra's
     ``sign_enveloped_document``/``verify_document``; sibling extensions
     exchange owned XML with it and never access its Rust-owned DOM directly.
-    Mutations through the returned Document are immediately visible to the
-    etree proxies.
+    They serialize the outbound document with
+    ``to_xml_with_options(include_doctype=True)`` so a preserved DOCTYPE is not
+    lost. Mutations through the returned Document are immediately visible to
+    the etree proxies.
 
     Raises ``TypeError`` for objects that are not pyuppsala elements or trees.
     """
