@@ -122,6 +122,13 @@ print(validator.is_valid_str("<greeting>Hello!</greeting>"))  # True
 print(validator.is_valid_str("<greeting><bad/></greeting>"))  # False
 ```
 
+For an existing DOM, `validator.validate(doc)` avoids reparsing XML.
+`validator.validate_node(node)` validates a selected element independently:
+it reads document roots directly and copies subtrees in Rust, preserving
+inherited namespace bindings without mutating the source. Both return a list
+of validation errors and release the GIL. `etree.XMLSchema.validate()` and
+`assertValid()` use this native path automatically.
+
 ### Mutate the DOM
 
 ```python

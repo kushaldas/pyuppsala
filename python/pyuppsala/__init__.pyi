@@ -596,6 +596,9 @@ class XsdValidator:
     def validate(self, doc: Document) -> list[ValidationError]:
         """Validate an XML document. Returns a list of errors (empty = valid)."""
         ...
+    def validate_node(self, node: Node) -> list[ValidationError]:
+        """Validate an element independently, preserving inherited namespaces."""
+        ...
     def validate_str(self, xml: str) -> list[ValidationError]:
         """Validate an XML string. Returns a list of errors (empty = valid)."""
         ...

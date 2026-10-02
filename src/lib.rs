@@ -4713,6 +4713,63 @@ impl XsdValidator {
             .collect())
     }
 
+    /// Validate one element as a standalone document without an XML round trip.
+    ///
+    /// Whole-document roots are read directly. Subtrees are imported into a
+    /// temporary native document so identity constraints cannot see siblings.
+    /// Inherited namespaces (including prefixes used only in QName values) are
+    /// copied with nearest-ancestor precedence. The source is never mutated.
+    fn validate_node(&self, py: Python<'_>, node: &Node) -> PyResult<Vec<ValidationErrorPy>> {
+        let shared = Arc::clone(&node.doc);
+        let id = node.id;
+        let validator = &self.inner;
+        let errors = py
+            .detach(|| {
+                let guard = shared.lock().map_err(|e| e.to_string())?;
+                let source = guard.doc();
+                if source.element(id).is_none() {
+                    return Err("validate_node requires an element node".to_string());
+                }
+                if source.document_element() == Some(id) {
+                    return Ok(validator.validate(source));
+                }
+                let mut document = UDocument::new();
+                let root = document
+                    .import_subtree(source, id)
+                    .ok_or_else(|| "cannot import validation subtree".to_string())?;
+                let mut declarations = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                let mut current = Some(id);
+                while let Some(ancestor) = current {
+                    if let Some(element) = source.element(ancestor) {
+                        for (prefix, uri) in &element.namespace_declarations {
+                            if seen.insert(prefix.to_string()) {
+                                declarations.push((
+                                    std::borrow::Cow::Owned(prefix.to_string()),
+                                    std::borrow::Cow::Owned(uri.to_string()),
+                                ));
+                            }
+                        }
+                    }
+                    current = source.parent(ancestor);
+                }
+                if let Some(element) = document.element_mut(root) {
+                    element.namespace_declarations = declarations;
+                }
+                document.append_child(document.root(), root);
+                Ok(validator.validate(&document))
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(errors
+            .into_iter()
+            .map(|e| ValidationErrorPy {
+                message: e.message,
+                line: e.line,
+                column: e.column,
+            })
+            .collect())
+    }
+
     /// Validate an XML string against this schema. Convenience method.
     ///
     /// Returns a list of ValidationError objects. An empty list means valid.

@@ -2521,11 +2521,9 @@ class XMLSchema:
     def validate(self, tree):
         """Return True if ``tree`` is valid; record failures in ``error_log``."""
         root = tree.getroot() if isinstance(tree, _ElementTree) else tree
-        # Serialize via tostring (not raw node.to_xml) so a validated sub-element
-        # keeps the namespace declarations it inherits from ancestors; otherwise
-        # the standalone fragment would fail to reparse for validation.
-        xml = tostring(root, encoding="unicode")
-        self.error_log = self._validator.validate_str(xml)
+        # Native validation preserves subtree isolation and inherited namespaces
+        # without serializing and reparsing every element.
+        self.error_log = self._validator.validate_node(root._node)
         return len(self.error_log) == 0
 
     def assertValid(self, tree):
