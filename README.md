@@ -123,11 +123,15 @@ print(validator.is_valid_str("<greeting><bad/></greeting>"))  # False
 ```
 
 For an existing DOM, `validator.validate(doc)` avoids reparsing XML.
-`validator.validate_node(node)` validates a selected element independently:
-it reads document roots directly and copies subtrees in Rust, preserving
-inherited namespace bindings without mutating the source. Both return a list
-of validation errors and release the GIL. `etree.XMLSchema.validate()` and
-`assertValid()` use this native path automatically.
+The experimental `validator.experimental_validate_node(node)` validates a
+selected element independently: it reads document roots directly and copies
+subtrees in Rust, preserving inherited namespace bindings without mutating
+the source. It returns validation errors and releases the GIL.
+
+The etree equivalents are `schema.experimental_validate(tree)` and
+`schema.experimental_assertValid(tree)`. These APIs are opt-in and may change.
+The established `validate()`, `assertValid()` and callable schema APIs retain
+their serialization-based validation path.
 
 ### Mutate the DOM
 

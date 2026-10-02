@@ -4713,13 +4713,18 @@ impl XsdValidator {
             .collect())
     }
 
-    /// Validate one element as a standalone document without an XML round trip.
+    /// Experimental: validate one element without an XML round trip.
+    /// This opt-in API may change.
     ///
     /// Whole-document roots are read directly. Subtrees are imported into a
     /// temporary native document so identity constraints cannot see siblings.
     /// Inherited namespaces (including prefixes used only in QName values) are
     /// copied with nearest-ancestor precedence. The source is never mutated.
-    fn validate_node(&self, py: Python<'_>, node: &Node) -> PyResult<Vec<ValidationErrorPy>> {
+    fn experimental_validate_node(
+        &self,
+        py: Python<'_>,
+        node: &Node,
+    ) -> PyResult<Vec<ValidationErrorPy>> {
         let shared = Arc::clone(&node.doc);
         let id = node.id;
         let validator = &self.inner;
@@ -4728,7 +4733,7 @@ impl XsdValidator {
                 let guard = shared.lock().map_err(|e| e.to_string())?;
                 let source = guard.doc();
                 if source.element(id).is_none() {
-                    return Err("validate_node requires an element node".to_string());
+                    return Err("experimental_validate_node requires an element node".to_string());
                 }
                 if source.document_element() == Some(id) {
                     return Ok(validator.validate(source));

@@ -27,9 +27,9 @@ def test_native_validation_matches_serialized(xml, tag, valid):
     before = E.tostring(root)
     parent = node.getparent()
     reference = schema._validator.validate_str(E.tostring(node, encoding='unicode'))
-    assert schema.validate(node) is valid
+    assert schema.experimental_validate(node) is valid
     assert [e.message for e in schema.error_log] == [e.message for e in reference]
-    assert schema.validate(E.ElementTree(node)) is valid
+    assert schema.experimental_validate(E.ElementTree(node)) is valid
     assert E.tostring(root) == before
     assert node.getparent() is parent
 
@@ -38,15 +38,15 @@ def test_native_validation_observes_mutation_and_detached_elements():
     schema = E.XMLSchema(E.fromstring(SCHEMA))
     root = E.fromstring('<outer><number>42</number></outer>')
     node = root[0]
-    assert schema.validate(node)
+    assert schema.experimental_validate(node)
     root.remove(node)
     node.text = 'bad'
-    assert not schema.validate(node)
+    assert not schema.experimental_validate(node)
     with pytest.raises(E.DocumentInvalid) as error:
-        schema.assertValid(node)
+        schema.experimental_assertValid(node)
     assert error.value.error_log
     node.text = '7'
-    assert schema.validate(node)
+    assert schema.experimental_validate(node)
     assert schema.error_log == []
 
 
@@ -55,14 +55,14 @@ def test_native_validation_releases_gil_with_shared_document():
     doc = pyuppsala.parse('<outer><number>42</number><number>bad</number></outer>')
     nodes = doc.get_elements_by_tag_name('number')
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda i: not validator.validate_node(nodes[i % 2]), range(40)))
+        results = list(pool.map(lambda i: not validator.experimental_validate_node(nodes[i % 2]), range(40)))
     assert results == [i % 2 == 0 for i in range(40)]
 
 
 def test_native_validation_rejects_non_element():
     validator = pyuppsala.XsdValidator(SCHEMA)
     with pytest.raises(RuntimeError, match='element node'):
-        validator.validate_node(pyuppsala.parse('<number>1</number>').root)
+        validator.experimental_validate_node(pyuppsala.parse('<number>1</number>').root)
 
 
 def test_identity_constraints_are_scoped_to_the_validated_subtree():
@@ -76,19 +76,37 @@ def test_identity_constraints_are_scoped_to_the_validated_subtree():
       </xs:element></xs:schema>'''))
     outer = E.fromstring('<outer><group><item key="a"/></group>'
                          '<group><item key="a"/><item key="a"/></group></outer>')
-    assert schema.validate(outer[0])
-    assert not schema.validate(outer[1])
-    assert schema.validate(outer[0])
+    assert schema.experimental_validate(outer[0])
+    assert not schema.experimental_validate(outer[1])
+    assert schema.experimental_validate(outer[0])
     assert schema.error_log == []
 
 
 def test_document_root_validation_observes_mutation():
     schema = E.XMLSchema(E.fromstring(SCHEMA))
     node = E.fromstring('<number>42</number>')
-    assert schema.validate(node)
+    assert schema.experimental_validate(node)
     node.text = 'bad'
-    assert not schema.validate(node)
+    assert not schema.experimental_validate(node)
     assert schema.error_log
     node.text = '7'
-    assert schema.validate(node)
+    assert schema.experimental_validate(node)
     assert schema.error_log == []
+
+
+
+def test_standard_validation_does_not_use_experimental_api():
+    schema = E.XMLSchema(E.fromstring(SCHEMA))
+    calls = []
+
+    class StableValidator:
+        def validate_str(self, xml):
+            calls.append(xml)
+            return []
+
+    schema._validator = StableValidator()
+    node = E.fromstring('<number>42</number>')
+    assert schema.validate(node)
+    schema.assertValid(node)
+    assert schema(node)
+    assert calls == ['<number>42</number>'] * 3

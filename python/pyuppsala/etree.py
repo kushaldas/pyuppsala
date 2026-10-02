@@ -2521,10 +2521,27 @@ class XMLSchema:
     def validate(self, tree):
         """Return True if ``tree`` is valid; record failures in ``error_log``."""
         root = tree.getroot() if isinstance(tree, _ElementTree) else tree
-        # Native validation preserves subtree isolation and inherited namespaces
-        # without serializing and reparsing every element.
-        self.error_log = self._validator.validate_node(root._node)
+        xml = tostring(root, encoding="unicode")
+        self.error_log = self._validator.validate_str(xml)
         return len(self.error_log) == 0
+
+    def experimental_validate(self, tree):
+        """Experimental native DOM validation; the API may change.
+
+        Preserves subtree isolation and inherited namespaces without serializing
+        and reparsing XML. Records failures in ``error_log`` like ``validate``.
+        """
+        root = tree.getroot() if isinstance(tree, _ElementTree) else tree
+        self.error_log = self._validator.experimental_validate_node(root._node)
+        return len(self.error_log) == 0
+
+    def experimental_assertValid(self, tree):
+        """Experimental native validation raising ``DocumentInvalid`` on failure."""
+        if not self.experimental_validate(tree):
+            messages = "; ".join(e.message for e in self.error_log)
+            exc = DocumentInvalid(messages or "Document does not validate")
+            exc.error_log = self.error_log
+            raise exc
 
     def assertValid(self, tree):
         """Raise :class:`DocumentInvalid` if ``tree`` does not validate.
