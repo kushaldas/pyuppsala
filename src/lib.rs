@@ -384,6 +384,38 @@ fn writer_attr_refs(attrs: &Option<Vec<(String, String)>>) -> PyResult<Vec<(&str
 // Shared document handle - allows multiple Python objects to reference one DOM
 // ---------------------------------------------------------------------------
 
+/// Find bare element names whose lexical default namespace changes validation.
+/// Attributes are deliberately excluded: default namespaces never qualify them.
+fn validation_default_names(doc: &UDocument<'_>, root: NodeId) -> Vec<(NodeId, String)> {
+    let mut changes = Vec::new();
+    let mut stack = vec![(root, None::<String>)];
+    while let Some((id, mut default_ns)) = stack.pop() {
+        let Some(element) = doc.element(id) else {
+            continue;
+        };
+        for (prefix, uri) in &element.namespace_declarations {
+            if prefix.is_empty() {
+                default_ns = if uri.is_empty() {
+                    None
+                } else {
+                    Some(uri.to_string())
+                };
+            }
+        }
+        if element.name.prefix.is_none() && element.name.namespace_uri.is_none() {
+            if let Some(uri) = &default_ns {
+                changes.push((id, uri.clone()));
+            }
+        }
+        stack.extend(
+            doc.children(id)
+                .into_iter()
+                .map(|child| (child, default_ns.clone())),
+        );
+    }
+    changes
+}
+
 fn release_detached_subtree_payload(doc: &mut UDocument<'_>, root: NodeId) {
     let children = doc.children(root);
     for child in children {
@@ -4701,6 +4733,77 @@ impl XsdValidator {
             .detach(|| {
                 let inner_doc = shared.lock().map_err(|e| e.to_string())?;
                 Ok::<_, String>(validator.validate(inner_doc.doc()))
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(errors
+            .into_iter()
+            .map(|e| ValidationErrorPy {
+                message: e.message,
+                line: e.line,
+                column: e.column,
+            })
+            .collect())
+    }
+
+    /// Experimental: validate one element without an XML round trip.
+    /// This opt-in API may change.
+    ///
+    /// Whole-document roots needing no namespace adjustment are read directly.
+    /// Other roots and subtrees are imported into a
+    /// temporary native document so identity constraints cannot see siblings.
+    /// Inherited namespaces (including prefixes used only in QName values) are
+    /// copied with nearest-ancestor precedence. The source is never mutated.
+    fn experimental_validate_node(
+        &self,
+        py: Python<'_>,
+        node: &Node,
+    ) -> PyResult<Vec<ValidationErrorPy>> {
+        let shared = Arc::clone(&node.doc);
+        let id = node.id;
+        let validator = &self.inner;
+        let errors = py
+            .detach(|| {
+                let guard = shared.lock().map_err(|e| e.to_string())?;
+                let source = guard.doc();
+                if source.element(id).is_none() {
+                    return Err("experimental_validate_node requires an element node".to_string());
+                }
+                if source.document_element() == Some(id)
+                    && validation_default_names(source, id).is_empty()
+                {
+                    return Ok(validator.validate(source));
+                }
+                let mut document = UDocument::new();
+                let root = document
+                    .import_subtree(source, id)
+                    .ok_or_else(|| "cannot import validation subtree".to_string())?;
+                let mut declarations = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                let mut current = Some(id);
+                while let Some(ancestor) = current {
+                    if let Some(element) = source.element(ancestor) {
+                        for (prefix, uri) in &element.namespace_declarations {
+                            if seen.insert(prefix.to_string()) {
+                                declarations.push((
+                                    std::borrow::Cow::Owned(prefix.to_string()),
+                                    std::borrow::Cow::Owned(uri.to_string()),
+                                ));
+                            }
+                        }
+                    }
+                    current = source.parent(ancestor);
+                }
+                if let Some(element) = document.element_mut(root) {
+                    element.namespace_declarations = declarations;
+                }
+                document.append_child(document.root(), root);
+                // Match etree serialization on a detached copy, including
+                // inherited defaults and explicit xmlns="" resets.
+                for (element_id, uri) in validation_default_names(&document, root) {
+                    let element = document.element_mut(element_id).unwrap();
+                    element.name = UQName::with_namespace(uri, element.name.local_name.to_string());
+                }
+                Ok(validator.validate(&document))
             })
             .map_err(PyRuntimeError::new_err)?;
         Ok(errors

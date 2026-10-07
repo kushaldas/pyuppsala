@@ -596,6 +596,9 @@ class XsdValidator:
     def validate(self, doc: Document) -> list[ValidationError]:
         """Validate an XML document. Returns a list of errors (empty = valid)."""
         ...
+    def experimental_validate_node(self, node: Node) -> list[ValidationError]:
+        """Experimental element validation; this opt-in API may change."""
+        ...
     def validate_str(self, xml: str) -> list[ValidationError]:
         """Validate an XML string. Returns a list of errors (empty = valid)."""
         ...
