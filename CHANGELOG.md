@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.11.1 [2026-10-07]
+
+### Added
+
+- Added invocation-local parameters to ``Xslt.transform()`` and
+  ``Xslt.transform_document()`` through ``parameters`` and
+  ``string_parameters`` mappings, with ``Xslt.strparam()`` for literal values.
+- Added keyword parameters to ``etree.XSLT`` calls, accepting XPath expression
+  strings, compiled ``XPath`` objects, and ``XSLT.strparam()`` literal values.
+  XPath result types, including node sets, are preserved. Parameter values
+  remain isolated across repeated and concurrent transformation calls.
+- Added parameter and pyFF stylesheet regression tests, with lxml installed
+  in CI and release wheel test environments for differential checks.
+
+### Changed
+
+- Updated Uppsala from 0.10.1 to 0.11.0 on crates.io.
+- ``etree.XSLT.strparam()`` now returns an opaque literal parameter token
+  instead of an XPath-quoted string. Pass the token directly to the transform;
+  pass ordinary strings only when XPath expression evaluation is intended.
+
+### Fixed
+
+- Support the implicit reserved ``xml`` namespace in XPath and XSLT match
+  patterns, including pyFF's ``tidy.xsl`` and ``eidas-cleanup.xsl`` cleanup of
+  ``xml:id`` and ``xml:base`` attributes. Caller namespace overrides cannot
+  rebind the reserved prefix.
+- Preserve literal publisher values containing quotes, markup characters,
+  and Unicode when supplied to pyFF's ``pubinfo.xsl`` stylesheet.
+
+
 ## 0.11.0 [2026-09-02]
 
 ### Added

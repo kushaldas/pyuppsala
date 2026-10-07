@@ -583,8 +583,9 @@ API reference
 Current pyFF stylesheet compatibility
 -------------------------------------
 
-The local Uppsala dependency supports external XSLT parameters and the implicit
-``xml`` namespace binding required by ``tidy.xsl`` and ``eidas-cleanup.xsl``.
+The Uppsala 0.11.0 dependency from crates.io supports external XSLT parameters
+and the implicit ``xml`` namespace binding required by ``tidy.xsl`` and
+``eidas-cleanup.xsl``.
 The pyFF ``atom``, ``kalmar2``, ``pp``, ``pubinfo``, ``regauth``, ``tidy``,
 ``eidas-cleanup``, and ``unsign`` stylesheets pass the representative differential
 checks. ``kalmar2`` output indentation may differ.
