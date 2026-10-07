@@ -1760,7 +1760,21 @@ Xslt
       unless you explicitly raise ``max_depth``. Set ``exslt=False`` when you do
       not need EXSLT compatibility.
 
-   .. method:: transform(source_xml: str) -> str
+   Both methods accept ``parameters`` (an ordered dictionary of XPath expression
+   strings or literal tokens returned by ``Xslt.strparam(text)``)
+   and ``string_parameters`` (a dictionary of literal strings). Supplying the
+   same name in both dictionaries raises ``ValueError``. Values apply only to
+   the current invocation; concurrent calls do not share parameter values.
+
+   Expressions use the source document root and stylesheet namespace bindings,
+   preserving XPath types, including source node sets. Expressions can refer to
+   literal arguments and earlier expression arguments, but not stylesheet globals.
+   Literal values (including ``string_parameters``) are bound before expressions. Names can be unprefixed,
+   prefixed using stylesheet bindings, or in ``{namespace}local`` form.
+   Unused expressions are still evaluated and can raise errors, but unused
+   values and arguments naming ``xsl:variable`` do not override declarations.
+
+   .. method:: transform(source_xml: str, *, parameters=None, string_parameters=None) -> str
 
       Apply the compiled stylesheet to a source XML string and return the
       serialized result.
@@ -1772,7 +1786,7 @@ Xslt
          sheet = Xslt(stylesheet_xml, exslt=False)
          result = sheet.transform("<root/>")
 
-   .. method:: transform_document(document: Document) -> str
+   .. method:: transform_document(document: Document, *, parameters=None, string_parameters=None) -> str
 
       Apply the compiled stylesheet directly to a parsed :class:`Document`
       and return the serialized result.

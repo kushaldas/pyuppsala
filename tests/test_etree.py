@@ -1379,6 +1379,26 @@ class TestStandalone:
             "<NetworkLink/><Folder><Placemark/></Folder></kml>" % uri
         )
 
+    def test_set_xmlns_rebinds_existing_default_namespace(self):
+        root = P.Element("root")
+        child = P.SubElement(root, "child")
+        nested = P.Element("nested", nsmap={None: "urn:nested"})
+        nested_child = P.SubElement(nested, "child")
+        root.append(nested)
+
+        root.set("xmlns", "urn:a")
+        root.set("xmlns", "urn:b")
+
+        assert root.tag == "{urn:b}root"
+        assert child.tag == "{urn:b}child"
+        # A descendant's own default declaration starts a separate scope.
+        assert nested.tag == "{urn:nested}nested"
+        assert nested_child.tag == "{urn:nested}child"
+        assert P.tostring(root, encoding="unicode") == (
+            '<root xmlns="urn:b"><child/><nested xmlns="urn:nested">'
+            "<child/></nested></root>"
+        )
+
     def test_default_namespace_propagation_respects_undeclaration(self):
         uri = "http://www.opengis.net/kml/2.2"
         root = P.Element("kml", nsmap={None: uri})
@@ -1398,6 +1418,12 @@ class TestStandalone:
         el.set("xmlns:foo", "urn:foo")
         out = P.tostring(el, encoding="unicode")
         assert out == '<a xmlns:foo="urn:foo"/>', out
+
+    def test_set_xmlns_rejects_empty_prefixed_name(self):
+        el = P.Element("a")
+        with pytest.raises(ValueError, match="prefix must not be empty"):
+            el.set("xmlns:", "urn:foo")
+        assert P.tostring(el, encoding="unicode") == "<a/>"
 
     def test_index_non_element_raises_valueerror(self):
         root = P.fromstring("<r><a/></r>")
@@ -1619,10 +1645,10 @@ class TestXSLT:
         with pytest.raises(P.XSLTParseError):
             P.XSLT(P.fromstring("<notxsl/>"))
 
-    def test_params_not_supported(self):
+    def test_undeclared_parameter_is_ignored(self):
+        """Supplying an undeclared parameter leaves the transformation unchanged."""
         t = P.XSLT(P.fromstring(TIDY_XSLT))
-        with pytest.raises(NotImplementedError):
-            t(P.fromstring(XSLT_DOC), some_param="x")
+        assert str(t(P.fromstring(XSLT_DOC), some_param="'x'")) == str(t(P.fromstring(XSLT_DOC)))
 
     def test_regexp_false_rejected(self):
         # EXSLT regexp is always on; an explicit request to disable it must not
