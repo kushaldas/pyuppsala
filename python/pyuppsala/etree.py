@@ -2537,6 +2537,17 @@ class _XSLTResultTree:
         return "<_XSLTResultTree>"
 
 
+class _XSLTQuotedString:
+    """Opaque literal parameter; its contents are never parsed as XPath."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        if not isinstance(value, str):
+            raise TypeError("XSLT.strparam requires a string")
+        self.value = value
+
+
 class XSLT:
     """A compiled XSLT 1.0 stylesheet, callable on an element or tree.
 
@@ -2545,8 +2556,8 @@ class XSLT:
     ``str()``/``bytes()`` on it for the serialized output or ``getroot()`` for
     the result element. EXSLT extension functions are enabled (matching lxml).
 
-    XSLT parameters (``transform(doc, name=value)``) are not yet supported and
-    raise :class:`NotImplementedError`.
+    Keyword parameters are XPath expressions. Use :meth:`strparam` to pass
+    literal text without XPath parsing. Parameters apply only to that call.
     """
 
     def __init__(self, xslt_input, *, extensions=None, regexp=True, access_control=None):
@@ -2577,11 +2588,17 @@ class XSLT:
         # silently returning an unprofiled result.
         if profile_run:
             raise NotImplementedError("XSLT profile_run is not supported")
-        if kwargs:
-            names = ", ".join(sorted(kwargs))
-            raise NotImplementedError(
-                "XSLT parameters are not yet supported: %s" % names
-            )
+        parameters = {}
+        for name, value in kwargs.items():
+            if isinstance(value, _XSLTQuotedString):
+                parameters[name] = _u.Xslt.strparam(value.value)
+            elif isinstance(value, str):
+                parameters[name] = value
+            elif isinstance(value, XPath):
+                parameters[name] = value.path
+            else:
+                raise TypeError("XSLT parameters require XPath strings or XSLT.strparam values")
+        options = {"parameters": parameters}
         try:
             native_doc = self._whole_document_source(_input)
             if native_doc is not None:
@@ -2590,10 +2607,10 @@ class XSLT:
                 # of that string -- for a large document that is one full
                 # serialization plus one full parse (and its transient arena)
                 # saved per transform.
-                result = self._native.transform_document(native_doc)
+                result = self._native.transform_document(native_doc, **options)
             else:
                 source_xml = tostring(_input, encoding="unicode")
-                result = self._native.transform(source_xml)
+                result = self._native.transform(source_xml, **options)
         except _XSLT_NATIVE_ERRORS as e:
             self.error_log = [_XSLTLogEntry(str(e))]
             raise XSLTApplyError(str(e)) from e
@@ -2629,10 +2646,7 @@ class XSLT:
     @staticmethod
     def strparam(value):
         """Wrap a string as an XSLT string parameter (lxml-compatible helper)."""
-        # lxml returns an opaque token quoting the value for use as a param.
-        # Parameters are not yet wired through to the engine, but provide the
-        # helper so call sites that build params do not break at import time.
-        return "'%s'" % str(value).replace("'", "&apos;")
+        return _XSLTQuotedString(value)
 
 
 # ---------------------------------------------------------------------------

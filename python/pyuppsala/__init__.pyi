@@ -694,6 +694,8 @@ class XsdRegex:
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
 
+class _XsltStringParam: ...
+
 class Xslt:
     """A compiled XSLT 1.0 stylesheet.
 
@@ -712,7 +714,11 @@ class Xslt:
         (see ``DEFAULT_MAX_XSLT_DEPTH``).
         """
         ...
-    def transform_document(self, document: Document) -> str:
+    @staticmethod
+    def strparam(value: str) -> _XsltStringParam:
+        """Wrap literal text for an ordered parameter dictionary."""
+        ...
+    def transform_document(self, document: Document, *, parameters: Optional[dict[str, Union[str, _XsltStringParam]]] = None, string_parameters: Optional[dict[str, str]] = None) -> str:
         """Apply the stylesheet directly to a parsed ``Document``.
 
         Never serializes or re-parses the source: the stylesheet runs over the
@@ -720,7 +726,7 @@ class Xslt:
         effect (as by ``Document.prepare_xpath()``) but not otherwise mutated.
         """
         ...
-    def transform(self, source_xml: str) -> str:
+    def transform(self, source_xml: str, *, parameters: Optional[dict[str, Union[str, _XsltStringParam]]] = None, string_parameters: Optional[dict[str, str]] = None) -> str:
         """Apply the stylesheet to a source XML string, returning the result."""
         ...
 
