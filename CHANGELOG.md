@@ -35,8 +35,9 @@
   rebind the reserved prefix.
 - Preserve literal publisher values containing quotes, markup characters,
   and Unicode when supplied to pyFF's ``pubinfo.xsl`` stylesheet.
-- Preserve default namespace declarations when constructing a bare-tag element
-  with ``nsmap={None: uri}``, and serialize ``element.set("xmlns", uri)`` and
+- Preserve default namespace declarations when constructing bare-tag trees with
+  ``nsmap={None: uri}``, including existing and subsequently attached
+  descendants. Serialize ``element.set("xmlns", uri)`` and
   ``element.set("xmlns:<prefix>", uri)`` as namespace declarations rather than
   sanitized ``xmlns_`` attributes.
 - Validate KML content models containing an optional ``xs:choice`` followed by

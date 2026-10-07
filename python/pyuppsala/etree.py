@@ -609,6 +609,7 @@ def _attach(holder, parent_node, node, tail, ref=None):
         holder.doc.append_child(parent_node, node)
     else:
         holder.doc.insert_before(parent_node, node, ref)
+    _apply_inherited_default_namespace(parent_node, node)
     _attach_tail(holder, parent_node, tail, node)
 
 
@@ -620,11 +621,10 @@ def _attach(holder, parent_node, node, tail, ref=None):
 def _build_element(holder, tag, nsmap):
     nsmap = _validate_nsmap(nsmap)
     ns, local = _split_key(tag)
-    # lxml parity: a bare tag (no Clark namespace) combined with a default
-    # declaration in nsmap places the element *in* that default namespace.
-    # Otherwise the element would be in no namespace while carrying an
-    # xmlns="uri" declaration, which the serializer resolves to xmlns="" and
-    # the URI would be lost.
+    # Compatibility policy: a bare tag combined with a non-empty default
+    # declaration is placed in that namespace. This keeps the in-memory tree
+    # consistent with the serialized XML instead of allowing its namespace to
+    # change only when the output is parsed again.
     if ns is None and nsmap and nsmap.get(None):
         ns = nsmap[None]
     prefix = _prefix_for_ns(ns, nsmap) if ns else None
@@ -633,6 +633,36 @@ def _build_element(holder, tag, nsmap):
         for pfx, uri in nsmap.items():
             holder.doc.set_namespace_declaration(node, pfx, uri)
     return node
+
+
+def _qualify_default_namespace_subtree(node, inherited_default=None):
+    """Apply effective default namespaces to bare names in ``node``'s subtree.
+
+    An element's own default declaration overrides the inherited value,
+    including ``xmlns=""`` which stops qualification below that point. Existing
+    explicitly namespaced elements are left unchanged. The iterative walk also
+    handles programmatically constructed trees deeper than Python's recursion
+    limit.
+    """
+    stack = [(node, inherited_default)]
+    while stack:
+        current, default_ns = stack.pop()
+        if current.kind != "element":
+            continue
+        for prefix, uri in current.namespace_declarations:
+            if prefix is None:
+                default_ns = uri or None
+        qname = current.tag
+        if default_ns and qname.namespace_uri is None:
+            current.set_qname(qname.local_name, default_ns, None)
+        children = _content_children(current)
+        stack.extend((child, default_ns) for child in reversed(children))
+
+
+def _apply_inherited_default_namespace(parent_node, node):
+    """Qualify a newly attached subtree under ``parent_node``'s default ns."""
+    inherited_default = dict(parent_node.nsmap()).get(None) or None
+    _qualify_default_namespace_subtree(node, inherited_default)
 
 
 def _finalize_element_ns(holder, node):
@@ -691,7 +721,7 @@ def SubElement(_parent, _tag, attrib=None, nsmap=None, **extra):
     """Create a child element of ``_parent`` in the same document."""
     holder = _parent._holder
     node = _build_element(holder, _tag, nsmap)
-    holder.doc.append_child(_parent._node, node)
+    _attach(holder, _parent._node, node, [])
     _finalize_element_ns(holder, node)
     el = holder.proxy(node)
     _apply_attribs(el, attrib, extra)
@@ -887,20 +917,16 @@ class _Element(_u._ElementBase):
         one if needed) so the attribute serializes correctly.
 
         ``set("xmlns", uri)`` and ``set("xmlns:<prefix>", uri)`` are treated as
-        namespace *declarations* (matching ``lxml``), recorded on the element so
-        they serialize as real ``xmlns`` output rather than a sanitized
-        ``xmlns_`` attribute. Use ``nsmap`` at construction time for the common
-        case; this is the in-place equivalent.
+        namespace declarations, recorded on the element so they serialize as
+        real ``xmlns`` output rather than a sanitized ``xmlns_`` attribute. A
+        non-empty default declaration also qualifies bare names in the affected
+        subtree so its in-memory names agree with its serialized XML.
         """
+        _check_xml_string(value)
         if isinstance(key, str):
             if key == "xmlns":
                 self._holder.doc.set_namespace_declaration(self._node, None, value)
-                # Place a no-namespace element into the newly declared default
-                # namespace so the URI is not dropped as xmlns="" on output
-                # (matches Element(tag, nsmap={None: uri})).
-                q = self._node.tag
-                if value and q.namespace_uri is None:
-                    self._node.set_qname(q.local_name, value, None)
+                _qualify_default_namespace_subtree(self._node)
                 return
             if key.startswith("xmlns:"):
                 self._holder.doc.set_namespace_declaration(
@@ -908,7 +934,6 @@ class _Element(_u._ElementBase):
                 )
                 return
         ns, local = _split_key(key)
-        _check_xml_string(value)
         prefix = None
         if ns:
             prefix = self._ensure_ns_prefix(ns)
@@ -965,6 +990,7 @@ class _Element(_u._ElementBase):
         # Insert the new child in place, then remove the old one (with its tail).
         node, tail = self._adopt(element)
         self._holder.doc.insert_before(self._node, node, old)
+        _apply_inherited_default_namespace(self._node, node)
         _extract(self._holder, old)
         _attach_tail(self._holder, self._node, tail, node)
 
@@ -1172,6 +1198,7 @@ class _Element(_u._ElementBase):
             raise ValueError("Element is not a child of this node.")
         node, tail = self._adopt(new_element)
         self._holder.doc.insert_before(self._node, node, old_element._node)
+        _apply_inherited_default_namespace(self._node, node)
         _extract(self._holder, old_element._node)
         _attach_tail(self._holder, self._node, tail, node)
 
@@ -1182,6 +1209,7 @@ class _Element(_u._ElementBase):
             raise TypeError("cannot add sibling to a root element")
         node, tail = self._adopt(element)
         self._holder.doc.insert_after(parent, node, self._node)
+        _apply_inherited_default_namespace(parent, node)
         _attach_tail(self._holder, parent, tail, node)
 
     def addprevious(self, element):
@@ -1191,6 +1219,7 @@ class _Element(_u._ElementBase):
             raise TypeError("cannot add sibling to a root element")
         node, tail = self._adopt(element)
         self._holder.doc.insert_before(parent, node, self._node)
+        _apply_inherited_default_namespace(parent, node)
         _attach_tail(self._holder, parent, tail, node)
 
     def makeelement(self, _tag, attrib=None, nsmap=None, **extra):
