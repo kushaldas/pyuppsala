@@ -1502,10 +1502,10 @@ class TestXSLT:
         with pytest.raises(P.XSLTParseError):
             P.XSLT(P.fromstring("<notxsl/>"))
 
-    def test_params_not_supported(self):
+    def test_undeclared_parameter_is_ignored(self):
+        """Supplying an undeclared parameter leaves the transformation unchanged."""
         t = P.XSLT(P.fromstring(TIDY_XSLT))
-        with pytest.raises(NotImplementedError):
-            t(P.fromstring(XSLT_DOC), some_param="x")
+        assert str(t(P.fromstring(XSLT_DOC), some_param="'x'")) == str(t(P.fromstring(XSLT_DOC)))
 
     def test_regexp_false_rejected(self):
         # EXSLT regexp is always on; an explicit request to disable it must not

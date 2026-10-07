@@ -4978,8 +4978,54 @@ struct Xslt {
     inner: uppsala::xslt::Stylesheet,
 }
 
+/// Opaque literal parameter returned by `Xslt.strparam`.
+#[pyclass(frozen, name = "_XsltStringParam")]
+struct XsltStringParam {
+    value: String,
+}
+
+/// Own all values before detaching, preserving dictionary insertion order so
+/// expressions can reference previously supplied parameters.
+fn xslt_parameters(
+    parameters: Option<&Bound<'_, PyDict>>,
+    string_parameters: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Vec<(String, uppsala::xslt::ParameterValue)>> {
+    use uppsala::xslt::ParameterValue;
+    let mut result = Vec::new();
+    if let Some(strings) = string_parameters {
+        for (name, value) in strings.iter() {
+            let name: String = name.extract()?;
+            if let Some(parameters) = parameters {
+                if parameters.contains(&name)? {
+                    return Err(PyValueError::new_err(
+                        "parameter supplied as both expression and string",
+                    ));
+                }
+            }
+            result.push((name, ParameterValue::String(value.extract()?)));
+        }
+    }
+    if let Some(parameters) = parameters {
+        for (name, value) in parameters.iter() {
+            let value = if let Ok(literal) = value.extract::<PyRef<'_, XsltStringParam>>() {
+                ParameterValue::String(literal.value.clone())
+            } else {
+                ParameterValue::Expression(value.extract()?)
+            };
+            result.push((name.extract()?, value));
+        }
+    }
+    Ok(result)
+}
+
 #[pymethods]
 impl Xslt {
+    /// Wrap literal text for use in an ordered `parameters` dictionary.
+    #[staticmethod]
+    fn strparam(value: String) -> XsltStringParam {
+        XsltStringParam { value }
+    }
+
     /// Compile an XSLT 1.0 stylesheet from its XML source text.
     ///
     /// ``exslt`` enables the opt-in EXSLT extension-function library
@@ -5011,7 +5057,17 @@ impl Xslt {
 
     /// Apply the stylesheet to a source XML string, returning the serialized
     /// result. The source is parsed and prepared for XPath internally.
-    fn transform(&self, py: Python<'_>, source_xml: &str) -> PyResult<String> {
+    /// `parameters` supplies XPath expressions; `string_parameters` supplies
+    /// literal text. Both mappings are local to this invocation.
+    #[pyo3(signature = (source_xml, *, parameters=None, string_parameters=None))]
+    fn transform(
+        &self,
+        py: Python<'_>,
+        source_xml: &str,
+        parameters: Option<&Bound<'_, PyDict>>,
+        string_parameters: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<String> {
+        let params = xslt_parameters(parameters, string_parameters)?;
         // Parse + transform are pure Rust over owned data; release the GIL so
         // concurrent transforms (e.g. pyFF's per-entity tidy.xsl) parallelize.
         let xml = source_xml.to_string();
@@ -5019,7 +5075,7 @@ impl Xslt {
         py.detach(|| {
             let mut source = UParser::new().parse(&xml)?;
             source.prepare_xpath();
-            sheet.transform(&source)
+            sheet.transform_with_params(&source, &params)
         })
         .map_err(xml_error_to_pyerr)
     }
@@ -5032,8 +5088,17 @@ impl Xslt {
     /// (e.g. a 100 MB SAML aggregate) that removes one full serialization and
     /// one full parse per transform, and the corresponding transient arena.
     /// The document is prepared for XPath as a side effect (same as calling
-    /// `Document.prepare_xpath()`); it is not otherwise mutated.
-    fn transform_document(&self, py: Python<'_>, document: &Document) -> PyResult<String> {
+    /// `Document.prepare_xpath()`); it is not otherwise mutated. Parameter
+    /// mappings have the same invocation-local semantics as `transform`.
+    #[pyo3(signature = (document, *, parameters=None, string_parameters=None))]
+    fn transform_document(
+        &self,
+        py: Python<'_>,
+        document: &Document,
+        parameters: Option<&Bound<'_, PyDict>>,
+        string_parameters: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<String> {
+        let params = xslt_parameters(parameters, string_parameters)?;
         let shared = Arc::clone(&document.inner);
         let sheet = &self.inner;
         // The transform is pure Rust over the shared DOM; release the GIL and
@@ -5042,7 +5107,7 @@ impl Xslt {
         py.detach(|| {
             let mut guard = shared.lock().map_err(|e| e.to_string())?;
             guard.with_doc_mut(|_input, doc| doc.prepare_xpath());
-            Ok::<_, String>(sheet.transform(guard.doc()))
+            Ok::<_, String>(sheet.transform_with_params(guard.doc(), &params))
         })
         .map_err(PyRuntimeError::new_err)?
         .map_err(xml_error_to_pyerr)
@@ -5995,6 +6060,7 @@ fn _pyuppsala(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<XmlWriter>()?;
     m.add_class::<XsdRegex>()?;
     m.add_class::<Xslt>()?;
+    m.add_class::<XsltStringParam>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(parse, m)?)?;

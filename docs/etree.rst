@@ -453,9 +453,19 @@ ElementTree, schema, and transform helpers
 ``DocumentInvalid`` and attaches the same per-call log to the exception.
 
 ``XSLT`` exposes an ``error_log`` list for transform failures and a
-``strparam(value)`` compatibility helper. Parameters are not implemented yet,
-so passing keyword parameters to a transform raises ``NotImplementedError``,
-but ``strparam`` is available for code paths that prepare values conditionally.
+``strparam(value)`` literal-string helper. Keyword values are XPath expression
+strings (or ``XPath`` objects); use ``XSLT.strparam(text)`` for literal text,
+including quotes, ampersands, and Unicode. Values apply only to the current call.
+Expressions retain their XPath type and run against the source document root
+with stylesheet namespace bindings. Literal parameters are bound first; expressions
+may reference them and earlier expression arguments, but not stylesheet globals. Parameter names may be unprefixed, prefixed
+using those bindings, or in ``{namespace}local`` form. Undeclared parameters are
+ignored; external arguments cannot override ``xsl:variable`` declarations.
+
+For example::
+
+    transform(document, publisher=ET.XSLT.strparam("https://example.org/publisher"))
+    transform(document, limit="5", enabled="false()")
 
 When the transform input is a document's root element (or its tree), ``XSLT``
 runs the stylesheet directly over the live DOM via
@@ -569,3 +579,17 @@ API reference
    :members:
 .. autoclass:: XSLT
    :members:
+
+Current pyFF stylesheet compatibility
+-------------------------------------
+
+The Uppsala 0.11.0 dependency from crates.io supports external XSLT parameters
+and the implicit ``xml`` namespace binding required by ``tidy.xsl`` and
+``eidas-cleanup.xsl``.
+The pyFF ``atom``, ``kalmar2``, ``pp``, ``pubinfo``, ``regauth``, ``tidy``,
+``eidas-cleanup``, and ``unsign`` stylesheets pass the representative differential
+checks. ``kalmar2`` output indentation may differ.
+
+``atom2html`` and ``entity2html`` still require HTML output support;
+``discojson`` and ``entity2html`` require variable-filter XPath expressions.
+These stylesheets are not yet supported.

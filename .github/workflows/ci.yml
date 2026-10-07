@@ -34,7 +34,7 @@ jobs:
         curl -LsSf https://astral.sh/uv/install.sh | sh
         uv venv
         source .venv/bin/activate
-        uv pip install pytest
+        uv pip install pytest "lxml>=5.0"
         uv pip install ./dist/pyuppsala-*.whl
 
     - name: Run tests
@@ -73,7 +73,7 @@ jobs:
         curl -LsSf https://astral.sh/uv/install.sh | sh
         uv venv
         source .venv/bin/activate
-        uv pip install pytest
+        uv pip install pytest "lxml>=5.0"
         uv pip install ./dist/pyuppsala-*.whl
 
     - name: Run tests
@@ -111,7 +111,7 @@ jobs:
         curl -LsSf https://astral.sh/uv/install.sh | sh
         uv venv --python python3.14
         source .venv/bin/activate
-        uv pip install --upgrade "maturin>=1,<2" pytest
+        uv pip install --upgrade "maturin>=1,<2" pytest "lxml>=5.0"
 
     - name: Build wheel
       run: |
@@ -157,7 +157,7 @@ jobs:
 
     - name: Build environment
       run: |
-        python.exe -m pip install --upgrade pip "maturin>=1,<2" pytest
+        python.exe -m pip install --upgrade pip "maturin>=1,<2" pytest "lxml>=5.0"
 
     - name: Build wheel
       run: |
@@ -168,7 +168,7 @@ jobs:
       run: |
         python -m venv venv
         .\venv\Scripts\Activate.ps1
-        pip install pytest
+        pip install pytest "lxml>=5.0"
         pip install pyuppsala --no-index --find-links target\wheels
         pytest tests/ -vvv
 
@@ -205,7 +205,7 @@ jobs:
 
     - name: Build environment
       run: |
-        python.exe -m pip install --upgrade pip "maturin>=1,<2" pytest
+        python.exe -m pip install --upgrade pip "maturin>=1,<2" pytest "lxml>=5.0"
 
     - name: Build wheel
       run: |
@@ -216,7 +216,7 @@ jobs:
       run: |
         python -m venv venv
         .\venv\Scripts\Activate.ps1
-        pip install pytest
+        pip install pytest "lxml>=5.0"
         pip install pyuppsala --no-index --find-links target\wheels
         pytest tests/ -vvv
 
