@@ -1503,6 +1503,7 @@ class TestXSLT:
             P.XSLT(P.fromstring("<notxsl/>"))
 
     def test_undeclared_parameter_is_ignored(self):
+        """Supplying an undeclared parameter leaves the transformation unchanged."""
         t = P.XSLT(P.fromstring(TIDY_XSLT))
         assert str(t(P.fromstring(XSLT_DOC), some_param="'x'")) == str(t(P.fromstring(XSLT_DOC)))
 

@@ -18,13 +18,16 @@ SOURCE = '<root><item id="one"/><item id="two"/></root>'
 
 
 def transform(style=STYLE):
+    """Compile a fresh stylesheet so each test starts without call state."""
     return P.XSLT(P.fromstring(style))
 
 
 @pytest.mark.parametrize('value', ['', 'O\'Brien "quoted" & <xml> å漢字', "&apos;", 'https://example.org/?a=1&b=2'])
 @pytest.mark.parametrize('fallback', [False, True])
 def test_literals_and_paths(value, fallback):
+    """Preserve literal text on both input paths and restore defaults on reuse."""
     t = transform()
+    # A document-level comment forces the facade to serialize its input.
     source = P.fromstring(('<!--force serialized path-->' if fallback else '') + SOURCE)
     result = t(source, value=P.XSLT.strparam(value)).getroot()
     assert result.get('value') == value
@@ -34,6 +37,7 @@ def test_literals_and_paths(value, fallback):
 
 @pytest.mark.parametrize('expr', ["'quoted'", '5', 'false()', 'true()', 'count(/root/item)', 'string(/root/item/@id)', 'position()', 'last()'])
 def test_expression_parity(expr):
+    """Match lxml expression values and XPath truthiness for external parameters."""
     L = pytest.importorskip('lxml.etree')
     ours = transform()(P.fromstring(SOURCE), value=expr).getroot()
     theirs = L.XSLT(L.fromstring(STYLE.encode()))(L.fromstring(SOURCE.encode()), value=expr).getroot()
@@ -42,6 +46,7 @@ def test_expression_parity(expr):
 
 
 def test_nodeset_stays_nodeset():
+    """Keep node-set parameters copyable as nodes on native and serialized paths."""
     style = STYLE.replace('<xsl:if test="$value"><yes/></xsl:if>', '<xsl:copy-of select="$value"/>')
     t = transform(style)
     for xml in [SOURCE, '<!--fallback-->' + SOURCE]:
@@ -51,10 +56,12 @@ def test_nodeset_stays_nodeset():
 
 @pytest.mark.parametrize('name', ['p:qualified', 'q:qualified', '{urn:param}qualified'])
 def test_expanded_names(name):
+    """Resolve prefix aliases and expanded names to the same declared parameter."""
     assert transform()(P.fromstring(SOURCE), **{name: P.XSLT.strparam('yes')}).getroot().get('qualified') == 'yes'
 
 
 def test_errors_and_reuse():
+    """Reject invalid arguments and clear failed-call state before stylesheet reuse."""
     t = transform()
     source = P.fromstring(SOURCE)
     for params in [{'value': '('}, {'value': '$absent'}, {'bad:name': "'x'"}]:
@@ -71,6 +78,7 @@ def test_errors_and_reuse():
 
 
 def test_variables_cannot_be_overridden_and_local_shadowing():
+    """Protect global variables from overrides and let local parameters shadow globals."""
     t = transform()
     assert t(P.fromstring(SOURCE), derived=P.XSLT.strparam('wrong')).getroot().get('derived') == 'default!'
     style = STYLE.replace('<out value=', '<xsl:param name="value" select="\'local\'"/><out value=')
@@ -78,8 +86,10 @@ def test_variables_cannot_be_overridden_and_local_shadowing():
 
 
 def test_concurrent_calls_and_compiled_xpath():
+    """Isolate concurrent call values and accept compiled XPath parameter expressions."""
     t = transform()
     def run(i):
+        """Return the value observed by one call sharing the compiled stylesheet."""
         return t(P.fromstring(SOURCE), value=P.XSLT.strparam(str(i))).getroot().get('value')
     with ThreadPoolExecutor(max_workers=4) as pool:
         assert list(pool.map(run, range(32))) == [str(i) for i in range(32)]
@@ -87,6 +97,7 @@ def test_concurrent_calls_and_compiled_xpath():
 
 
 def test_native_paths_and_conflicting_parameters():
+    """Match native input APIs and reject names supplied through both parameter maps."""
     t = Xslt(STYLE)
     doc = Document(SOURCE)
     for parameters in [{'parameters': {'value': 'false()'}}, {'string_parameters': {'value': 'literal'}}]:
@@ -96,6 +107,7 @@ def test_native_paths_and_conflicting_parameters():
 
 
 def test_global_dependency_cycle_is_error():
+    """Report cyclic globals unless an external parameter breaks the dependency cycle."""
     style = STYLE.replace("select=\"'default'\"", 'select="$derived"')
     with pytest.raises(P.XSLTApplyError, match='circular'):
         transform(style)(P.fromstring(SOURCE))
@@ -103,6 +115,7 @@ def test_global_dependency_cycle_is_error():
 
 
 def test_pyff_publication_stylesheet():
+    """Preserve a literal publisher and emit a zoned timestamp with either Extensions layout."""
     from datetime import datetime
     style = (Path(__file__).parent / 'fixtures' / 'pubinfo.xsl').read_bytes()
     t = P.XSLT(P.fromstring(style))
@@ -116,6 +129,7 @@ def test_pyff_publication_stylesheet():
 
 
 def test_parameters_follow_keyword_order_like_lxml():
+    """Match lxml by binding literals first and evaluating expressions in keyword order."""
     L = pytest.importorskip('lxml.etree')
     for E in [P, L]:
         t = E.XSLT(E.fromstring(STYLE.encode()))
@@ -130,6 +144,7 @@ def test_parameters_follow_keyword_order_like_lxml():
 
 
 def test_native_ordered_literals_and_expressions():
+    """Expose native literal tokens to expressions consistently through both input APIs."""
     t = Xslt(STYLE)
     params = {'value': Xslt.strparam('literal'), 'p:qualified': "concat($value, '!')"}
     root = P.fromstring(t.transform(SOURCE, parameters=params))
@@ -140,6 +155,7 @@ def test_native_ordered_literals_and_expressions():
 
 
 def test_bad_unused_expression_is_reported():
+    """Validate an expression even when no top-level parameter uses its name."""
     t = transform()
     with pytest.raises(P.XSLTApplyError):
         t(P.fromstring(SOURCE), unused='(')
@@ -161,6 +177,7 @@ def test_pyff_cleanup_removes_xml_attributes(stylesheet, fallback):
     actual = P.XSLT(P.fromstring(style))(P.fromstring(source)).getroot()
     expected = L.XSLT(L.fromstring(style))(L.fromstring(source)).getroot()
     def tree(node):
+        """Compare expanded names and content without serializer prefix differences."""
         return node.tag, dict(node.attrib), node.text, [tree(c) for c in node]
     assert tree(actual) == tree(expected)
     assert actual.get('{http://www.w3.org/XML/1998/namespace}lang') == 'en'
@@ -171,5 +188,6 @@ def test_pyff_cleanup_removes_xml_attributes(stylesheet, fallback):
 
 
 def test_xpath_cannot_rebind_xml_prefix():
+    """Keep xml bound to its reserved namespace despite an explicit caller override."""
     root = P.fromstring('<root xmlns:other="urn:other" xml:id="real" other:id="wrong"/>')
     assert root.xpath('string(@xml:id)', namespaces={'xml': 'urn:other'}) == 'real'
