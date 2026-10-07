@@ -609,7 +609,6 @@ def _attach(holder, parent_node, node, tail, ref=None):
         holder.doc.append_child(parent_node, node)
     else:
         holder.doc.insert_before(parent_node, node, ref)
-    _apply_inherited_default_namespace(parent_node, node)
     _attach_tail(holder, parent_node, tail, node)
 
 
@@ -621,12 +620,6 @@ def _attach(holder, parent_node, node, tail, ref=None):
 def _build_element(holder, tag, nsmap):
     nsmap = _validate_nsmap(nsmap)
     ns, local = _split_key(tag)
-    # Compatibility policy: a bare tag combined with a non-empty default
-    # declaration is placed in that namespace. This keeps the in-memory tree
-    # consistent with the serialized XML instead of allowing its namespace to
-    # change only when the output is parsed again.
-    if ns is None and nsmap and nsmap.get(None):
-        ns = nsmap[None]
     prefix = _prefix_for_ns(ns, nsmap) if ns else None
     node = holder.doc.create_element(local, ns, prefix)
     if nsmap:
@@ -636,13 +629,12 @@ def _build_element(holder, tag, nsmap):
 
 
 def _qualify_default_namespace_subtree(node, inherited_default=None):
-    """Apply effective default namespaces to bare names in ``node``'s subtree.
+    """Apply effective default namespaces to bare names in a serialization copy.
 
     An element's own default declaration overrides the inherited value,
     including ``xmlns=""`` which stops qualification below that point. Existing
-    explicitly namespaced elements are left unchanged. The iterative walk also
-    handles programmatically constructed trees deeper than Python's recursion
-    limit.
+    explicitly namespaced elements are left unchanged. This must never be used
+    on the live tree: lxml namespace declarations do not change expanded names.
     """
     stack = [(node, inherited_default)]
     while stack:
@@ -653,46 +645,28 @@ def _qualify_default_namespace_subtree(node, inherited_default=None):
             if prefix is None:
                 default_ns = uri or None
         qname = current.tag
-        if default_ns and qname.namespace_uri is None:
+        if default_ns and qname.prefix is None and qname.namespace_uri is None:
             current.set_qname(qname.local_name, default_ns, None)
         children = _content_children(current)
         stack.extend((child, default_ns) for child in reversed(children))
 
 
-def _apply_inherited_default_namespace(parent_node, node):
-    """Qualify a newly attached subtree under ``parent_node``'s default ns."""
-    inherited_default = dict(parent_node.nsmap()).get(None) or None
-    if inherited_default is None:
-        return
-    _qualify_default_namespace_subtree(node, inherited_default)
-
-
-def _rebind_default_namespace_subtree(node, old_default, new_default):
-    """Rebind unprefixed names governed by ``node``'s default declaration.
-
-    Descendant default declarations start independent lexical scopes and are
-    therefore left untouched. Within this declaration's scope, only bare names
-    (when adding the first default) or unprefixed names using the previous
-    default are changed; explicitly prefixed names are never rewritten.
-    """
-    stack = [(node, True)]
+def _has_bare_name_under_default_namespace(node, inherited_default=None):
+    """Return whether lexical default-namespace serialization needs a copy."""
+    stack = [(node, inherited_default)]
     while stack:
-        current, is_root = stack.pop()
+        current, default_ns = stack.pop()
         if current.kind != "element":
             continue
-        if not is_root and any(
-            prefix is None for prefix, _uri in current.namespace_declarations
-        ):
-            continue
+        for prefix, uri in current.namespace_declarations:
+            if prefix is None:
+                default_ns = uri or None
         qname = current.tag
-        if qname.prefix is None:
-            if old_default:
-                if qname.namespace_uri == old_default:
-                    current.set_qname(qname.local_name, new_default, None)
-            elif qname.namespace_uri is None and new_default:
-                current.set_qname(qname.local_name, new_default, None)
+        if default_ns and qname.prefix is None and qname.namespace_uri is None:
+            return True
         children = _content_children(current)
-        stack.extend((child, False) for child in reversed(children))
+        stack.extend((child, default_ns) for child in reversed(children))
+    return False
 
 
 def _finalize_element_ns(holder, node):
@@ -948,18 +922,13 @@ class _Element(_u._ElementBase):
 
         ``set("xmlns", uri)`` and ``set("xmlns:<prefix>", uri)`` are treated as
         namespace declarations, recorded on the element so they serialize as
-        real ``xmlns`` output rather than a sanitized ``xmlns_`` attribute. A
-        non-empty default declaration also qualifies bare names in the affected
-        subtree so its in-memory names agree with its serialized XML.
+        real ``xmlns`` output rather than a sanitized ``xmlns_`` attribute.
+        Default declarations do not alter existing expanded element names.
         """
         _check_xml_string(value)
         if isinstance(key, str):
             if key == "xmlns":
-                old_default = dict(self._node.nsmap()).get(None) or None
                 self._holder.doc.set_namespace_declaration(self._node, None, value)
-                _rebind_default_namespace_subtree(
-                    self._node, old_default, value or None
-                )
                 return
             if key.startswith("xmlns:"):
                 prefix = key[len("xmlns:") :]
@@ -1026,7 +995,6 @@ class _Element(_u._ElementBase):
         # Insert the new child in place, then remove the old one (with its tail).
         node, tail = self._adopt(element)
         self._holder.doc.insert_before(self._node, node, old)
-        _apply_inherited_default_namespace(self._node, node)
         _extract(self._holder, old)
         _attach_tail(self._holder, self._node, tail, node)
 
@@ -1234,7 +1202,6 @@ class _Element(_u._ElementBase):
             raise ValueError("Element is not a child of this node.")
         node, tail = self._adopt(new_element)
         self._holder.doc.insert_before(self._node, node, old_element._node)
-        _apply_inherited_default_namespace(self._node, node)
         _extract(self._holder, old_element._node)
         _attach_tail(self._holder, self._node, tail, node)
 
@@ -1245,7 +1212,6 @@ class _Element(_u._ElementBase):
             raise TypeError("cannot add sibling to a root element")
         node, tail = self._adopt(element)
         self._holder.doc.insert_after(parent, node, self._node)
-        _apply_inherited_default_namespace(parent, node)
         _attach_tail(self._holder, parent, tail, node)
 
     def addprevious(self, element):
@@ -1255,7 +1221,6 @@ class _Element(_u._ElementBase):
             raise TypeError("cannot add sibling to a root element")
         node, tail = self._adopt(element)
         self._holder.doc.insert_before(parent, node, self._node)
-        _apply_inherited_default_namespace(parent, node)
         _attach_tail(self._holder, parent, tail, node)
 
     def makeelement(self, _tag, attrib=None, nsmap=None, **extra):
@@ -2245,6 +2210,16 @@ def _inject_inherited_namespaces(element, text):
     return text[:insert_at] + decls + text[insert_at:]
 
 
+def _serialize_node(node, pretty_print):
+    """Serialize one native node, applying etree's pretty-print convention."""
+    if pretty_print:
+        text = node.to_xml_with_options("  ", False)
+        if not text.endswith("\n"):
+            text += "\n"
+        return text
+    return node.to_xml()
+
+
 def tostring(
     element_or_tree,
     encoding=None,
@@ -2296,13 +2271,19 @@ def tostring(
     if doctype_str is None and tree is not None:
         doctype_str = tree.docinfo.doctype or None
 
-    node = element._node
-    if pretty_print:
-        text = node.to_xml_with_options("  ", False)
-        if not text.endswith("\n"):
-            text += "\n"
-    else:
-        text = node.to_xml()
+    serialization_element = element
+    text = _serialize_node(element._node, pretty_print)
+    if 'xmlns=""' in text and _has_bare_name_under_default_namespace(
+        element._node, dict(element._node.nsmap()).get(None) or None
+    ):
+        # lxml preserves bare expanded names in memory even when an explicit
+        # default declaration would lexically place them in a namespace. The
+        # native serializer protects QName round-tripping by emitting xmlns="",
+        # so qualify a detached copy to reproduce lxml's lexical output without
+        # mutating the live tree.
+        serialization_element = _standalone_clone(element)
+        _qualify_default_namespace_subtree(serialization_element._node)
+        text = _serialize_node(serialization_element._node, pretty_print)
 
     # uppsala's serializer emits only the namespace declarations made *on* the
     # serialized element, not those it inherits from ancestors. Serializing a
@@ -2311,7 +2292,7 @@ def tostring(
     # in-scope declarations on the serialization root, so mirror that by adding
     # any inherited-but-undeclared bindings to the top start tag. For a document
     # root this is a no-op (its nsmap equals its own declarations).
-    text = _inject_inherited_namespaces(element, text)
+    text = _inject_inherited_namespaces(serialization_element, text)
 
     # The DOCTYPE sits between the optional XML declaration and the root, so
     # prepend it before the declaration logic below (which prepends in turn).
