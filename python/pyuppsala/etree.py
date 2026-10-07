@@ -2532,6 +2532,8 @@ class XMLSchema:
         and reparsing XML. Records failures in ``error_log`` like ``validate``.
         """
         root = tree.getroot() if isinstance(tree, _ElementTree) else tree
+        if root is None:
+            raise AssertionError("ElementTree not initialized, missing root")
         self.error_log = self._validator.experimental_validate_node(root._node)
         return len(self.error_log) == 0
 

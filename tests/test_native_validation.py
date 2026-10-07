@@ -21,11 +21,14 @@ SCHEMA = '''<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
     ('<outer xmlns="urn:outer"><inner xmlns=""><number>42</number></inner></outer>', './/number', True),
 ])
 def test_native_validation_matches_serialized(xml, tag, valid):
+    """Match serialized validation without changing ancestry or namespace context."""
     schema = E.XMLSchema(E.fromstring(SCHEMA))
     root = E.fromstring(xml)
     node = root if tag is None else root.find(tag)
     before = E.tostring(root)
     parent = node.getparent()
+    # Standalone serialization supplies the reference behavior for inherited
+    # namespaces, including shadowed prefixes and a reset default namespace.
     reference = schema._validator.validate_str(E.tostring(node, encoding='unicode'))
     assert schema.experimental_validate(node) is valid
     assert [e.message for e in schema.error_log] == [e.message for e in reference]
@@ -35,6 +38,7 @@ def test_native_validation_matches_serialized(xml, tag, valid):
 
 
 def test_native_validation_observes_mutation_and_detached_elements():
+    """Validate detached nodes using their current text and clear stale errors."""
     schema = E.XMLSchema(E.fromstring(SCHEMA))
     root = E.fromstring('<outer><number>42</number></outer>')
     node = root[0]
@@ -51,6 +55,9 @@ def test_native_validation_observes_mutation_and_detached_elements():
 
 
 def test_native_validation_releases_gil_with_shared_document():
+    """Check concurrent validation results for nodes sharing one document."""
+    # This exercises concurrent callers; it does not measure GIL release or
+    # prove that the native validation calls execute in parallel.
     validator = pyuppsala.XsdValidator(SCHEMA)
     doc = pyuppsala.parse('<outer><number>42</number><number>bad</number></outer>')
     nodes = doc.get_elements_by_tag_name('number')
@@ -60,12 +67,14 @@ def test_native_validation_releases_gil_with_shared_document():
 
 
 def test_native_validation_rejects_non_element():
+    """Reject the document node rather than treating it as the root element."""
     validator = pyuppsala.XsdValidator(SCHEMA)
     with pytest.raises(RuntimeError, match='element node'):
         validator.experimental_validate_node(pyuppsala.parse('<number>1</number>').root)
 
 
 def test_identity_constraints_are_scoped_to_the_validated_subtree():
+    """Keep uniqueness checks and their errors local to each validated group."""
     schema = E.XMLSchema(E.fromstring('''<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
       <xs:element name="group"><xs:complexType><xs:sequence>
         <xs:element name="item" minOccurs="0" maxOccurs="unbounded"><xs:complexType>
@@ -76,6 +85,7 @@ def test_identity_constraints_are_scoped_to_the_validated_subtree():
       </xs:element></xs:schema>'''))
     outer = E.fromstring('<outer><group><item key="a"/></group>'
                          '<group><item key="a"/><item key="a"/></group></outer>')
+    # A duplicate in the sibling group must not invalidate the first group.
     assert schema.experimental_validate(outer[0])
     assert not schema.experimental_validate(outer[1])
     assert schema.experimental_validate(outer[0])
@@ -83,6 +93,7 @@ def test_identity_constraints_are_scoped_to_the_validated_subtree():
 
 
 def test_document_root_validation_observes_mutation():
+    """Have the whole-document path observe edits and reset validation errors."""
     schema = E.XMLSchema(E.fromstring(SCHEMA))
     node = E.fromstring('<number>42</number>')
     assert schema.experimental_validate(node)
@@ -96,11 +107,15 @@ def test_document_root_validation_observes_mutation():
 
 
 def test_standard_validation_does_not_use_experimental_api():
+    """Keep all three stable validation entry points on the serialized API."""
     schema = E.XMLSchema(E.fromstring(SCHEMA))
     calls = []
 
     class StableValidator:
+        """Expose only the stable method so experimental dispatch would fail."""
+
         def validate_str(self, xml):
+            """Record serialized inputs and report successful validation."""
             calls.append(xml)
             return []
 
@@ -110,3 +125,36 @@ def test_standard_validation_does_not_use_experimental_api():
     schema.assertValid(node)
     assert schema(node)
     assert calls == ['<number>42</number>'] * 3
+
+
+@pytest.mark.parametrize('subtree', [False, True])
+@pytest.mark.parametrize('reset_default', [False, True])
+def test_native_validation_qualifies_bare_names_without_mutation(subtree, reset_default):
+    """Match lexical default namespaces for roots, subtrees, and namespace resets."""
+    schema = E.XMLSchema(E.fromstring('''
+      <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                 targetNamespace="urn:kml" elementFormDefault="qualified">
+        <xs:element name="kml"><xs:complexType><xs:sequence>
+          <xs:element name="child" form="%s"/>
+        </xs:sequence></xs:complexType></xs:element>
+      </xs:schema>''' % ('unqualified' if reset_default else 'qualified')))
+    outer = E.Element('outer', nsmap={None: 'urn:kml'})
+    node = E.SubElement(outer, 'kml') if subtree else E.Element('kml', nsmap={None: 'urn:kml'})
+    child = E.SubElement(node, 'child', nsmap={None: ''} if reset_default else None)
+    before = E.tostring(outer if subtree else node)
+    names = (node.tag, child.tag)
+    parent = node.getparent()
+    assert schema.validate(node)
+    assert schema.experimental_validate(node)
+    assert schema.experimental_validate(E.ElementTree(node))
+    assert (node.tag, child.tag) == names
+    assert node.getparent() is parent
+    assert E.tostring(outer if subtree else node) == before
+
+
+@pytest.mark.parametrize('method', ['experimental_validate', 'experimental_assertValid'])
+def test_native_validation_empty_tree_reports_missing_root(method):
+    """Give empty trees the stable API's explicit missing-root assertion."""
+    schema = E.XMLSchema(E.fromstring(SCHEMA))
+    with pytest.raises(AssertionError, match='ElementTree not initialized, missing root'):
+        getattr(schema, method)(E.ElementTree())

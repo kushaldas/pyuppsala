@@ -124,9 +124,11 @@ print(validator.is_valid_str("<greeting><bad/></greeting>"))  # False
 
 For an existing DOM, `validator.validate(doc)` avoids reparsing XML.
 The experimental `validator.experimental_validate_node(node)` validates a
-selected element independently: it reads document roots directly and copies
-subtrees in Rust, preserving inherited namespace bindings without mutating
-the source. It returns validation errors and releases the GIL.
+selected element independently: it reads document roots directly when no
+namespace adjustment is needed and otherwise copies the selected subtree in
+Rust. Copies preserve inherited namespace bindings and apply effective default
+namespaces to bare element names, matching etree serialization without mutating
+the source. Empty etree trees raise the same missing-root assertion as `validate()`. It returns validation errors and releases the GIL.
 
 The etree equivalents are `schema.experimental_validate(tree)` and
 `schema.experimental_assertValid(tree)`. These APIs are opt-in and may change.

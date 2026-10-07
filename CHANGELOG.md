@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added opt-in ``XsdValidator.experimental_validate_node()``,
+  ``etree.XMLSchema.experimental_validate()``, and
+  ``etree.XMLSchema.experimental_assertValid()`` APIs for native DOM validation
+  without XML serialization and reparsing. Validation releases the GIL,
+  preserves inherited namespaces and subtree isolation, and does not mutate
+  the source tree. These experimental APIs may change; established validation
+  APIs retain their serialization-based behavior.
+
+### Fixed
+
+- Match etree serialization's effective default namespaces during experimental
+  native validation, including bare element names and explicit namespace resets.
+  Apply namespace adjustments to a temporary copy while retaining direct
+  validation for document roots that need no adjustment.
+- Report the established missing-root ``AssertionError`` when experimental
+  validation receives an empty ``ElementTree``.
+
 ## 0.11.1 [2026-10-07]
 
 ### Added
