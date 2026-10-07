@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.11.1 [2026-10-07]
+
+### Added
+
+- Added invocation-local parameters to ``Xslt.transform()`` and
+  ``Xslt.transform_document()`` through ``parameters`` and
+  ``string_parameters`` mappings, with ``Xslt.strparam()`` for literal values.
+- Added keyword parameters to ``etree.XSLT`` calls, accepting XPath expression
+  strings, compiled ``XPath`` objects, and ``XSLT.strparam()`` literal values.
+  XPath result types, including node sets, are preserved. Parameter values
+  remain isolated across repeated and concurrent transformation calls.
+- Added parameter and pyFF stylesheet regression tests, with lxml installed
+  in CI and release wheel test environments for differential checks.
+- Added ``etree.XMLSchema.assert_()``, which raises ``AssertionError`` for an
+  invalid document, alongside ``assertValid()``, which raises
+  ``DocumentInvalid``.
+
+### Changed
+
+- Updated Uppsala from 0.10.1 to 0.11.0 on crates.io.
+- ``etree.XSLT.strparam()`` now returns an opaque literal parameter token
+  instead of an XPath-quoted string. Pass the token directly to the transform;
+  pass ordinary strings only when XPath expression evaluation is intended.
+- ``etree.XMLParser(recover=True)`` now emits a ``UserWarning`` and parses
+  strictly instead of raising ``NotImplementedError``. Malformed input still
+  raises ``XMLSyntaxError`` because Uppsala does not provide recovery parsing.
+
+### Fixed
+
+- Support the implicit reserved ``xml`` namespace in XPath and XSLT match
+  patterns, including pyFF's ``tidy.xsl`` and ``eidas-cleanup.xsl`` cleanup of
+  ``xml:id`` and ``xml:base`` attributes. Caller namespace overrides cannot
+  rebind the reserved prefix.
+- Preserve literal publisher values containing quotes, markup characters,
+  and Unicode when supplied to pyFF's ``pubinfo.xsl`` stylesheet.
+- Preserve default namespace declarations when constructing a bare-tag element
+  with ``nsmap={None: uri}``, and serialize ``element.set("xmlns", uri)`` and
+  ``element.set("xmlns:<prefix>", uri)`` as namespace declarations rather than
+  sanitized ``xmlns_`` attributes.
+- Validate KML content models containing an optional ``xs:choice`` followed by
+  substitution-group members, so valid children such as ``Placemark`` are no
+  longer rejected as unmatched choice alternatives.
+
 ## 0.11.0 [2026-09-02]
 
 ### Added
@@ -244,38 +287,6 @@ inherits these transparently through the dependency upgrade.
   (`[profile.release] lto = "fat"`, `codegen-units = 1`). Since the cdylib is the
   final compiled artifact, this lets uppsala's hot scanning loops inline across
   the crate boundary into pyuppsala's call sites.
-
-
-## 0.5.2
-
-Built against uppsala 0.5.2. Resolves the fastkml integration report (issue #6).
-
-### Added
-
-- `etree.Element(tag, nsmap={None: uri})` with a bare (non-Clark) tag now
-  places the element in that default namespace and serializes as `xmlns="uri"`,
-  instead of dropping the URI as `xmlns=""`.
-- `element.set("xmlns", uri)` and `element.set("xmlns:<prefix>", uri)` are now
-  treated as namespace declarations (lxml parity), serializing as real `xmlns`
-  output rather than a sanitized `xmlns_` attribute. The default form also
-  places a no-namespace element in the declared namespace.
-- `etree.XMLSchema` gains an `assert_()` method (lxml parity) that raises
-  `AssertionError` on an invalid document, alongside the existing
-  `assertValid()` which raises `DocumentInvalid`.
-- Valid KML now validates: uppsala 0.5.2 fixes XSD `xs:choice` content models
-  whose alternatives are all optional, so e.g.
-  `<Document><Placemark/></Document>` no longer reports "does not match any
-  choice alternative".
-
-### Changed
-
-- Requires uppsala 0.5.2. Namespace declarations are recorded via uppsala's new
-  `Document::declare_namespace` helper rather than mutating the declaration list
-  directly.
-- `etree.XMLParser(recover=True)` no longer raises `NotImplementedError`; it
-  emits a `UserWarning` and is ignored (uppsala parses strictly), so lxml code
-  passing `recover=True` keeps running. Malformed input still raises
-  `XMLSyntaxError`.
 
 
 ## 0.5.1
