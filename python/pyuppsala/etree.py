@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import warnings
 
 from . import _elementpath as ElementPath
 from . import _pyuppsala as _u
@@ -627,6 +628,47 @@ def _build_element(holder, tag, nsmap):
     return node
 
 
+def _qualify_default_namespace_subtree(node, inherited_default=None):
+    """Apply effective default namespaces to bare names in a serialization copy.
+
+    An element's own default declaration overrides the inherited value,
+    including ``xmlns=""`` which stops qualification below that point. Existing
+    explicitly namespaced elements are left unchanged. This must never be used
+    on the live tree: lxml namespace declarations do not change expanded names.
+    """
+    stack = [(node, inherited_default)]
+    while stack:
+        current, default_ns = stack.pop()
+        if current.kind != "element":
+            continue
+        for prefix, uri in current.namespace_declarations:
+            if prefix is None:
+                default_ns = uri or None
+        qname = current.tag
+        if default_ns and qname.prefix is None and qname.namespace_uri is None:
+            current.set_qname(qname.local_name, default_ns, None)
+        children = _content_children(current)
+        stack.extend((child, default_ns) for child in reversed(children))
+
+
+def _has_bare_name_under_default_namespace(node, inherited_default=None):
+    """Return whether lexical default-namespace serialization needs a copy."""
+    stack = [(node, inherited_default)]
+    while stack:
+        current, default_ns = stack.pop()
+        if current.kind != "element":
+            continue
+        for prefix, uri in current.namespace_declarations:
+            if prefix is None:
+                default_ns = uri or None
+        qname = current.tag
+        if default_ns and qname.prefix is None and qname.namespace_uri is None:
+            return True
+        children = _content_children(current)
+        stack.extend((child, default_ns) for child in reversed(children))
+    return False
+
+
 def _finalize_element_ns(holder, node):
     """Ensure an attached element's namespace is serializable, reusing an
     in-scope prefix/default declaration when one exists rather than emitting a
@@ -683,7 +725,7 @@ def SubElement(_parent, _tag, attrib=None, nsmap=None, **extra):
     """Create a child element of ``_parent`` in the same document."""
     holder = _parent._holder
     node = _build_element(holder, _tag, nsmap)
-    holder.doc.append_child(_parent._node, node)
+    _attach(holder, _parent._node, node, [])
     _finalize_element_ns(holder, node)
     el = holder.proxy(node)
     _apply_attribs(el, attrib, extra)
@@ -877,9 +919,26 @@ class _Element(_u._ElementBase):
 
         For namespaced attributes, ensures a usable prefix is in scope (declaring
         one if needed) so the attribute serializes correctly.
+
+        ``set("xmlns", uri)`` and ``set("xmlns:<prefix>", uri)`` are treated as
+        namespace declarations, recorded on the element so they serialize as
+        real ``xmlns`` output rather than a sanitized ``xmlns_`` attribute.
+        Default declarations do not alter existing expanded element names.
         """
-        ns, local = _split_key(key)
         _check_xml_string(value)
+        if isinstance(key, str):
+            if key == "xmlns":
+                self._holder.doc.set_namespace_declaration(self._node, None, value)
+                return
+            if key.startswith("xmlns:"):
+                prefix = key[len("xmlns:") :]
+                if not prefix:
+                    raise ValueError("namespace prefix must not be empty")
+                self._holder.doc.set_namespace_declaration(
+                    self._node, prefix, value
+                )
+                return
+        ns, local = _split_key(key)
         prefix = None
         if ns:
             prefix = self._ensure_ns_prefix(ns)
@@ -1736,9 +1795,18 @@ class XMLParser:
         declarations (defusedxml-style hardening). Options whose absence would
         silently change correctness raise ``NotImplementedError``; purely
         cosmetic options are accepted and ignored.
+
+        ``recover=True`` is accepted for ``lxml`` compatibility but has no effect:
+        uppsala has no error-recovery mode and always parses strictly, so a
+        :class:`UserWarning` is emitted and malformed input still raises
+        :class:`XMLSyntaxError` rather than being repaired.
         """
         if recover:
-            raise NotImplementedError("recover-mode parsing is not supported")
+            warnings.warn(
+                "recover=True is not supported by pyuppsala; parsing strictly "
+                "instead (malformed input will raise XMLSyntaxError)",
+                stacklevel=2,
+            )
         if dtd_validation or load_dtd:
             raise NotImplementedError("DTD processing is not supported")
         if not resolve_entities:
@@ -2142,6 +2210,16 @@ def _inject_inherited_namespaces(element, text):
     return text[:insert_at] + decls + text[insert_at:]
 
 
+def _serialize_node(node, pretty_print):
+    """Serialize one native node, applying etree's pretty-print convention."""
+    if pretty_print:
+        text = node.to_xml_with_options("  ", False)
+        if not text.endswith("\n"):
+            text += "\n"
+        return text
+    return node.to_xml()
+
+
 def tostring(
     element_or_tree,
     encoding=None,
@@ -2193,13 +2271,19 @@ def tostring(
     if doctype_str is None and tree is not None:
         doctype_str = tree.docinfo.doctype or None
 
-    node = element._node
-    if pretty_print:
-        text = node.to_xml_with_options("  ", False)
-        if not text.endswith("\n"):
-            text += "\n"
-    else:
-        text = node.to_xml()
+    serialization_element = element
+    text = _serialize_node(element._node, pretty_print)
+    if 'xmlns=""' in text and _has_bare_name_under_default_namespace(
+        element._node, dict(element._node.nsmap()).get(None) or None
+    ):
+        # lxml preserves bare expanded names in memory even when an explicit
+        # default declaration would lexically place them in a namespace. The
+        # native serializer protects QName round-tripping by emitting xmlns="",
+        # so qualify a detached copy to reproduce lxml's lexical output without
+        # mutating the live tree.
+        serialization_element = _standalone_clone(element)
+        _qualify_default_namespace_subtree(serialization_element._node)
+        text = _serialize_node(serialization_element._node, pretty_print)
 
     # uppsala's serializer emits only the namespace declarations made *on* the
     # serialized element, not those it inherits from ancestors. Serializing a
@@ -2208,7 +2292,7 @@ def tostring(
     # in-scope declarations on the serialization root, so mirror that by adding
     # any inherited-but-undeclared bindings to the top start tag. For a document
     # root this is a no-op (its nsmap equals its own declarations).
-    text = _inject_inherited_namespaces(element, text)
+    text = _inject_inherited_namespaces(serialization_element, text)
 
     # The DOCTYPE sits between the optional XML declaration and the root, so
     # prepend it before the declaration logic below (which prepends in turn).
@@ -2455,6 +2539,16 @@ class XMLSchema:
             exc = DocumentInvalid(messages or "Document does not validate")
             exc.error_log = self.error_log
             raise exc
+
+    def assert_(self, tree):
+        """Raise :class:`AssertionError` if ``tree`` does not validate.
+
+        Mirrors ``lxml.etree.XMLSchema.assert_``; existing lxml code that
+        catches ``AssertionError`` keeps working.
+        """
+        if not self.validate(tree):
+            messages = "; ".join(e.message for e in self.error_log)
+            raise AssertionError(messages or "Document does not validate")
 
     def __call__(self, tree):
         """Return True if ``tree`` validates (alias for :meth:`validate`)."""

@@ -13,6 +13,9 @@
   remain isolated across repeated and concurrent transformation calls.
 - Added parameter and pyFF stylesheet regression tests, with lxml installed
   in CI and release wheel test environments for differential checks.
+- Added ``etree.XMLSchema.assert_()``, which raises ``AssertionError`` for an
+  invalid document, alongside ``assertValid()``, which raises
+  ``DocumentInvalid``.
 
 ### Changed
 
@@ -20,6 +23,9 @@
 - ``etree.XSLT.strparam()`` now returns an opaque literal parameter token
   instead of an XPath-quoted string. Pass the token directly to the transform;
   pass ordinary strings only when XPath expression evaluation is intended.
+- ``etree.XMLParser(recover=True)`` now emits a ``UserWarning`` and parses
+  strictly instead of raising ``NotImplementedError``. Malformed input still
+  raises ``XMLSyntaxError`` because Uppsala does not provide recovery parsing.
 
 ### Fixed
 
@@ -29,7 +35,14 @@
   rebind the reserved prefix.
 - Preserve literal publisher values containing quotes, markup characters,
   and Unicode when supplied to pyFF's ``pubinfo.xsl`` stylesheet.
-
+- Preserve default namespace declarations when constructing bare-tag trees with
+  ``nsmap={None: uri}``, including existing and subsequently attached
+  descendants. Serialize ``element.set("xmlns", uri)`` and
+  ``element.set("xmlns:<prefix>", uri)`` as namespace declarations rather than
+  sanitized ``xmlns_`` attributes.
+- Validate KML content models containing an optional ``xs:choice`` followed by
+  substitution-group members, so valid children such as ``Placemark`` are no
+  longer rejected as unmatched choice alternatives.
 
 ## 0.11.0 [2026-09-02]
 

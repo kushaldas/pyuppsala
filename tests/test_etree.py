@@ -701,13 +701,33 @@ class TestStandalone:
 
     def test_unsupported_parser_options_raise(self):
         for kwargs in (
-            {"recover": True},
             {"dtd_validation": True},
             {"load_dtd": True},
             {"resolve_entities": False},
         ):
             with pytest.raises(NotImplementedError):
                 P.XMLParser(**kwargs)
+
+    def test_recover_warns_and_is_ignored(self):
+        # recover=True has no effect (uppsala parses strictly) but must not
+        # hard-fail, so lxml code passing recover=True keeps running.
+        with pytest.warns(UserWarning):
+            parser = P.XMLParser(recover=True)
+        # Well-formed input still parses; malformed input still raises.
+        assert P.fromstring("<a><b/></a>", parser).tag == "a"
+        with pytest.raises(P.XMLSyntaxError):
+            P.fromstring("<a><b></a>", parser)
+
+    def test_schema_assert_raises_assertionerror(self):
+        # lxml parity: assert_() raises AssertionError, assertValid() raises
+        # DocumentInvalid.
+        schema = P.XMLSchema(P.fromstring(SCHEMA))
+        schema.assert_(P.fromstring("<note>hi</note>"))  # valid: no raise
+        bad = P.fromstring("<wrong/>")
+        with pytest.raises(AssertionError):
+            schema.assert_(bad)
+        with pytest.raises(P.DocumentInvalid):
+            schema.assertValid(bad)
 
     def test_cosmetic_parser_options_ignored(self):
         parser = P.XMLParser(collect_ids=False, compact=False, no_network=True)
@@ -1281,6 +1301,140 @@ class TestStandalone:
         assert P.tostring(root, encoding="unicode") == (
             '<root xmlns="urn:d"><renamed/></root>'
         )
+
+    def test_nsmap_default_on_bare_tag_preserves_uri(self):
+        # Issue #6 item 4: Element(tag, nsmap={None: uri}) with a bare tag used
+        # to serialize as xmlns="" (URI lost). The declaration is preserved
+        # without changing the element's expanded name, matching lxml.
+        uri = "http://www.opengis.net/kml/2.2"
+        root = P.Element("kml", nsmap={None: uri})
+        assert P.tostring(root, encoding="unicode") == '<kml xmlns="%s"/>' % uri
+        assert root.tag == "kml"
+        reparsed = P.fromstring(P.tostring(root, encoding="unicode"))
+        assert reparsed.tag == "{%s}kml" % uri
+
+    def test_nsmap_default_preserves_bare_descendants(self):
+        # A default declaration controls lexical output but does not change the
+        # expanded names used by .tag and find().
+        uri = "http://www.opengis.net/kml/2.2"
+        root = P.Element("kml", nsmap={None: uri})
+        document = P.SubElement(root, "Document")
+        placemark = P.SubElement(document, "Placemark")
+
+        assert [root.tag, document.tag, placemark.tag] == [
+            "kml",
+            "Document",
+            "Placemark",
+        ]
+        assert root.find("Document") is document
+        assert P.tostring(root, encoding="unicode") == (
+            '<kml xmlns="%s"><Document><Placemark/></Document></kml>' % uri
+        )
+
+    def test_set_xmlns_declares_default_namespace(self):
+        # Issue #6 item 3: set("xmlns", uri) is a namespace declaration, not an
+        # xmlns_ attribute. The declaration does not rename the element.
+        uri = "http://www.opengis.net/kml/2.2"
+        root = P.Element("kml")
+        root.set("xmlns", uri)
+        out = P.tostring(root, encoding="unicode")
+        assert "xmlns_" not in out, out
+        assert out == '<kml xmlns="%s"/>' % uri
+        assert root.tag == "kml"
+        assert root.get("xmlns") is None  # not stored as an attribute
+
+    def test_set_xmlns_preserves_existing_and_added_descendants(self):
+        uri = "http://www.opengis.net/kml/2.2"
+        root = P.Element("kml")
+        document = P.SubElement(root, "Document")
+        placemark = P.SubElement(document, "Placemark")
+
+        # Existing and subsequently added bare descendants keep their expanded
+        # names while the explicit declaration is retained in lexical output.
+        root.set("xmlns", uri)
+        network_link = P.SubElement(root, "NetworkLink")
+
+        # A detached bare subtree added later is updated as a whole.
+        folder = P.Element("Folder")
+        folder_placemark = P.SubElement(folder, "Placemark")
+        root.append(folder)
+
+        assert [
+            root.tag,
+            document.tag,
+            placemark.tag,
+            network_link.tag,
+            folder.tag,
+            folder_placemark.tag,
+        ] == [
+            "kml",
+            "Document",
+            "Placemark",
+            "NetworkLink",
+            "Folder",
+            "Placemark",
+        ]
+        out = P.tostring(root, encoding="unicode")
+        assert 'xmlns=""' not in out
+        assert out == (
+            '<kml xmlns="%s"><Document><Placemark/></Document>'
+            "<NetworkLink/><Folder><Placemark/></Folder></kml>" % uri
+        )
+
+    def test_set_xmlns_replaces_declaration_without_renaming_bare_tree(self):
+        root = P.Element("root")
+        child = P.SubElement(root, "child")
+
+        root.set("xmlns", "urn:a")
+        root.set("xmlns", "urn:b")
+
+        assert root.tag == "root"
+        assert child.tag == "child"
+        assert P.tostring(root, encoding="unicode") == (
+            '<root xmlns="urn:b"><child/></root>'
+        )
+
+    def test_set_xmlns_does_not_rebind_existing_qnames(self):
+        root = P.fromstring('<root xmlns="urn:a"><child/></root>')
+        root.set("xmlns", "urn:b")
+
+        assert root.tag == "{urn:a}root"
+        assert root[0].tag == "{urn:a}child"
+        out = P.tostring(root, encoding="unicode")
+        assert out == (
+            '<ns0:root xmlns="urn:b" xmlns:ns0="urn:a">'
+            '<child xmlns="urn:a"/></ns0:root>'
+        )
+        reparsed = P.fromstring(out)
+        assert reparsed.tag == "{urn:a}root"
+        assert reparsed[0].tag == "{urn:a}child"
+
+    def test_default_namespace_propagation_respects_undeclaration(self):
+        uri = "http://www.opengis.net/kml/2.2"
+        root = P.Element("kml", nsmap={None: uri})
+        plain = P.Element("plain", nsmap={None: ""})
+        leaf = P.SubElement(plain, "leaf")
+        root.append(plain)
+
+        assert root.tag == "kml"
+        assert plain.tag == "plain"
+        assert leaf.tag == "leaf"
+        assert P.tostring(root, encoding="unicode") == (
+            '<kml xmlns="%s"><plain xmlns=""><leaf/></plain></kml>' % uri
+        )
+
+    def test_set_xmlns_prefixed_declares_prefix(self):
+        # set("xmlns:p", uri) declares prefix p rather than setting an attribute.
+        el = P.Element("a")
+        el.set("xmlns:foo", "urn:foo")
+        out = P.tostring(el, encoding="unicode")
+        assert out == '<a xmlns:foo="urn:foo"/>', out
+
+    def test_set_xmlns_rejects_empty_prefixed_name(self):
+        el = P.Element("a")
+        with pytest.raises(ValueError, match="prefix must not be empty"):
+            el.set("xmlns:", "urn:foo")
+        assert P.tostring(el, encoding="unicode") == "<a/>"
 
     def test_index_non_element_raises_valueerror(self):
         root = P.fromstring("<r><a/></r>")

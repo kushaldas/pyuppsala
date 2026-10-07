@@ -524,7 +524,6 @@ The following lxml features are **not** part of the first release. Options that
 would silently change parsing correctness raise ``NotImplementedError`` rather
 than being ignored:
 
-- ``XMLParser(recover=True)`` -- error-recovery parsing
 - DTD processing (``dtd_validation``, ``load_dtd``, ``resolve_entities=False``)
 - custom URI resolvers and parser ``target`` objects
 - ``tostring(method=...)`` other than ``"xml"`` (``"html"``, ``"text"``,
@@ -540,6 +539,10 @@ compatibility but has been a no-op since 0.10.0: under the zero-copy document
 model the decoded input is the document's backing storage and cannot be
 released while the tree is alive, so source-inspection helpers keep working
 regardless of this flag.
+
+``XMLParser(recover=True)`` is accepted for migration compatibility and emits a
+``UserWarning``, but parsing remains strict. Malformed input therefore still
+raises ``XMLSyntaxError``; Uppsala does not perform error-recovery parsing.
 
 .. note::
 
