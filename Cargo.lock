@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "pyuppsala"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "pyo3",
  "self_cell",
@@ -329,9 +329,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "uppsala"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f48e34837f1165c635e8c20824d47e12ded9c18e8ba1849639e3782e00539212"
+checksum = "717b252544d044a701181a32cf7ff443b86603acf99faf8d45e14b20a8c769be"
 
 [[package]]
 name = "ureq"

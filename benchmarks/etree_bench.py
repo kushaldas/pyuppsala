@@ -41,6 +41,11 @@ try:
 except Exception:  # pragma: no cover - lxml is a dev convenience only
     LX = None
 
+# The aggregate is a trusted 7 MB fixture with ~45k nodes; the default anti-DoS
+# XPath node-visit budget (100k) would abort ``xpath_ns`` before it finishes a
+# full-document walk. Raise it through the documented module-level knob.
+PU.MAX_XPATH_NODE_VISITS = 10_000_000
+
 
 # SAML / metadata namespaces used by the entity-shaped operations below. These
 # mirror the constants pyFF keeps in pyff.constants.NS.

@@ -651,24 +651,6 @@ def _qualify_default_namespace_subtree(node, inherited_default=None):
         stack.extend((child, default_ns) for child in reversed(children))
 
 
-def _has_bare_name_under_default_namespace(node, inherited_default=None):
-    """Return whether lexical default-namespace serialization needs a copy."""
-    stack = [(node, inherited_default)]
-    while stack:
-        current, default_ns = stack.pop()
-        if current.kind != "element":
-            continue
-        for prefix, uri in current.namespace_declarations:
-            if prefix is None:
-                default_ns = uri or None
-        qname = current.tag
-        if default_ns and qname.prefix is None and qname.namespace_uri is None:
-            return True
-        children = _content_children(current)
-        stack.extend((child, default_ns) for child in reversed(children))
-    return False
-
-
 def _finalize_element_ns(holder, node):
     """Ensure an attached element's namespace is serializable, reusing an
     in-scope prefix/default declaration when one exists rather than emitting a
@@ -1351,29 +1333,8 @@ class _Element(_u._ElementBase):
         ``NotImplementedError`` rather than silently ignoring it.
         """
         del smart_strings  # accepted for lxml compatibility; no behavioral effect
-        if variables:
-            raise NotImplementedError(
-                "XPath variable binding is not supported (got %r)"
-                % sorted(variables)
-            )
-        # The budget is the module-level ``MAX_XPATH_NODE_VISITS``. It defaults
-        # to the native anti-DoS cap and can be raised explicitly by callers
-        # that evaluate XPath only over trusted large documents.
-        ev = _u.XPathEvaluator(max_node_visits=MAX_XPATH_NODE_VISITS)
-        if namespaces:
-            for pfx, uri in namespaces.items():
-                if pfx:
-                    ev.add_namespace(pfx, uri)
-        # Build the attribute-node and document-order indexes the engine needs
-        # for the attribute axis (``@name``) and correct node-set ordering/dedup.
-        # prepare_xpath() rebuilds from scratch, so it also picks up any tree
-        # mutations made since the last evaluation.
-        self._holder.doc.prepare_xpath()
-        try:
-            result = ev.evaluate(self._holder.doc, _path, self._node)
-        except _u.XPathError as e:
-            raise XPathEvalError(str(e)) from e
-        return _wrap_xpath_result(self._holder, result)
+        _reject_xpath_variables(variables)
+        return _evaluate_xpath(self, _make_xpath_evaluator(namespaces), _path)
 
     def xinclude(self, *, network_access=False):
         """Process W3C XInclude ``xi:include`` directives in this subtree.
@@ -2169,55 +2130,38 @@ def iterparse(source, events=("end",), parser=None, tag=None):
     return native
 
 
-def _tostring_open_tag_end(text):
-    """Index of the ``>`` (or the ``/`` of ``/>``) that closes the first start
-    tag in ``text``, respecting quoted attribute values; ``None`` if not found.
+def _serialize_node(node, pretty_print, as_bytes=False, ascii=True):
+    """Serialize one native node, applying etree's pretty-print convention.
+
+    uppsala's serializer emits only the namespace declarations made *on* the
+    serialized element, not those it inherits from ancestors. Serializing a
+    sub-element that uses an inherited prefix (or default namespace) would
+    then drop the binding and produce a fragment that cannot reparse. lxml
+    keeps in-scope declarations on the serialization root, so
+    ``to_xml_standalone`` adds any inherited-but-undeclared bindings to the
+    top start tag natively (a no-op for a document root, whose nsmap equals
+    its own declarations).
+
+    With ``as_bytes`` the result is produced as ``bytes`` directly in Rust
+    (ASCII with character references, or UTF-8 when ``ascii`` is false),
+    which is what ``tostring()`` returns by default; this avoids building a
+    Python ``str`` of the whole document only to encode it again.
     """
-    quote = None
-    for i, c in enumerate(text):
-        if quote:
-            if c == quote:
-                quote = None
-        elif c in ('"', "'"):
-            quote = c
-        elif c == ">":
-            return i - 1 if i > 0 and text[i - 1] == "/" else i
-    return None
+    indent = "  " if pretty_print else None
+    if as_bytes:
+        data = node.to_xml_bytes_standalone(indent, False, ascii)
+        if pretty_print and not data.endswith(b"\n"):
+            data += b"\n"
+        return data
+    text = node.to_xml_standalone(indent, False)
+    if pretty_print and not text.endswith("\n"):
+        text += "\n"
+    return text
 
 
-def _inject_inherited_namespaces(element, text):
-    """Add namespace declarations the element inherits from its ancestors to the
-    serialized top start tag, so a serialized sub-element round-trips (matching
-    lxml). A no-op for the document root, whose in-scope map equals its own
-    declarations.
-    """
-    nsmap = element.nsmap
-    if not nsmap:
-        return text
-    own = {(pfx or None) for pfx, _uri in element._node.namespace_declarations}
-    missing = [(pfx, uri) for pfx, uri in nsmap.items() if pfx not in own]
-    if not missing:
-        return text
-    decls = "".join(
-        ' xmlns="%s"' % _escape_xml_attr_value(uri)
-        if pfx is None
-        else ' xmlns:%s="%s"' % (pfx, _escape_xml_attr_value(uri))
-        for pfx, uri in missing
-    )
-    insert_at = _tostring_open_tag_end(text)
-    if insert_at is None:
-        return text
-    return text[:insert_at] + decls + text[insert_at:]
-
-
-def _serialize_node(node, pretty_print):
-    """Serialize one native node, applying etree's pretty-print convention."""
-    if pretty_print:
-        text = node.to_xml_with_options("  ", False)
-        if not text.endswith("\n"):
-            text += "\n"
-        return text
-    return node.to_xml()
+def _is_unicode_encoding(encoding):
+    """Whether ``encoding`` selects lxml's ``str`` output (``"unicode"``)."""
+    return encoding is not None and str(encoding).lower() == "unicode"
 
 
 def tostring(
@@ -2271,10 +2215,20 @@ def tostring(
     if doctype_str is None and tree is not None:
         doctype_str = tree.docinfo.doctype or None
 
-    serialization_element = element
-    text = _serialize_node(element._node, pretty_print)
-    if 'xmlns=""' in text and _has_bare_name_under_default_namespace(
-        element._node, dict(element._node.nsmap()).get(None) or None
+    # Output form. ``encoding="unicode"`` returns ``str``. ASCII (the default)
+    # and UTF-8 are produced as bytes natively; any other codec serializes to
+    # ``str`` and encodes with ``xmlcharrefreplace`` below.
+    unicode_out = _is_unicode_encoding(encoding)
+    enc = "ASCII" if encoding is None else str(encoding)
+    enc_lower = enc.lower()
+    native_ascii = not unicode_out and enc_lower in ("ascii", "us-ascii")
+    native_utf8 = not unicode_out and enc_lower in ("utf-8", "utf8")
+    as_bytes = native_ascii or native_utf8
+    xmlns_empty = b'xmlns=""' if as_bytes else 'xmlns=""'
+
+    text = _serialize_node(element._node, pretty_print, as_bytes, native_ascii)
+    if xmlns_empty in text and element._node.has_bare_name_under_default_namespace(
+        dict(element._node.nsmap()).get(None) or None
     ):
         # lxml preserves bare expanded names in memory even when an explicit
         # default declaration would lexically place them in a namespace. The
@@ -2283,38 +2237,33 @@ def tostring(
         # mutating the live tree.
         serialization_element = _standalone_clone(element)
         _qualify_default_namespace_subtree(serialization_element._node)
-        text = _serialize_node(serialization_element._node, pretty_print)
-
-    # uppsala's serializer emits only the namespace declarations made *on* the
-    # serialized element, not those it inherits from ancestors. Serializing a
-    # sub-element that uses an inherited prefix (or default namespace) would then
-    # drop the binding and produce a fragment that cannot reparse. lxml keeps
-    # in-scope declarations on the serialization root, so mirror that by adding
-    # any inherited-but-undeclared bindings to the top start tag. For a document
-    # root this is a no-op (its nsmap equals its own declarations).
-    text = _inject_inherited_namespaces(serialization_element, text)
+        text = _serialize_node(
+            serialization_element._node, pretty_print, as_bytes, native_ascii
+        )
 
     # The DOCTYPE sits between the optional XML declaration and the root, so
     # prepend it before the declaration logic below (which prepends in turn).
     if doctype_str:
-        text = doctype_str + "\n" + text
+        prefix = doctype_str + "\n"
+        text = (prefix.encode(enc, "xmlcharrefreplace") if as_bytes else prefix) + text
 
-    if encoding is not None and str(encoding).lower() == "unicode":
+    if unicode_out:
         if xml_declaration:
             text = '<?xml version="1.0"?>\n' + text
         return text
 
     # Byte output. Default (encoding=None) is ASCII with no declaration, like lxml.
-    enc = "ASCII" if encoding is None else str(encoding)
     if xml_declaration is None:
-        xml_declaration = encoding is not None and enc.lower() not in (
+        xml_declaration = encoding is not None and enc_lower not in (
             "utf-8",
             "us-ascii",
             "ascii",
         )
     if xml_declaration:
         decl = '<?xml version="1.0" encoding="%s"?>\n' % enc
-        text = decl + text
+        text = (decl.encode("ascii") if as_bytes else decl) + text
+    if as_bytes:
+        return text
     return text.encode(enc, "xmlcharrefreplace")
 
 
@@ -2403,8 +2352,55 @@ def indent(tree, space="  ", level=0):
 # ---------------------------------------------------------------------------
 
 
+def _reject_xpath_variables(variables):
+    """XPath variable binding (lxml's ``$name`` keyword arguments) is not
+    supported by the underlying engine; passing any raises
+    ``NotImplementedError`` rather than silently ignoring it."""
+    if variables:
+        raise NotImplementedError(
+            "XPath variable binding is not supported (got %r)" % sorted(variables)
+        )
+
+
+def _make_xpath_evaluator(namespaces):
+    """A native evaluator with ``namespaces`` registered and the budget set.
+
+    The budget is the module-level ``MAX_XPATH_NODE_VISITS``. It defaults to
+    the native anti-DoS cap and can be raised explicitly by callers that
+    evaluate XPath only over trusted large documents.
+    """
+    ev = _u.XPathEvaluator(max_node_visits=MAX_XPATH_NODE_VISITS)
+    if namespaces:
+        for pfx, uri in namespaces.items():
+            if pfx:
+                ev.add_namespace(pfx, uri)
+    return ev
+
+
+def _evaluate_xpath(element, ev, path):
+    """Evaluate ``path`` with ``element`` as context on evaluator ``ev``."""
+    holder = element._holder
+    # Build the attribute-node and document-order indexes the engine needs
+    # for the attribute axis (``@name``) and correct node-set ordering/dedup.
+    # prepare_xpath() is a no-op while the tree is unchanged and rebuilds
+    # after a mutation, so it also picks up any tree edits made since the
+    # last evaluation.
+    holder.doc.prepare_xpath()
+    try:
+        result = ev.evaluate(holder.doc, path, element._node)
+    except _u.XPathError as e:
+        raise XPathEvalError(str(e)) from e
+    return _wrap_xpath_result(holder, result)
+
+
 class XPath:
-    """A reusable, precompiled XPath expression callable on elements/trees."""
+    """A reusable, precompiled XPath expression callable on elements/trees.
+
+    The instance keeps one native evaluator, so repeated calls reuse its
+    compiled-expression cache instead of re-parsing ``path`` every time. The
+    evaluator is rebuilt if ``MAX_XPATH_NODE_VISITS`` changes between calls,
+    so raising the budget after constructing an ``XPath`` still takes effect.
+    """
 
     def __init__(self, path, namespaces=None, **kwargs):
         # No extra options (lxml's regexp/smart_strings/extensions) are
@@ -2415,16 +2411,19 @@ class XPath:
             raise TypeError("unexpected XPath keyword argument(s): %s" % names)
         self.path = path
         self._namespaces = namespaces
+        self._evaluator = None
+        self._evaluator_budget = None
 
     def __call__(self, element_or_tree, **variables):
         """Evaluate the expression against ``element_or_tree``."""
+        _reject_xpath_variables(variables)
         if isinstance(element_or_tree, _ElementTree):
-            element_or_tree = element_or_tree.getroot()
-        # Forward variables so unsupported variable binding raises rather than
-        # being silently dropped.
-        return element_or_tree.xpath(
-            self.path, namespaces=self._namespaces, **variables
-        )
+            element_or_tree = element_or_tree._require_root()
+        budget = MAX_XPATH_NODE_VISITS
+        if self._evaluator is None or self._evaluator_budget != budget:
+            self._evaluator = _make_xpath_evaluator(self._namespaces)
+            self._evaluator_budget = budget
+        return _evaluate_xpath(element_or_tree, self._evaluator, self.path)
 
 
 class ETXPath(XPath):

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 [2026-10-09]
 
 ### Added
 
@@ -11,6 +11,35 @@
   preserves inherited namespaces and subtree isolation, and does not mutate
   the source tree. These experimental APIs may change; established validation
   APIs retain their serialization-based behavior.
+
+### Changed
+
+- ``tostring()`` serializes straight to ``bytes`` in Rust for the default
+  ASCII output and for UTF-8 (``Node.to_xml_bytes_standalone``), writing
+  non-ASCII characters as decimal character references exactly as
+  ``str.encode("ascii", "xmlcharrefreplace")`` did, and splices inherited
+  namespace declarations into a sub-element's start tag natively
+  (``Node.to_xml_standalone``). The default-namespace copy decision
+  (``Node.has_bare_name_under_default_namespace``) is a native pointer walk
+  instead of a Python tree walk, and serialization reuses a per-thread buffer.
+  Whole-aggregate ``tostring`` of the 7 MB SWAMID fixture drops from ~151 ms to
+  ~37 ms on the laptop (lxml: ~37 ms); per-entity ``tostring`` from ~79 ms to
+  ~42 ms (lxml: ~42 ms). Output bytes are unchanged.
+- ``etree.XPath`` objects keep one native evaluator, so repeated calls hit
+  uppsala's compiled-expression cache (cheap expressions 6.7 us to 2.5 us per
+  call); the evaluator is rebuilt if ``MAX_XPATH_NODE_VISITS`` changes.
+  Together with uppsala's fused ``//`` evaluation (uppsala ADR 0020),
+  ``//md:EntityDescriptor/@entityID`` over the aggregate drops from ~23 ms to
+  ~5 ms (lxml: ~7 ms).
+- Build against uppsala 0.12.0 from crates.io (ADR 0019: DOM parsing no
+  longer goes through pull events, restoring the pre-0.9.0 parse speed; ADR
+  0020: fused ``//`` evaluation). Whole-aggregate parse of the 7 MB SWAMID
+  fixture is 25-35% faster than with 0.11.0 on the pyFF server.
+- Added ``just bench-lxml``, ``just bench-xpath``, and ``just bench-parallel``
+  recipes and ``benchmarks/xpath_pattern.py`` (compiled-XPath reuse versus
+  per-call compilation). ``benchmarks/etree_bench.py`` now raises the XPath
+  node-visit budget for the trusted aggregate so the ``xpath_ns`` row measures
+  instead of aborting.
 
 ### Fixed
 
