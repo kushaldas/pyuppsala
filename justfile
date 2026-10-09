@@ -28,6 +28,38 @@ wheel:
 docs:
     cd docs && make html
 
+# ─── Benchmarks (pyuppsala vs lxml; lxml is a dev-group dependency) ───
+#
+# The aggregate defaults to the pyFF test fixture in a sibling checkout
+# (../pyFF/src/pyff/test/data/metadata/swamid-2.0-test.xml). Pass another SAML
+# EntitiesDescriptor file as the first argument. The extension is rebuilt in
+# release mode first so the numbers never come from a stale debug build.
+
+# Per-operation pyFF-shaped comparison against lxml (ratio column = pyuppsala/lxml)
+bench-lxml aggregate="" budget="0.5" json="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv run maturin develop --release >&2
+    args=()
+    [[ -n "{{aggregate}}" ]] && args+=("{{aggregate}}")
+    [[ -n "{{json}}" ]] && args+=(--json "{{json}}")
+    cmd=(uv run python benchmarks/etree_bench.py "${args[@]}" --budget "{{budget}}")
+    if command -v taskset >/dev/null 2>&1; then
+        taskset -c 0 "${cmd[@]}"
+    else
+        "${cmd[@]}"
+    fi
+
+# Compiled-XPath reuse vs per-call compilation on the aggregate
+bench-xpath aggregate="":
+    uv run maturin develop --release >&2
+    uv run python benchmarks/xpath_pattern.py {{aggregate}}
+
+# Batch / parallel ingest (parse_many, fetch_many); add --fetch for the HTTP rows
+bench-parallel *args:
+    uv run maturin develop --release >&2
+    uv run python benchmarks/parallel_bench.py {{args}}
+
 # ─── Fuzzing (top-level fuzz/, Atheris + libFuzzer over the PyO3 extension) ───
 #
 # OSS-Fuzz-style layout: harnesses are fuzz/<name>_fuzzer.py. Atheris drives the

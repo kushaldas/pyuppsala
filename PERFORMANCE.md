@@ -265,3 +265,123 @@ and sign fragments.
 - uppsala XSD choice validation has a known gap (`uppsala/xsd_bug.md`) that blocks
   schema validation of some real-world metadata; unrelated to performance but caps what
   the pyFF benchmark exercises (validation is skipped there).
+
+---
+
+## 2026-10-08: built against uppsala 0.12.0 (ADR 0019 direct DOM construction)
+
+uppsala `c7117e6d` (0.9.0, 2026-07-05) had routed `Parser::parse` through the
+pull-event API, which doubled DOM parse time on node-dense inputs. uppsala
+ADR 0019 (2026-10-08, `main` after PR #54, version 0.12.0) restores direct arena
+construction from a shared tokenizer; 0.12.0 also carries the zero-alloc
+traversal, the `Mutex` + `Arc` XPath AST cache, vendored FxHash internal maps,
+and build profiles. The measurements below were taken against the 0.12.0
+working tree through a `[patch.crates-io] uppsala = { path = "../uppsala" }`
+override; since uppsala 0.12.0 was published (2026-10-09) `Cargo.toml` simply
+depends on `uppsala = "0.12.0"` from crates.io and the patch table is gone.
+One lesson from that interlude: a path patch is silently ignored
+(`[[patch.unused]]` in `Cargo.lock`) when the dependency requirement does not
+admit the path tree's version, so check the lockfile after adding one.
+
+Measured on the old pyFF server (4-vCPU AMD EPYC 7551 VM, Debian 13, CPython
+3.13.5, lxml 6.1.1, both builds installed in separate venvs from release wheels
+and run back to back twice, `taskset -c 2`, `--budget 1.0`) on the 7.1 MB
+swamid-2.0-test aggregate (1032 entities, 44,823 nodes). `before` is this tree
+at `58cf13b` against crates.io uppsala 0.11.0; `after` is the same tree against
+the 0.12.0 working tree. Two runs each; ratio = pyuppsala / lxml, lower is better.
+
+| Operation | before (ms) | after (ms) | lxml (ms) | ratio before | ratio after |
+|---|---:|---:|---:|---:|---:|
+| parse_aggregate | 57.4 / 46.9 | **36.5 / 40.0** | 77-86 | 0.61-0.66x | **0.46-0.51x** |
+| parse_entities | 46.4 / 53.5 | **35.9 / 33.7** | 85-92 | 0.50-0.63x | **0.39-0.40x** |
+| xpath_ns | 23.4 / 27.1 | **13.1 / 14.9** | 4.8-9.2 | 3.5-4.8x | **1.6-2.7x** |
+| xpath full-doc (`xpath_pattern.py`, compiled) | 22.2 | **13.9** | - | - | - |
+| iter_entitydescriptor | 4.4 / 6.8 | 8.6 / 6.5 | 3.6-5.9 | 1.2-1.5x | 1.5-1.8x (noise) |
+| with_tree | 61.3 / 61.4 | 70.5 / 65.1 | 53-63 | 1.0-1.2x | 1.2x (noise) |
+| tostring_whole | 120.7 / 126.0 | 120.1 / 116.8 | 28-35 | 3.4-3.8x | 4.0-4.3x |
+| tostring_per_entity | 74.2 / 65.9 | 70.1 / 67.0 | 32-36 | 1.8-2.3x | 1.9-2.1x |
+| build_aggregate | 85.7 / 94.8 | 89.2 / 108.8 | 73-98 | 1.0x | 1.1-1.2x (noise) |
+| xpath cheap (`string(@entityID)`, compiled) | 4.2 us | 4.5 us | - | - | - |
+
+Consistent deltas: parse ops −25…−35% (the ADR 0019 fix) and the namespaced
+full-document XPath −45% (uppsala-side traversal and node-set work). Everything
+else moves within this host's ±20% run-to-run swing (the lxml column wobbles
+by that much between runs with no change at all).
+
+Two things this round made visible, both independent of the uppsala bump,
+were fixed the same day in the second pass below: `tostring_whole` at
+3.4-4.3x lxml, and the compiled-`XPath` object being no faster than per-call
+compilation.
+
+Reproduce with `just bench-lxml <aggregate> 1.0` and `just bench-xpath <aggregate>`
+(both rebuild the extension in release mode first).
+
+---
+
+## 2026-10-08, second pass: serialization and XPath to lxml parity
+
+Profiled on the same aggregate with `perf` and per-stage timing scripts.
+Three findings, all fixed:
+
+1. **`tostring` spent 92 ms of its 151 ms in a Python tree walk.** When the
+   serialized text contains `xmlns=""` (the SWAMID aggregate legitimately has
+   two), `tostring` walked all 44,823 nodes in Python
+   (`_has_bare_name_under_default_namespace`) to decide whether a qualified
+   copy is needed, and answered no. The walk is now native
+   (`Node.has_bare_name_under_default_namespace`, a first-child/next-sibling
+   pointer walk with a scope stack only for elements that declare a default
+   namespace): 4.5 ms. The 7 MB `str` round trip (UTF-8 buffer -> Python
+   `str` -> `encode("ascii", "xmlcharrefreplace")`, ~22 ms) is gone too:
+   `Node.to_xml_bytes_standalone` writes ASCII bytes with decimal character
+   references (or raw UTF-8) straight from the Rust buffer, and the
+   inherited-namespace splice for sub-elements (`Node.to_xml_standalone`)
+   replaces the per-call `nsmap` + Python start-tag scan (25 ms over 1032
+   entities). Serialization also reuses a per-thread scratch buffer: a fresh
+   7 MB `String` per call was mmapped and page-faulted every time, which made
+   `tostring` 62 ms in a fresh process and 42 ms once the heap was warm. The
+   bytes produced are identical to before.
+2. **`//` in uppsala materialized every node, then re-tested every child with
+   a SipHash lookup per candidate.** `//md:EntityDescriptor/md:IDPSSODescriptor`
+   cost 23.7 ms in the evaluator and 0.3 ms in the binding; the benchmark's
+   `//md:EntityDescriptor/@entityID` row 22.8 ms. uppsala ADR 0020 fuses the
+   pair into one descendant walk that tests nodes in place and resolves the
+   namespace prefix once per step: 5.3 ms and 5.4 ms.
+3. **`XPath` objects built a fresh evaluator per call**, so uppsala's
+   compiled-expression cache never hit. Each `XPath` now keeps one evaluator
+   (rebuilt if `MAX_XPATH_NODE_VISITS` changes): the cheap
+   `string(@entityID)` call drops from 6.7 us to 2.5 us.
+
+Measured on the old pyFF server (same setup as above; candidate installed
+from a release wheel into its own venv, two runs, `taskset -c 2`,
+`--budget 1.0`). `before` is the first pass above (uppsala 0.12.0 tree, prior
+to this work); `after` is this tree. Ratio = pyuppsala / lxml, lower is better.
+
+| Operation | before (ms) | after (ms) | lxml (ms) | ratio before | ratio after |
+|---|---:|---:|---:|---:|---:|
+| tostring_whole | 120.1 / 116.8 | **35.1 / 33.0** | 34-40 | 4.0-4.3x | **0.8-1.0x** |
+| tostring_per_entity | 70.1 / 67.0 | **32.7 / 37.2** | 33-36 | 1.9-2.1x | **1.0x** |
+| xpath_ns | 13.1 / 14.9 | **4.5 / 3.8** | 5.1-6.4 | 1.6-2.7x | **0.7x** |
+| xpath full-doc (`xpath_pattern.py`, compiled) | 13.9 | **3.8** | - | - | - |
+| xpath cheap (`string(@entityID)`, compiled / oneshot) | 4.5 / 4.7 us | **2.1 / 5.1 us** | - | - | - |
+| parse_aggregate | 36.5 / 40.0 | 36.8 / 42.9 | 75-87 | 0.46-0.51x | 0.49x |
+| parse_entities | 35.9 / 33.7 | 37.8 / 40.0 | 84-92 | 0.39-0.40x | 0.43-0.45x |
+| with_tree | 70.5 / 65.1 | 63.1 / 63.3 | 51-65 | 1.2x | 1.0-1.2x |
+| iter_entitydescriptor | 8.6 / 6.5 | 4.6 / 4.6 | 3.8-4.2 | 1.5-1.8x | 1.1-1.2x |
+| build_aggregate | 89.2 / 108.8 | 112.5 / 119.4 | 69-82 | 1.1-1.2x | 1.4-1.7x (noise: untouched path, laptop 117.6 -> 109.2) |
+| nsmap_per_entity | 1.14 / 1.11 | 0.96 / 1.28 | 0.7-0.9 | 1.4-1.7x | 1.3-1.4x |
+
+Laptop (Intel Core Ultra 7 155H, `just bench-lxml "" 1.0`): tostring_whole
+151 -> 37.2 ms (lxml 37-49), tostring_per_entity 79 -> 42.4 ms (lxml 42.1),
+xpath_ns 22.8 -> 5.4 ms (lxml 6.9); parse and traversal rows unchanged.
+
+What remains above lxml is the per-proxy structural floor PERFORMANCE.md
+already describes (`with_tree`, `has_tag_per_entity`, `nsmap_per_entity`,
+`findall_predicate` at 1.0-1.5x, all FFI-call bound) and `build_aggregate`
+(cross-document import, 1.1-1.4x). The serializer itself is now within a few
+percent of libxml2's; its remaining cost is per-element name validation and
+namespace planning (`uppsala/docs/performance.md`, third pass).
+
+Tests: `uv run pytest tests/` (551, including the new
+`tests/test_native_serialization.py` byte-for-byte checks against lxml) and,
+in `../uppsala`, `cargo test` (all suites) plus clippy and rustdoc clean.
+

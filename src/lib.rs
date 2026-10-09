@@ -2,9 +2,10 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict, PyString};
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use uppsala::dom::{Attribute as UAttribute, NodeId, NodeKind, QName as UQName, XmlWriteOptions};
@@ -1440,6 +1441,159 @@ impl Node {
             Ok::<_, String>(guard.doc().node_to_xml_with_options(id, &opts))
         })
         .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Serialize this node like `to_xml_with_options`, then add to its start
+    /// tag the in-scope namespace declarations it inherits from ancestors but
+    /// does not declare itself, so a serialized sub-element re-parses on its
+    /// own (lxml keeps in-scope declarations on the serialization root). A
+    /// document root, a node without an element ancestor, and a non-element
+    /// serialize unchanged. One lock, GIL released; replaces the etree layer's
+    /// per-call `nsmap` + Python start-tag scan + string splice.
+    #[pyo3(signature = (indent=None, expand_empty_elements=false))]
+    fn to_xml_standalone<'py>(
+        &self,
+        py: Python<'py>,
+        indent: Option<&str>,
+        expand_empty_elements: bool,
+    ) -> PyResult<Bound<'py, PyString>> {
+        let opts = make_write_options(indent, expand_empty_elements, false);
+        // Serialize with the GIL released, then (GIL re-acquired) copy the
+        // scratch buffer into the Python object. The buffer is thread-local,
+        // so the two phases see the same bytes without holding a borrow across
+        // the detach boundary.
+        self.serialize_standalone_into_scratch(py, &opts)?;
+        Ok(SERIALIZE_SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let s = PyString::new(py, &buf);
+            release_scratch(&mut buf);
+            s
+        }))
+    }
+
+    /// `to_xml_standalone` delivered as `bytes`: UTF-8 when `ascii` is false,
+    /// otherwise ASCII with every non-ASCII character written as a decimal
+    /// character reference (`&#8364;`), which is what Python's
+    /// `str.encode("ascii", "xmlcharrefreplace")` produces. The etree layer's
+    /// default `tostring()` returns ASCII bytes, so this skips building a
+    /// multi-megabyte Python `str` from the UTF-8 buffer only to encode it
+    /// straight back; the bytes object is filled from the Rust buffer.
+    #[pyo3(signature = (indent=None, expand_empty_elements=false, ascii=true))]
+    fn to_xml_bytes_standalone<'py>(
+        &self,
+        py: Python<'py>,
+        indent: Option<&str>,
+        expand_empty_elements: bool,
+        ascii: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let opts = make_write_options(indent, expand_empty_elements, false);
+        self.serialize_standalone_into_scratch(py, &opts)?;
+        Ok(SERIALIZE_SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            // UTF-8 output, or ASCII output of an already-ASCII document, is
+            // the buffer itself. Only a non-ASCII document on the ASCII path
+            // needs the character-reference rewrite into the second buffer.
+            let out = if !ascii || buf.is_ascii() {
+                PyBytes::new(py, buf.as_bytes())
+            } else {
+                SERIALIZE_SCRATCH_BYTES.with(|bcell| {
+                    let mut bytes = bcell.borrow_mut();
+                    bytes.clear();
+                    charref_non_ascii(&buf, &mut bytes);
+                    let out = PyBytes::new(py, &bytes);
+                    if bytes.capacity() > SERIALIZE_SCRATCH_KEEP {
+                        *bytes = Vec::new();
+                    }
+                    out
+                })
+            };
+            release_scratch(&mut buf);
+            out
+        }))
+    }
+
+    /// Does any element in this subtree carry a bare name (no prefix and no
+    /// namespace) while a non-empty default namespace is in effect, counting
+    /// `inherited_default` as the default namespace in scope at this node?
+    /// The etree layer uses this to decide whether lexical default-namespace
+    /// serialization needs a qualified copy; a native walk because the check
+    /// runs on every `tostring` whose output contains `xmlns=""`.
+    #[pyo3(signature = (inherited_default=None))]
+    fn has_bare_name_under_default_namespace(
+        &self,
+        inherited_default: Option<&str>,
+    ) -> PyResult<bool> {
+        let guard = self
+            .doc
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let doc = guard.doc();
+        let root = self.id;
+        // Pre-order pointer walk (first-child / next-sibling / parent), so the
+        // common case allocates nothing. `scope` records only the elements
+        // that declare a default namespace, with the default in effect above
+        // them, and is unwound as the walk climbs back past them.
+        let mut scope: Vec<(NodeId, Option<&str>)> = Vec::new();
+        let mut default_ns = inherited_default;
+        let mut cur = root;
+        loop {
+            let mut has_children = false;
+            if let Some(el) = doc.element(cur) {
+                // The element's own `xmlns` (empty prefix) declaration, if any:
+                // `Some(None)` for `xmlns=""`, which *stops* qualification below
+                // this point, `Some(Some(uri))` for a real default, `None` when
+                // the element declares no default and inherits the current one.
+                let mut declared: Option<Option<&str>> = None;
+                for (prefix, uri) in &el.namespace_declarations {
+                    if prefix.is_empty() {
+                        declared = Some(if uri.is_empty() { None } else { Some(uri) });
+                    }
+                }
+                if let Some(d) = declared {
+                    scope.push((cur, default_ns));
+                    default_ns = d;
+                }
+                // A bare name is one the parser left unqualified: no prefix and
+                // no namespace. Under a non-empty default it would serialize as
+                // if it were in that namespace, which is what the caller must
+                // avoid by qualifying a copy.
+                if default_ns.is_some()
+                    && el.name.prefix.is_none()
+                    && el.name.namespace_uri.is_none()
+                {
+                    return Ok(true);
+                }
+                if let Some(c) = doc.first_child(cur) {
+                    cur = c;
+                    has_children = true;
+                }
+            }
+            // Non-elements (text, comments, PIs) have no children and no
+            // declarations; they just fall through to the sibling/climb step.
+            if has_children {
+                continue;
+            }
+            // Leave `cur`, then move to its next sibling or climb.
+            loop {
+                if cur == root {
+                    return Ok(false);
+                }
+                if let Some(&(id, saved)) = scope.last() {
+                    if id == cur {
+                        default_ns = saved;
+                        scope.pop();
+                    }
+                }
+                if let Some(s) = doc.next_sibling(cur) {
+                    cur = s;
+                    break;
+                }
+                match doc.parent(cur) {
+                    Some(p) => cur = p,
+                    None => return Ok(false),
+                }
+            }
+        }
     }
 
     /// Find descendant elements by local tag name.
@@ -6112,6 +6266,228 @@ fn decode_utf16_raw(bytes: &[u8], big_endian: bool) -> Result<String, String> {
         })
         .collect();
     String::from_utf16(&code_units).map_err(|e| format!("1:1: Invalid UTF-16 {}: {}", endian, e))
+}
+
+thread_local! {
+    /// Reused serialization buffer. A fresh multi-megabyte `String` per
+    /// `tostring` is mapped and page-faulted anew on every call (the kernel
+    /// showed up at ~9% of whole-document serialization); keeping the
+    /// capacity on the thread turns that into plain writes. The GIL-released
+    /// serializer never re-enters Python, so the borrow is never contended.
+    static SERIALIZE_SCRATCH: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Companion buffer for the ASCII character-reference rewrite.
+    static SERIALIZE_SCRATCH_BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Scratch capacity above which the buffer is dropped after use, so one huge
+/// document does not pin memory for the thread's lifetime.
+const SERIALIZE_SCRATCH_KEEP: usize = 64 << 20;
+
+/// Give the scratch buffer back after use: keep its capacity for the next
+/// call unless it grew past `SERIALIZE_SCRATCH_KEEP`, in which case drop it so
+/// the memory returns to the allocator. The contents are not cleared here;
+/// every producer clears before writing.
+fn release_scratch(buf: &mut String) {
+    if buf.capacity() > SERIALIZE_SCRATCH_KEEP {
+        *buf = String::new();
+    }
+}
+
+impl Node {
+    /// Serialize this node with inherited namespace declarations spliced in
+    /// (see `to_xml_standalone`) into the thread's scratch buffer, with the
+    /// GIL released and the document locked only for the serialization.
+    fn serialize_standalone_into_scratch(
+        &self,
+        py: Python<'_>,
+        opts: &XmlWriteOptions,
+    ) -> PyResult<()> {
+        let shared = Arc::clone(&self.doc);
+        let id = self.id;
+        py.detach(|| {
+            let guard = shared.lock().map_err(|e| e.to_string())?;
+            SERIALIZE_SCRATCH.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.clear();
+                serialize_standalone_into(guard.doc(), id, opts, &mut buf);
+            });
+            Ok::<_, String>(())
+        })
+        .map_err(PyRuntimeError::new_err)
+    }
+}
+
+/// Length of the leading run of ASCII bytes, eight bytes per step.
+///
+/// A byte is ASCII exactly when its high bit is clear, so a word-wide AND
+/// against the high-bit mask tests eight bytes at once; the tail (and the
+/// word containing the first non-ASCII byte) is finished byte by byte. A
+/// per-byte `position` scan here was 11% of the whole bytes path.
+fn ascii_run_len(bytes: &[u8]) -> usize {
+    let mut i = 0usize;
+    while i + 8 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        if word & 0x8080_8080_8080_8080 != 0 {
+            break;
+        }
+        i += 8;
+    }
+    while i < bytes.len() && bytes[i] < 0x80 {
+        i += 1;
+    }
+    i
+}
+
+/// Append `text` to `out` with every non-ASCII character replaced by its
+/// decimal character reference (`&#233;`), byte-identical to Python's
+/// `str.encode("ascii", "xmlcharrefreplace")`. ASCII runs are copied in
+/// bulk; only the non-ASCII characters are decoded. Characters escaped by the
+/// serializer itself (`&amp;`, `&lt;`, ...) are already ASCII and pass through.
+fn charref_non_ascii(text: &str, out: &mut Vec<u8>) {
+    let bytes = text.as_bytes();
+    out.reserve(bytes.len() + bytes.len() / 8);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let run = ascii_run_len(&bytes[i..]);
+        out.extend_from_slice(&bytes[i..i + run]);
+        i += run;
+        if i >= bytes.len() {
+            break;
+        }
+        // `text` is valid UTF-8, so a byte >= 0x80 starts a whole char.
+        let ch = text[i..].chars().next().unwrap();
+        out.extend_from_slice(b"&#");
+        out.extend_from_slice((ch as u32).to_string().as_bytes());
+        out.push(b';');
+        i += ch.len_utf8();
+    }
+}
+
+/// Serialize `id` with `opts` into `text` and splice into its start tag the
+/// namespace declarations it inherits but does not declare (see
+/// `Node::to_xml_standalone`). `text` must be empty on entry.
+fn serialize_standalone_into(
+    doc: &UDocument<'_>,
+    id: NodeId,
+    opts: &XmlWriteOptions,
+    text: &mut String,
+) {
+    text.reserve(doc.node_serialized_size_hint(id));
+    doc.write_node_to_with_options(id, text, opts)
+        .expect("writing to a String cannot fail");
+    let missing = inherited_namespace_declarations(doc, id);
+    if !missing.is_empty() {
+        if let Some(at) = open_tag_end(text) {
+            let mut decls = String::new();
+            for (prefix, uri) in missing {
+                decls.push_str(" xmlns");
+                if !prefix.is_empty() {
+                    decls.push(':');
+                    decls.push_str(prefix);
+                }
+                decls.push_str("=\"");
+                push_escaped_attr_value(&mut decls, uri);
+                decls.push('"');
+            }
+            text.insert_str(at, &decls);
+        }
+    }
+}
+
+/// In-scope `(prefix, uri)` declarations `id` inherits from its element
+/// ancestors and does not redeclare itself, outermost first with inner
+/// bindings overriding outer ones in place (the order `dict(nsmap)` gives).
+/// The empty prefix is the default namespace. Empty for a document root.
+fn inherited_namespace_declarations<'d>(
+    doc: &'d UDocument<'_>,
+    id: NodeId,
+) -> Vec<(&'d str, &'d str)> {
+    let own = match doc.element(id) {
+        Some(el) => el,
+        None => return Vec::new(),
+    };
+    let mut chain: Vec<NodeId> = Vec::new();
+    let mut cur = doc.parent(id);
+    while let Some(aid) = cur {
+        if doc.element(aid).is_none() {
+            break;
+        }
+        chain.push(aid);
+        cur = doc.parent(aid);
+    }
+    if chain.is_empty() {
+        return Vec::new();
+    }
+    // Outermost ancestor first; an inner redeclaration of the same prefix
+    // overwrites the URI in place so the first-seen position is kept. That is
+    // the order `dict(element.nsmap)` produces, which the previous Python
+    // implementation emitted, so serialized output is unchanged. A linear
+    // scan is fine: real documents declare a handful of prefixes.
+    let mut scope: Vec<(&str, &str)> = Vec::new();
+    for &aid in chain.iter().rev() {
+        if let Some(el) = doc.element(aid) {
+            for (p, u) in &el.namespace_declarations {
+                match scope.iter_mut().find(|(sp, _)| *sp == p.as_ref()) {
+                    Some(slot) => slot.1 = u,
+                    None => scope.push((p, u)),
+                }
+            }
+        }
+    }
+    // Anything the element declares itself is already in its start tag.
+    scope.retain(|(p, _)| !own.namespace_declarations.iter().any(|(op, _)| op == p));
+    scope
+}
+
+/// Byte offset of the `>` (or of the `/` in `/>`) that closes the first start
+/// tag in serialized XML, skipping quoted attribute values; `None` when the
+/// text does not begin with a tag (a text or comment node, say).
+///
+/// Scanning bytes rather than chars is sound because `>`, `/` and both quote
+/// characters are ASCII and never appear inside a UTF-8 continuation
+/// sequence; the returned offset is therefore always a char boundary, as
+/// `String::insert_str` requires. The serializer escapes `>` and quotes
+/// inside attribute values, so the first unquoted `>` is the tag's end.
+fn open_tag_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'>' => {
+                    return Some(if i > 0 && bytes[i - 1] == b'/' {
+                        i - 1
+                    } else {
+                        i
+                    })
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// Append `value` escaped for a double-quoted attribute value, matching the
+/// etree layer's `_escape_xml_attr_value` table.
+fn push_escaped_attr_value(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            c => out.push(c),
+        }
+    }
 }
 
 fn make_write_options(
