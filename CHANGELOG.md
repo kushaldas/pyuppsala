@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.13.0 [2026-10-12]
+
+### Changed
+
+- ``etree.XMLSchema.validate()``, ``assertValid()``, ``assert_()`` and
+  ``__call__`` now validate the DOM natively through
+  ``XsdValidator.validate_node()`` (no serialization and reparse, GIL
+  released, subtree isolation and inherited namespaces preserved). The
+  serialized path remains available as ``validate_serialized()`` and is used
+  automatically for validator objects that only expose ``validate_str``.
+  ``experimental_validate`` / ``experimental_assertValid`` /
+  ``experimental_validate_node`` are kept as aliases.
+- Cross-document ``append``/``extend``/``insert`` and ``copy.deepcopy`` now
+  redeclare inherited namespaces natively inside ``Document.import_subtree``
+  (``inherit_ns=True``) instead of a Python ancestor loop issuing one native
+  call per declaration. Output is byte-identical.
+
+### Added
+
+- ``Document.to_xml_bytes_with_options()`` returns the serialized document as
+  UTF-8 ``bytes`` with a single copy out of the native buffer.
+- ``Document._prepend_fragment_xml(xml)`` inserts a parsed element fragment
+  as the first child of the document element without touching the rest of
+  the tree; sibling extensions (pybergshamra) use it to splice in a computed
+  ``<ds:Signature>`` instead of replacing the whole document.
+- ``_Element.fast_collect_text(tag)`` collects the stripped leading text of
+  matching descendants in one native pass.
+
 ## 0.12.0 [2026-10-09]
 
 ### Added

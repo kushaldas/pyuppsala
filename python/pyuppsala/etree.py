@@ -544,8 +544,8 @@ def _standalone_clone(el):
 def _copy_to_holder(el, dst):
     """Copy ``el`` as a detached subtree into ``dst`` and return its proxy."""
     snode = el._node
-    dnode = _clone_node(dst, snode)
-    _copy_inherited_ns(dst, snode, dnode)
+    # Native clone + inherited-namespace redeclaration in one pass.
+    dnode = dst.doc.import_subtree(snode, inherit_ns=True)
     return dst.proxy(dnode)
 
 
@@ -1136,10 +1136,11 @@ class _Element(_u._ElementBase):
         dst = self._holder
         snode = src_el._node
         stail = _following_text_run(snode)
-        new_node = _clone_node(dst, snode)
-        # Carry over namespaces inherited from ancestors outside the moved
-        # subtree so prefixed/defaulted names stay declared in the destination.
-        _copy_inherited_ns(dst, snode, new_node)
+        # Native clone that also carries over namespaces inherited from
+        # ancestors outside the moved subtree, so prefixed/defaulted names stay
+        # declared in the destination (formerly a Python ancestor loop making
+        # one FFI call per declaration, the top cost of pyFF's aggregation).
+        new_node = dst.doc.import_subtree(snode, inherit_ns=True)
         new_tail = [_clone_node(dst, text_node) for text_node in stail]
         _repoint_subtree(sh, dst, snode, new_node)
         if snode.parent is not None:
@@ -2518,31 +2519,43 @@ class XMLSchema:
         self.error_log = []
 
     def validate(self, tree):
-        """Return True if ``tree`` is valid; record failures in ``error_log``."""
+        """Return True if ``tree`` is valid; record failures in ``error_log``.
+
+        Validates the DOM natively (no serialization and reparse), preserving
+        subtree isolation and inherited namespaces, with the GIL released.
+        A validator object without native node validation (for example a
+        test double exposing only ``validate_str``) falls back to the
+        serialized path.
+        """
+        root = tree.getroot() if isinstance(tree, _ElementTree) else tree
+        if root is None:
+            raise AssertionError("ElementTree not initialized, missing root")
+        validate_node = getattr(self._validator, "validate_node", None)
+        if validate_node is None:
+            xml = tostring(root, encoding="unicode")
+            self.error_log = self._validator.validate_str(xml)
+        else:
+            self.error_log = validate_node(root._node)
+        return len(self.error_log) == 0
+
+    def validate_serialized(self, tree):
+        """Validate through XML serialization and reparse (the pre-0.13 path).
+
+        Kept for callers that want to validate exactly what ``tostring`` would
+        emit; ``validate`` is the native, faster equivalent.
+        """
         root = tree.getroot() if isinstance(tree, _ElementTree) else tree
         xml = tostring(root, encoding="unicode")
         self.error_log = self._validator.validate_str(xml)
         return len(self.error_log) == 0
 
     def experimental_validate(self, tree):
-        """Experimental native DOM validation; the API may change.
-
-        Preserves subtree isolation and inherited namespaces without serializing
-        and reparsing XML. Records failures in ``error_log`` like ``validate``.
-        """
-        root = tree.getroot() if isinstance(tree, _ElementTree) else tree
-        if root is None:
-            raise AssertionError("ElementTree not initialized, missing root")
-        self.error_log = self._validator.experimental_validate_node(root._node)
-        return len(self.error_log) == 0
+        """Alias of :meth:`validate`, kept from the 0.12 opt-in API."""
+        return self.validate(tree)
 
     def experimental_assertValid(self, tree):
-        """Experimental native validation raising ``DocumentInvalid`` on failure."""
-        if not self.experimental_validate(tree):
-            messages = "; ".join(e.message for e in self.error_log)
-            exc = DocumentInvalid(messages or "Document does not validate")
-            exc.error_log = self.error_log
-            raise exc
+        """Alias of :meth:`assertValid`, kept from the 0.12 opt-in API."""
+        return self.assertValid(tree)
 
     def assertValid(self, tree):
         """Raise :class:`DocumentInvalid` if ``tree`` does not validate.

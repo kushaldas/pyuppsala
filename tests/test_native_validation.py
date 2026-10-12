@@ -106,25 +106,40 @@ def test_document_root_validation_observes_mutation():
 
 
 
-def test_standard_validation_does_not_use_experimental_api():
-    """Keep all three stable validation entry points on the serialized API."""
+def test_standard_validation_uses_native_node_validation():
+    """All stable entry points validate the DOM natively; serialized is a fallback."""
     schema = E.XMLSchema(E.fromstring(SCHEMA))
     calls = []
 
-    class StableValidator:
-        """Expose only the stable method so experimental dispatch would fail."""
-
-        def validate_str(self, xml):
-            """Record serialized inputs and report successful validation."""
-            calls.append(xml)
+    class NativeValidator:
+        def validate_node(self, node):
+            calls.append(('node', node.kind))
             return []
 
-    schema._validator = StableValidator()
+        def validate_str(self, xml):  # must not be used when validate_node exists
+            calls.append(('str', xml))
+            return []
+
+    schema._validator = NativeValidator()
     node = E.fromstring('<number>42</number>')
     assert schema.validate(node)
     schema.assertValid(node)
     assert schema(node)
-    assert calls == ['<number>42</number>'] * 3
+    assert schema.experimental_validate(node)
+    assert calls == [('node', 'element')] * 4
+
+    class SerializedOnlyValidator:
+        """A validator exposing only validate_str falls back to serialization."""
+
+        def validate_str(self, xml):
+            calls.append(xml)
+            return []
+
+    calls.clear()
+    schema._validator = SerializedOnlyValidator()
+    assert schema.validate(node)
+    assert schema.validate_serialized(node)
+    assert calls == ['<number>42</number>'] * 2
 
 
 @pytest.mark.parametrize('subtree', [False, True])
@@ -158,3 +173,23 @@ def test_native_validation_empty_tree_reports_missing_root(method):
     schema = E.XMLSchema(E.fromstring(SCHEMA))
     with pytest.raises(AssertionError, match='ElementTree not initialized, missing root'):
         getattr(schema, method)(E.ElementTree())
+
+
+def test_validate_matches_serialized_on_subtrees_with_inherited_namespaces():
+    """Native (default) and serialized validation agree on a namespaced subtree."""
+    schema_xml = (
+        '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" '
+        'targetNamespace="urn:t" xmlns:t="urn:t" elementFormDefault="qualified">'
+        '<xs:element name="item"><xs:complexType><xs:sequence>'
+        '<xs:element name="n" type="xs:integer"/>'
+        '</xs:sequence></xs:complexType></xs:element></xs:schema>'
+    )
+    schema = E.XMLSchema(E.fromstring(schema_xml))
+    doc = E.fromstring('<t:root xmlns:t="urn:t"><t:item><t:n>1</t:n></t:item><t:item><t:n>x</t:n></t:item></t:root>')
+    good, bad = doc[0], doc[1]
+    assert schema.validate(good) and schema.validate_serialized(good)
+    assert not schema.validate(bad)
+    native_errors = [e.message for e in schema.error_log]
+    assert not schema.validate_serialized(bad)
+    serialized_errors = [e.message for e in schema.error_log]
+    assert native_errors == serialized_errors

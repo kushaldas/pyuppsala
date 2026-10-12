@@ -123,17 +123,19 @@ print(validator.is_valid_str("<greeting><bad/></greeting>"))  # False
 ```
 
 For an existing DOM, `validator.validate(doc)` avoids reparsing XML.
-The experimental `validator.experimental_validate_node(node)` validates a
-selected element independently: it reads document roots directly when no
-namespace adjustment is needed and otherwise copies the selected subtree in
-Rust. Copies preserve inherited namespace bindings and apply effective default
-namespaces to bare element names, matching etree serialization without mutating
-the source. Empty etree trees raise the same missing-root assertion as `validate()`. It returns validation errors and releases the GIL.
+`validator.validate_node(node)` validates a selected element independently
+without serializing: it reads document roots directly when no namespace
+adjustment is needed and otherwise copies the selected subtree in Rust. Copies
+preserve inherited namespace bindings and apply effective default namespaces to
+bare element names, matching etree serialization without mutating the source.
+It returns validation errors and releases the GIL.
 
-The etree equivalents are `schema.experimental_validate(tree)` and
-`schema.experimental_assertValid(tree)`. These APIs are opt-in and may change.
-The established `validate()`, `assertValid()` and callable schema APIs retain
-their serialization-based validation path.
+The etree `schema.validate(tree)`, `schema.assertValid(tree)`, `schema.assert_`
+and callable schema APIs use this native path; `schema.validate_serialized(tree)`
+keeps the serialize-and-reparse behaviour for callers that want to validate
+exactly what `tostring` would emit. The 0.12 opt-in names
+(`experimental_validate_node`, `experimental_validate`,
+`experimental_assertValid`) remain as aliases.
 
 ### Mutate the DOM
 
