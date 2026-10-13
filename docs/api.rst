@@ -527,11 +527,21 @@ Document
          doc.append_child(root, b)
          print(doc.to_xml())  # "<root><a/><b/></root>"
 
-   .. method:: import_subtree(source: Node) -> Node
+   .. method:: import_subtree(source: Node, inherit_ns: bool = False) -> Node
 
       Deep-copy *source* from a different :class:`Document` into this document
       and return the new, detached node. Use this when you intentionally need a
       cross-document copy; same-document mutators reject foreign node handles.
+
+      The element's own ``xmlns`` declarations are always copied. With the
+      default ``inherit_ns=False``, bindings the subtree inherits from ancestors
+      *outside* it (a prefix or default namespace declared further up the
+      source tree) are not redeclared, so re-binding them in the destination is
+      the caller's responsibility. With ``inherit_ns=True`` every in-scope
+      binding the source inherits but does not declare itself is redeclared on
+      the clone, nearest ancestor winning, so the copy serializes standalone
+      exactly as the original did in context. The etree layer's cross-document
+      ``append``/``extend`` and ``copy.deepcopy`` use this mode.
 
       :raises ValueError: If *source* already belongs to this document, is a
           document root, or is an attribute node.
@@ -543,6 +553,12 @@ Document
          clone = dst.import_subtree(src.document_element.children[0])
          dst.append_child(dst.document_element, clone)
          print(dst.to_xml())  # "<root><item/></root>"
+
+         src = Document('<p:items xmlns:p="urn:p"><p:item/></p:items>')
+         item = src.document_element.children[0]
+         dst = Document("<root/>")
+         dst.append_child(dst.document_element, dst.import_subtree(item, inherit_ns=True))
+         print(dst.to_xml())  # '<root><p:item xmlns:p="urn:p"/></root>'
 
    .. method:: insert_before(parent: Node, new_child: Node, reference: Node) -> None
 
@@ -681,6 +697,19 @@ Document
          # Expand empty elements (useful for HTML compatibility)
          print(doc.to_xml_with_options(expand_empty_elements=True))
          # "<root><a></a><b>text</b></root>"
+
+   .. method:: to_xml_bytes_with_options(indent=None, expand_empty_elements=False, include_doctype=False) -> bytes
+
+      Same output and parameters as :meth:`to_xml_with_options`, returned as
+      UTF-8 ``bytes`` with a single copy out of the native serializer. Prefer it
+      when the result is handed to another native consumer (for example
+      pybergshamra's document APIs) or written out as bytes, so a multi-megabyte
+      document is not decoded into a Python ``str`` only to be re-encoded.
+
+      .. code-block:: python
+
+         doc = Document("<root><a/></root>")
+         assert doc.to_xml_bytes_with_options() == doc.to_xml().encode("utf-8")
 
    .. method:: write_to_file(path: str) -> None
 
@@ -1463,6 +1492,26 @@ XsdValidator
          doc = Document("<name>Alice</name>")
          errors = validator.validate(doc)
          print(len(errors))  # 0
+
+   .. method:: validate_node(node: Node) -> list[ValidationError]
+
+      Validate one element and its subtree in place, without serializing and
+      reparsing. A document root needing no namespace adjustment is read
+      directly; any other element is copied into a temporary native document
+      so identity constraints cannot see its siblings, with inherited
+      namespace bindings and effective default namespaces preserved. The
+      source is never mutated and the GIL is released. This is the path behind
+      :meth:`pyuppsala.etree.XMLSchema.validate`;
+      ``experimental_validate_node`` remains as an alias.
+
+      :raises RuntimeError: If *node* is not an element.
+
+      .. code-block:: python
+
+         doc = Document("<people><name>Alice</name><name/></people>")
+         names = doc.document_element.children
+         assert validator.validate_node(names[0]) == []
+         assert validator.validate_node(names[1]) == []  # xs:string allows empty
 
    .. method:: validate_str(xml: str) -> list[ValidationError]
 
