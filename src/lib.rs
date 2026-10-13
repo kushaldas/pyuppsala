@@ -2311,9 +2311,11 @@ impl ElementBase {
         .map_err(PyRuntimeError::new_err)
     }
 
-    /// Collect the stripped leading text of every matching descendant without
-    /// materialising each element as a Python proxy (the `.text` of each
-    /// `iter(tag)` match, skipping elements with no leading text).
+    /// Collect the stripped `.text` of every `iter(tag)` match without
+    /// materialising a Python proxy per node: an element's leading text run, a
+    /// comment's content, or a processing instruction's data (so `tag=None`
+    /// covers comments and PIs like `Element.iter()` does). Matches with no
+    /// text are skipped.
     #[pyo3(signature = (tag=None))]
     fn fast_collect_text(
         &self,
@@ -3071,8 +3073,8 @@ fn matching_attr_value<'a>(
 
 /// Namespace declarations `id` inherits from ancestor elements but does not
 /// declare itself, nearest ancestor first, one entry per prefix (empty prefix
-/// is the default namespace). This is the order the etree layer's former
-/// Python `_copy_inherited_ns` produced, so cross-document clones serialize
+/// is the default namespace). This is the order the etree layer's
+/// former Python ancestor loop produced, so cross-document clones serialize
 /// byte-identically to before (`inherited_namespace_declarations` below keeps
 /// the outermost-first `nsmap` order used by standalone serialization).
 fn inherited_declarations_nearest_first(doc: &UDocument<'_>, id: NodeId) -> Vec<(String, String)> {
@@ -3103,11 +3105,20 @@ fn inherited_declarations_nearest_first(doc: &UDocument<'_>, id: NodeId) -> Vec<
     out
 }
 
+/// The `.text` of every `iter(tag)` match, selected by node kind: an element's
+/// leading text run, a comment's content, a processing instruction's data.
+/// Matches without text are skipped.
 fn collect_text_detached(doc: &UDocument<'_>, start: NodeId, filter: &DescFilter) -> Vec<String> {
     let mut stack = vec![start];
     let mut values = Vec::new();
     while let Some(id) = advance_desc_walk(doc, &mut stack, filter) {
-        if let Some(text) = leading_text_run_detached(doc, id) {
+        let text = match doc.node_kind(id) {
+            Some(NodeKind::Element(_)) => leading_text_run_detached(doc, id),
+            Some(NodeKind::Comment(text)) => Some(text.to_string()),
+            Some(NodeKind::ProcessingInstruction(pi)) => pi.data.as_ref().map(|d| d.to_string()),
+            _ => None,
+        };
+        if let Some(text) = text {
             values.push(text.trim().to_string());
         }
     }
@@ -4494,8 +4505,13 @@ impl Document {
     /// etree layer must clone rather than reparent. This does the entire subtree
     /// copy in one native pass (uppsala `Document::import_subtree`) instead of one
     /// FFI call per node, which was the dominant cost of pyFF's aggregation step.
-    /// The element's own namespace declarations are copied; namespaces inherited
-    /// from ancestors outside the subtree remain the caller's responsibility.
+    /// The element's own namespace declarations are always copied. With
+    /// ``inherit_ns=False`` (the default) namespaces inherited from ancestors
+    /// outside the subtree are not redeclared and remain the caller's
+    /// responsibility; with ``inherit_ns=True`` every in-scope binding the
+    /// source inherits but does not declare itself is redeclared on the clone
+    /// (nearest ancestor wins), which is what cross-document ``append`` and
+    /// ``deepcopy`` in the etree layer use.
     ///
     /// Locks both documents, in a fixed global order (by `Arc` address) so
     /// concurrent imports in opposite directions cannot deadlock. The source

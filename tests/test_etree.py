@@ -2228,6 +2228,12 @@ def test_fast_collect_text_matches_iter_text():
     expected = [e.text.strip() for e in root.iter(tag) if e.text is not None]
     assert root.fast_collect_text(tag) == expected == ["a", "b", "c"]
     assert root.fast_collect_text("{urn:m}missing") == []
+    # tag=None follows Element.iter(): comments and processing instructions
+    # contribute their .text too, elements without leading text are skipped.
+    mixed = P.fromstring('<r><!-- note --><?pi some data?><e>t</e><f/><?empty?></r>')
+    expected_all = [n.text.strip() for n in mixed.iter() if n.text is not None and n.text.strip()]
+    assert mixed.fast_collect_text() == expected_all
+    assert "note" in expected_all and "some data" in expected_all and "t" in expected_all
 
 
 def test_cross_document_append_keeps_inherited_namespaces_natively():

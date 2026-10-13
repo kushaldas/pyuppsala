@@ -254,7 +254,7 @@ over a large subtree:
      - Gather one attribute from matching elements.
      - You need sibling context, element text, or custom predicates.
    * - ``fast_collect_text(tag=None)``
-     - Gather the stripped leading text of matching elements that have text.
+     - Gather the stripped ``.text`` of matching nodes that have text (element leading text, comment content, PI data).
      - You need tails, mixed content, or the full recursive string value.
    * - ``fast_collect_grouped_text(group_tag, item_tag, key, value_tag)``
      - Extract fixed nested groups such as SAML EntityAttributes.

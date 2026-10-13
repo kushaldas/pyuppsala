@@ -530,7 +530,9 @@ def _clone_node(dst, snode):
     the top cost of pyFF's aggregation step once traversal went native (see
     pyFF/performance.md); doing the whole copy natively removes that per-node
     Python+FFI overhead. Namespaces inherited from ancestors outside the moved
-    subtree are added separately by :func:`_copy_inherited_ns`.
+    subtree are *not* redeclared here; the cross-document copy paths call
+    ``import_subtree(snode, inherit_ns=True)`` directly so that happens in the
+    same native pass.
     """
     return dst.doc.import_subtree(snode)
 
@@ -547,29 +549,6 @@ def _copy_to_holder(el, dst):
     # Native clone + inherited-namespace redeclaration in one pass.
     dnode = dst.doc.import_subtree(snode, inherit_ns=True)
     return dst.proxy(dnode)
-
-
-def _copy_inherited_ns(dst, snode, dnode):
-    """Declare on ``dnode`` the namespaces ``snode`` inherits from its ancestors.
-
-    ``_clone_node`` copies only each element's own ``xmlns`` declarations, so a
-    subtree that relied on a prefix (or default namespace) declared on an
-    ancestor *outside* the moved subtree would lose that binding after a
-    cross-tree move and serialize incorrectly. Walk ``snode``'s ancestors and
-    redeclare every in-scope binding it does not already declare itself onto the
-    cloned root ``dnode``, so all prefixes the subtree uses stay in scope. A
-    descendant that is genuinely in no namespace carries its own ``xmlns=""``
-    reset (preserved by ``_clone_node``), so this never recaptures it.
-    """
-    own = {pfx for pfx, _uri in snode.namespace_declarations}
-    seen = set(own)
-    n = snode.parent
-    while n is not None and n.kind == "element":
-        for pfx, uri in n.namespace_declarations:
-            if pfx not in seen:
-                seen.add(pfx)
-                dst.doc.set_namespace_declaration(dnode, pfx, uri)
-        n = n.parent
 
 
 def _repoint_subtree(src_holder, dst, snode, dnode):
