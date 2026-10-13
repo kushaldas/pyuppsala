@@ -2218,3 +2218,52 @@ class TestIterparse:
     def test_iterparse_syntax_error_is_etree_exception(self):
         with pytest.raises(P.XMLSyntaxError):
             list(P.iterparse(io.BytesIO(b"<r><a></r>")))
+
+
+def test_fast_collect_text_matches_iter_text():
+    root = P.fromstring(
+        '<r xmlns:m="urn:m"><m:h> a </m:h><x><m:h>b</m:h><m:h/></x><m:h>c<i>d</i>e</m:h></r>'
+    )
+    tag = "{urn:m}h"
+    expected = [e.text.strip() for e in root.iter(tag) if e.text is not None]
+    assert root.fast_collect_text(tag) == expected == ["a", "b", "c"]
+    assert root.fast_collect_text("{urn:m}missing") == []
+    # tag=None follows Element.iter(): comments and processing instructions
+    # contribute their .text too, elements without leading text are skipped.
+    mixed = P.fromstring('<r><!-- note --><?pi some data?><e>t</e><f/><?empty?></r>')
+    expected_all = [n.text.strip() for n in mixed.iter() if n.text is not None and n.text.strip()]
+    assert mixed.fast_collect_text() == expected_all
+    assert "note" in expected_all and "some data" in expected_all and "t" in expected_all
+
+
+def test_cross_document_append_keeps_inherited_namespaces_natively():
+    src = P.fromstring(
+        '<a xmlns:p="urn:p" xmlns="urn:d" xmlns:q="urn:q"><b xmlns:q="urn:q2" p:x="1"><q:c/></b></a>'
+    )
+    dst = P.fromstring('<out/>')
+    child = src[0]
+    dst.append(child)
+    out = P.tostring(dst, encoding="unicode")
+    # Inherited bindings are redeclared on the moved element; its own q binding wins.
+    assert 'xmlns:q="urn:q2"' in out and 'xmlns:q="urn:q"' not in out
+    assert 'xmlns:p="urn:p"' in out and 'xmlns="urn:d"' in out
+    assert '<q:c/>' in out and 'p:x="1"' in out
+    import copy
+    clone = copy.deepcopy(dst[0])
+    assert P.tostring(clone, encoding="unicode") == P.tostring(dst[0], encoding="unicode")
+
+
+def test_document_bytes_serializer_and_fragment_prepend():
+    import pyuppsala
+    doc = pyuppsala.Document('<!DOCTYPE r><r a="1"><k/>tail</r>')
+    s = doc.to_xml_with_options(include_doctype=True)
+    assert doc.to_xml_bytes_with_options(include_doctype=True) == s.encode("utf-8")
+    root = P.fromstring('<r><k/></r>')
+    native = P.native_document(root)
+    native._prepend_fragment_xml('<ds:Signature xmlns:ds="urn:ds"><ds:V>1</ds:V></ds:Signature>')
+    assert P.tostring(root, encoding="unicode") == (
+        '<r><ds:Signature xmlns:ds="urn:ds"><ds:V>1</ds:V></ds:Signature><k/></r>'
+    )
+    assert root[0].tag == "{urn:ds}Signature"
+    with pytest.raises(Exception):
+        native._prepend_fragment_xml('<not-xml')

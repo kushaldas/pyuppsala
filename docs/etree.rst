@@ -253,6 +253,9 @@ over a large subtree:
    * - ``fast_collect_attr(key, tag=None)``
      - Gather one attribute from matching elements.
      - You need sibling context, element text, or custom predicates.
+   * - ``fast_collect_text(tag=None)``
+     - Gather the stripped ``.text`` of matching nodes that have text (element leading text, comment content, PI data).
+     - You need tails, mixed content, or the full recursive string value.
    * - ``fast_collect_grouped_text(group_tag, item_tag, key, value_tag)``
      - Extract fixed nested groups such as SAML EntityAttributes.
      - You need general XPath semantics, recursive string values, or mutation.
@@ -413,7 +416,7 @@ Supported features
   ``itersiblings``, and full ``.xpath()`` via Uppsala's XPath 1.0 engine, plus
   :class:`XPath` / :class:`ETXPath` / :func:`XPathEvaluator`. pyuppsala also
   provides native bulk-scan extensions: ``fast_count``, ``fast_has``,
-  ``fast_sum_int_attr``, ``fast_collect_attr``, and
+  ``fast_sum_int_attr``, ``fast_collect_attr``, ``fast_collect_text``, and
   ``fast_collect_grouped_text``.
 - **Parser & validation**: :class:`XMLParser`, :func:`register_namespace`, and
   :class:`XMLSchema` (wrapping :class:`pyuppsala.XsdValidator`).
@@ -451,6 +454,8 @@ ElementTree, schema, and transform helpers
 ``XMLSchema`` exposes an ``error_log`` list. ``validate(tree)`` returns
 ``False`` and stores validation errors there; ``assertValid(tree)`` raises
 ``DocumentInvalid`` and attaches the same per-call log to the exception.
+Validation runs natively on the DOM (no serialization and reparse, GIL
+released); ``validate_serialized(tree)`` validates the serialized form instead.
 
 ``XSLT`` exposes an ``error_log`` list for transform failures and a
 ``strparam(value)`` literal-string helper. Keyword values are XPath expression

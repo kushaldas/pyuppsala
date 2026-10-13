@@ -463,10 +463,21 @@ class Document:
     def append_child(self, parent: Node, child: Node) -> None:
         """Append a child node to a parent node."""
         ...
-    def import_subtree(self, source: Node) -> Node:
+    def import_subtree(self, source: Node, inherit_ns: bool = False) -> Node:
         """Deep-copy ``source`` (a node from a different Document) and its whole
         subtree into this document in one native pass, returning the new detached
-        node. Raises ValueError if ``source`` belongs to this same Document."""
+        node. With ``inherit_ns`` the clone also redeclares the namespace bindings
+        ``source`` inherits from ancestors outside the subtree (nearest ancestor
+        wins). Raises ValueError if ``source`` belongs to this same Document."""
+        ...
+    def to_xml_bytes_with_options(
+        self,
+        indent: Optional[str] = None,
+        expand_empty_elements: bool = False,
+        include_doctype: bool = False,
+    ) -> bytes:
+        """Serialize like ``to_xml_with_options`` but return UTF-8 ``bytes``
+        (one copy out of the native buffer; used by sibling extensions)."""
         ...
     def set_namespace_declaration(
         self, node: Node, prefix: Optional[str], uri: str
@@ -596,8 +607,13 @@ class XsdValidator:
     def validate(self, doc: Document) -> list[ValidationError]:
         """Validate an XML document. Returns a list of errors (empty = valid)."""
         ...
+    def validate_node(self, node: Node) -> list[ValidationError]:
+        """Validate one element natively (no serialization), isolating the
+        subtree and carrying inherited namespaces. Returns a list of errors
+        (empty = valid). Releases the GIL."""
+        ...
     def experimental_validate_node(self, node: Node) -> list[ValidationError]:
-        """Experimental element validation; this opt-in API may change."""
+        """Alias of ``validate_node`` kept from the 0.12 opt-in API."""
         ...
     def validate_str(self, xml: str) -> list[ValidationError]:
         """Validate an XML string. Returns a list of errors (empty = valid)."""

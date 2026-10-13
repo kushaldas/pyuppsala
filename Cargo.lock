@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "pyuppsala"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "pyo3",
  "self_cell",

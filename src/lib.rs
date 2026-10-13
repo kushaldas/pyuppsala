@@ -2311,6 +2311,27 @@ impl ElementBase {
         .map_err(PyRuntimeError::new_err)
     }
 
+    /// Collect the stripped `.text` of every `iter(tag)` match without
+    /// materialising a Python proxy per node: an element's leading text run, a
+    /// comment's content, or a processing instruction's data (so `tag=None`
+    /// covers comments and PIs like `Element.iter()` does). Matches with no
+    /// text are skipped.
+    #[pyo3(signature = (tag=None))]
+    fn fast_collect_text(
+        &self,
+        py: Python<'_>,
+        tag: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<String>> {
+        let filter = desc_filter_from_py_tag(tag.as_ref())?;
+        let doc = Arc::clone(&self.doc);
+        let start = NodeId::new(self.node_id);
+        py.detach(move || {
+            let guard = doc.lock().map_err(|e| e.to_string())?;
+            Ok::<_, String>(collect_text_detached(guard.doc(), start, &filter))
+        })
+        .map_err(PyRuntimeError::new_err)
+    }
+
     /// Collect `(attribute_value, descendant_text_values)` groups without
     /// materialising the group/item/value elements as Python proxies.
     ///
@@ -3048,6 +3069,60 @@ fn matching_attr_value<'a>(
             })
             .map(|a| a.value.as_ref())
     })
+}
+
+/// Namespace declarations `id` inherits from ancestor elements but does not
+/// declare itself, nearest ancestor first, one entry per prefix (empty prefix
+/// is the default namespace). This is the order the etree layer's
+/// former Python ancestor loop produced, so cross-document clones serialize
+/// byte-identically to before (`inherited_namespace_declarations` below keeps
+/// the outermost-first `nsmap` order used by standalone serialization).
+fn inherited_declarations_nearest_first(doc: &UDocument<'_>, id: NodeId) -> Vec<(String, String)> {
+    let mut seen: std::collections::HashSet<String> = doc
+        .element(id)
+        .map(|el| {
+            el.namespace_declarations
+                .iter()
+                .map(|(p, _)| p.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let mut current = doc.parent(id);
+    while let Some(ancestor) = current {
+        match doc.element(ancestor) {
+            Some(element) => {
+                for (prefix, uri) in &element.namespace_declarations {
+                    if seen.insert(prefix.to_string()) {
+                        out.push((prefix.to_string(), uri.to_string()));
+                    }
+                }
+            }
+            None => break,
+        }
+        current = doc.parent(ancestor);
+    }
+    out
+}
+
+/// The `.text` of every `iter(tag)` match, selected by node kind: an element's
+/// leading text run, a comment's content, a processing instruction's data.
+/// Matches without text are skipped.
+fn collect_text_detached(doc: &UDocument<'_>, start: NodeId, filter: &DescFilter) -> Vec<String> {
+    let mut stack = vec![start];
+    let mut values = Vec::new();
+    while let Some(id) = advance_desc_walk(doc, &mut stack, filter) {
+        let text = match doc.node_kind(id) {
+            Some(NodeKind::Element(_)) => leading_text_run_detached(doc, id),
+            Some(NodeKind::Comment(text)) => Some(text.to_string()),
+            Some(NodeKind::ProcessingInstruction(pi)) => pi.data.as_ref().map(|d| d.to_string()),
+            _ => None,
+        };
+        if let Some(text) = text {
+            values.push(text.trim().to_string());
+        }
+    }
+    values
 }
 
 fn collect_attr_detached(
@@ -4176,6 +4251,67 @@ impl Document {
         Ok(())
     }
 
+    /// Serialize the document to UTF-8 ``bytes`` with formatting options.
+    ///
+    /// Same output as ``to_xml_with_options`` but delivered as ``bytes``: the
+    /// Rust buffer is copied once into the bytes object, instead of being
+    /// decoded into a Python ``str`` that a native consumer (pybergshamra)
+    /// would immediately re-encode. Sibling extensions use this to receive a
+    /// multi-megabyte document with one copy.
+    #[pyo3(signature = (indent=None, expand_empty_elements=false, include_doctype=false))]
+    fn to_xml_bytes_with_options<'py>(
+        &self,
+        py: Python<'py>,
+        indent: Option<&str>,
+        expand_empty_elements: bool,
+        include_doctype: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let opts = make_write_options(indent, expand_empty_elements, include_doctype);
+        let shared = Arc::clone(&self.inner);
+        let xml = py
+            .detach(|| {
+                let guard = shared.lock().map_err(|e| e.to_string())?;
+                Ok::<_, String>(guard.doc().to_xml_with_options(&opts))
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(PyBytes::new(py, xml.as_bytes()))
+    }
+
+    /// Insert an XML fragment as the first child of the document element.
+    ///
+    /// ``xml`` must parse as a single element (its own namespace declarations
+    /// travel with it). The fragment is parsed in a temporary document and
+    /// imported natively; nothing else in the tree changes and existing
+    /// element proxies stay valid. This is the hook pybergshamra uses to
+    /// splice a freshly computed ``<ds:Signature>`` into a signed document
+    /// without serializing and reparsing the whole tree.
+    fn _prepend_fragment_xml(&self, py: Python<'_>, xml: &str) -> PyResult<()> {
+        let input = xml.to_string();
+        let fragment = py.detach(|| OwnedDoc::try_parse(input, |s| UParser::new().parse(s)));
+        let fragment = fragment.map_err(|(error, _input)| xml_error_to_pyerr(error))?;
+        let fragment_root = fragment
+            .doc()
+            .document_element()
+            .ok_or_else(|| PyValueError::new_err("fragment has no element"))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        guard.with_doc_mut(|_input, doc| {
+            let root = doc
+                .document_element()
+                .ok_or_else(|| PyValueError::new_err("document has no element"))?;
+            let imported = doc
+                .import_subtree(fragment.doc(), fragment_root)
+                .ok_or_else(|| PyValueError::new_err("cannot import fragment"))?;
+            match doc.first_child(root) {
+                Some(first) => doc.insert_before(root, imported, first),
+                None => doc.append_child(root, imported),
+            }
+            Ok(())
+        })
+    }
+
     /// The raw ``<!DOCTYPE ...>`` declaration preserved from the source, or None.
     ///
     /// Uppsala preserves the document type declaration verbatim (including the
@@ -4369,14 +4505,20 @@ impl Document {
     /// etree layer must clone rather than reparent. This does the entire subtree
     /// copy in one native pass (uppsala `Document::import_subtree`) instead of one
     /// FFI call per node, which was the dominant cost of pyFF's aggregation step.
-    /// The element's own namespace declarations are copied; namespaces inherited
-    /// from ancestors outside the subtree remain the caller's responsibility.
+    /// The element's own namespace declarations are always copied. With
+    /// ``inherit_ns=False`` (the default) namespaces inherited from ancestors
+    /// outside the subtree are not redeclared and remain the caller's
+    /// responsibility; with ``inherit_ns=True`` every in-scope binding the
+    /// source inherits but does not declare itself is redeclared on the clone
+    /// (nearest ancestor wins), which is what cross-document ``append`` and
+    /// ``deepcopy`` in the etree layer use.
     ///
     /// Locks both documents, in a fixed global order (by `Arc` address) so
     /// concurrent imports in opposite directions cannot deadlock. The source
     /// must be a different `Document`; importing from the same document raises
     /// ValueError (use the move/detach path instead).
-    fn import_subtree(&self, source: &Node) -> PyResult<Node> {
+    #[pyo3(signature = (source, inherit_ns=false))]
+    fn import_subtree(&self, source: &Node, inherit_ns: bool) -> PyResult<Node> {
         if Arc::ptr_eq(&self.inner, &source.doc) {
             return Err(PyValueError::new_err(
                 "import_subtree requires a node from a different Document",
@@ -4412,6 +4554,26 @@ impl Document {
             .ok_or_else(|| {
                 PyValueError::new_err("cannot import this node (document root or attribute node)")
             })?;
+        if inherit_ns {
+            // Redeclare on the clone every in-scope binding the source inherits
+            // from ancestors outside the subtree and does not declare itself
+            // (nearest ancestor wins), so prefixed and defaulted names stay
+            // bound after a cross-document move. This replaces the etree
+            // layer's per-ancestor Python loop with one native pass.
+            let inherited = inherited_declarations_nearest_first(src_guard.doc(), source.id);
+            if !inherited.is_empty() {
+                dst_guard.with_doc_mut(|_input, doc| {
+                    if let Some(element) = doc.element_mut(new_id) {
+                        for (prefix, uri) in inherited {
+                            element.namespace_declarations.push((
+                                std::borrow::Cow::Owned(prefix),
+                                std::borrow::Cow::Owned(uri),
+                            ));
+                        }
+                    }
+                });
+            }
+        }
         Ok(Node {
             doc: Arc::clone(&self.inner),
             id: new_id,
@@ -4899,19 +5061,14 @@ impl XsdValidator {
             .collect())
     }
 
-    /// Experimental: validate one element without an XML round trip.
-    /// This opt-in API may change.
+    /// Validate one element natively, without an XML round trip.
     ///
     /// Whole-document roots needing no namespace adjustment are read directly.
     /// Other roots and subtrees are imported into a
     /// temporary native document so identity constraints cannot see siblings.
     /// Inherited namespaces (including prefixes used only in QName values) are
     /// copied with nearest-ancestor precedence. The source is never mutated.
-    fn experimental_validate_node(
-        &self,
-        py: Python<'_>,
-        node: &Node,
-    ) -> PyResult<Vec<ValidationErrorPy>> {
+    fn validate_node(&self, py: Python<'_>, node: &Node) -> PyResult<Vec<ValidationErrorPy>> {
         let shared = Arc::clone(&node.doc);
         let id = node.id;
         let validator = &self.inner;
@@ -4920,7 +5077,7 @@ impl XsdValidator {
                 let guard = shared.lock().map_err(|e| e.to_string())?;
                 let source = guard.doc();
                 if source.element(id).is_none() {
-                    return Err("experimental_validate_node requires an element node".to_string());
+                    return Err("validate_node requires an element node".to_string());
                 }
                 if source.document_element() == Some(id)
                     && validation_default_names(source, id).is_empty()
@@ -4968,6 +5125,15 @@ impl XsdValidator {
                 column: e.column,
             })
             .collect())
+    }
+
+    /// Former opt-in name of ``validate_node``; kept as an alias.
+    fn experimental_validate_node(
+        &self,
+        py: Python<'_>,
+        node: &Node,
+    ) -> PyResult<Vec<ValidationErrorPy>> {
+        self.validate_node(py, node)
     }
 
     /// Validate an XML string against this schema. Convenience method.
