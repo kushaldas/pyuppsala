@@ -6,7 +6,7 @@
 
 - Update Uppsala to 0.12.1 to preserve attribute namespaces in XSLT output,
   including copied attributes whose namespace declarations were on omitted
-  source ancestors. This fixes result reparsing through ``getroot()``
+  source ancestors. This fixes result reparsing through `getroot()`
   ([#36](https://github.com/kushaldas/pyuppsala/issues/36)).
 
 ## 0.13.0 [2026-10-12]
