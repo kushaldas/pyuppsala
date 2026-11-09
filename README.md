@@ -7,7 +7,7 @@ Python bindings for the [Uppsala](https://crates.io/crates/uppsala) XML library
 pyuppsala gives you a fast, correct, and memory-safe XML toolkit from Python
 with no C dependencies to compile and no transitive native libraries to audit.
 
-This release is against `0.11.0` of Uppsala library.
+pyuppsala 0.13.1 uses Uppsala 0.12.1.
 
 ## Features
 
@@ -226,8 +226,8 @@ with mypy/pyright.
 
 ## Development
 
-Builds use Uppsala 0.11.0 from crates.io, including the XSLT parameter and
-reserved `xml` namespace fixes. A sibling Uppsala checkout is not required.
+Builds use Uppsala 0.12.1 from crates.io, including XSLT parameter support and
+namespace fixes for copied and computed attributes. A sibling Uppsala checkout is not required.
 
 ```bash
 # Clone the repository
